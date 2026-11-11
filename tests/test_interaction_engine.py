@@ -160,3 +160,194 @@ def test_weighted_sample_rejects_length_mismatch():
     items = _population(3, lambda i: float(i + 1))
     with pytest.raises(ValueError, match="length mismatch"):
         _weighted_sample_without_replacement(items, [1.0, 1.0], 2, random.Random(1))
+
+
+# --- RQ1: GraphSampling ---------------------------------------------------
+
+
+def _graph_population(n: int) -> list[Agent]:
+    return [_make_agent(f"agent_{i:04d}", 4.0) for i in range(n)]
+
+
+def _ids(n: int) -> list[str]:
+    return [f"agent_{i:04d}" for i in range(n)]
+
+
+def _graph(n=20, degree=6, rewire_p=0.1, k=3, graph_seed=42) -> "GraphSampling":
+    from sandbox.interaction_engine import GraphSampling
+
+    return GraphSampling(_ids(n), degree=degree, rewire_p=rewire_p, k=k, graph_seed=graph_seed)
+
+
+def test_graph_sampling_returns_only_graph_neighbours():
+    """The point of the strategy: an agent's candidate set is structural, not
+    a function of where it currently stands."""
+    strategy = _graph()
+    population = _graph_population(20)
+
+    for speaker in population:
+        chosen = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(5))
+        adjacency = {
+            b for a, b in strategy.edges() if a == speaker.agent_id
+        } | {a for a, b in strategy.edges() if b == speaker.agent_id}
+        assert {a.agent_id for a in chosen} <= adjacency
+        assert speaker.agent_id not in {a.agent_id for a in chosen}
+        assert len(chosen) == len({a.agent_id for a in chosen}) == 3
+
+
+def test_graph_sampling_ignores_stance_entirely():
+    """AlphaSampling at alpha=1 would always pick the closest stance. The
+    graph must not, or the selection effect it exists to remove is still
+    there."""
+    strategy = _graph(n=20, degree=6, k=3)
+    population = [_make_agent(f"agent_{i:04d}", float(1 + (i % 7))) for i in range(20)]
+    speaker = population[0]
+
+    from_varied = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(5))
+    flat = [_make_agent(f"agent_{i:04d}", 4.0) for i in range(20)]
+    from_flat = strategy.select_neighbors(flat[0], flat, turn=1, rng=random.Random(5))
+
+    assert [a.agent_id for a in from_varied] == [a.agent_id for a in from_flat]
+
+
+def test_same_seed_gives_the_same_graph_and_the_same_samples():
+    """Two runs of a matched set share a seed, so they must share a graph and
+    read the same neighbours; only the rendering may differ."""
+    a, b = _graph(graph_seed=42), _graph(graph_seed=42)
+    assert a.edges() == b.edges()
+
+    population = _graph_population(20)
+    for speaker in population:
+        assert [
+            n.agent_id
+            for n in a.select_neighbors(speaker, population, turn=1, rng=random.Random(7))
+        ] == [
+            n.agent_id
+            for n in b.select_neighbors(speaker, population, turn=1, rng=random.Random(7))
+        ]
+
+
+def test_a_different_seed_gives_a_different_graph():
+    assert _graph(graph_seed=42).edges() != _graph(graph_seed=43).edges()
+
+
+def test_a_node_with_too_few_neighbours_raises_rather_than_returning_fewer():
+    """A short feed is a different stimulus. An agent that quietly read two
+    posts where everyone else read three would be a confound nothing in the
+    output records."""
+    from sandbox.interaction_engine import GraphSampling
+
+    # Degree 2 is a ring: every node has exactly 2 neighbours, so k=2 works
+    # and k=3 cannot be constructed at all.
+    with pytest.raises(ValueError, match="cannot exceed degree"):
+        GraphSampling(_ids(10), degree=2, rewire_p=0.0, k=3, graph_seed=1)
+
+    # The call-time path: a node whose neighbourhood is smaller than k. Built
+    # legally (k <= degree), then the graph is edited to strand one node.
+    strategy = GraphSampling(_ids(10), degree=4, rewire_p=0.0, k=3, graph_seed=1)
+    strategy._neighbors["agent_0000"] = ["agent_0001", "agent_0002"]
+    with pytest.raises(ValueError, match="need 3"):
+        strategy.select_neighbors(
+            _make_agent("agent_0000", 4.0), _graph_population(10), turn=1, rng=random.Random(0)
+        )
+
+
+def test_an_agent_outside_the_graph_raises():
+    """The graph is built once from the initial population, so an agent that
+    is not a node is a wiring error, not a run-time condition."""
+    strategy = _graph(n=10)
+    with pytest.raises(ValueError, match="not a node"):
+        strategy.select_neighbors(
+            _make_agent("agent_9999", 4.0), _graph_population(10), turn=1, rng=random.Random(0)
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        (dict(degree=5), "even"),
+        (dict(degree=1), ">= 2"),
+        (dict(degree=20), "less than the population"),
+        (dict(rewire_p=1.5), r"\[0,1\]"),
+        (dict(rewire_p=-0.1), r"\[0,1\]"),
+        (dict(k=0), "k must be >= 1"),
+        (dict(k=8), "cannot exceed degree"),
+    ],
+)
+def test_graph_construction_rejects_invalid_parameters(kwargs, message):
+    """Never silently clamped: the same contract AlphaSampling holds."""
+    from sandbox.interaction_engine import GraphSampling
+
+    base = dict(agent_ids=_ids(20), degree=6, rewire_p=0.1, k=3, graph_seed=1)
+    base.update(kwargs)
+    with pytest.raises(ValueError, match=message):
+        GraphSampling(**base)
+
+
+def test_duplicate_agent_ids_are_rejected():
+    """Node indices map to agent IDs positionally, so a duplicate would make
+    two nodes the same agent and silently halve the population."""
+    from sandbox.interaction_engine import GraphSampling
+
+    with pytest.raises(ValueError, match="unique"):
+        GraphSampling(["a", "b", "b", "c", "d"], degree=2, rewire_p=0.1, k=1, graph_seed=1)
+
+
+def test_edges_are_sorted_pairs_covering_the_population():
+    strategy = _graph(n=20, degree=6)
+    edges = strategy.edges()
+
+    assert edges == sorted(edges)
+    assert all(a < b for a, b in edges)
+    assert len(edges) == 20 * 6 // 2  # rewiring moves edges, never adds or drops them
+    assert {a for a, _ in edges} | {b for _, b in edges} == set(_ids(20))
+
+
+def test_the_graph_is_connected():
+    """A disconnected population is two smaller experiments sharing an output
+    file, which is why the connected WS variant is used."""
+    import networkx as nx
+
+    strategy = _graph(n=30, degree=4, rewire_p=0.3, graph_seed=99)
+    graph = nx.Graph()
+    graph.add_nodes_from(_ids(30))
+    graph.add_edges_from(strategy.edges())
+    assert nx.is_connected(graph)
+
+
+def test_sampling_consumes_the_rng_exactly_once_per_agent():
+    """A second rng.sample call per agent would both advance the stream twice
+    and return a set other than the one just validated.
+
+    Checked by state rather than by output: one call's result alone cannot
+    distinguish "sampled once" from "sampled twice and returned the second",
+    whereas how far the stream advanced can.
+    """
+    strategy = _graph(n=20, degree=6, k=3)
+    population = _graph_population(20)
+    speaker = population[0]
+    candidates = sorted(
+        {b for a, b in strategy.edges() if a == speaker.agent_id}
+        | {a for a, b in strategy.edges() if b == speaker.agent_id}
+    )
+
+    used = random.Random(3)
+    chosen = strategy.select_neighbors(speaker, population, turn=1, rng=used)
+
+    reference = random.Random(3)
+    expected = reference.sample(candidates, 3)
+
+    assert [a.agent_id for a in chosen] == expected
+    assert used.random() == reference.random()  # the streams are still in step
+
+
+def test_turn_does_not_change_the_draw_for_a_fixed_rng():
+    """The graph does not change over the run; which neighbours are read comes
+    from rng, which the orchestrator derives per turn."""
+    strategy = _graph()
+    population = _graph_population(20)
+    speaker = population[4]
+
+    first = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(11))
+    second = strategy.select_neighbors(speaker, population, turn=9, rng=random.Random(11))
+    assert [a.agent_id for a in first] == [a.agent_id for a in second]
