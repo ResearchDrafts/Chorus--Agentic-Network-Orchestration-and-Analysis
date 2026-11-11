@@ -1,0 +1,53 @@
+# RQ1 bank-regime smoke test: the E4 control arm (delivery: off).
+#
+# Agents read nothing and write no reply, but are still probed every round.
+# It measures how far stance drifts from the probing alone, which is the
+# baseline every delivery-on arm is compared against.
+#
+# Sides, posted items and neighbours are still resolved and still logged, so
+# every seeded stream consumes identically to the delivery-on arm and the two
+# differ in what agents SAW and in nothing else. items_read is empty on every
+# row, and there are no reply calls at all: 0 replies, 8 x 4 = 32 probes.
+#
+# Note the quotes on delivery: YAML 1.1 reads bare `off` as the boolean False.
+#
+#   python run_simulation.py configs/rq1/smoke_off.yaml
+
+K: 3
+M: 8
+N: 3
+alpha: 0.5
+api_base: http://localhost:8000/v1
+bank_path: data/bank/test_bank.csv
+checkpoint_every_n_turns: 1
+delivery: "off"
+graph_degree: 4
+graph_rewire_p: 0.1
+language_condition: english
+meme_injection:
+  enabled: false
+memory_rounds: 3
+model_backend_id: hosted_vllm/Qwen/Qwen2.5-7B-Instruct
+neighbor_strategy: graph
+persona_pool_id: pool_20
+probe_mass_floor: 0.5
+probe_question: Should city bus fares stay subsidised?
+probe_top_logprobs: 20
+rate_limits: {}
+regime: bank
+rq_target: RQ1_RQ2
+run_id: rq1_smoke_off
+seed: 42
+stance_high_label: fares should stay subsidised
+stance_low_label: fares should not be subsidised
+stance_scale:
+- 1
+- 2
+- 3
+- 4
+- 5
+- 6
+- 7
+temperature: 0.7
+topic: whether city bus fares should stay subsidised
+trial_number: 1

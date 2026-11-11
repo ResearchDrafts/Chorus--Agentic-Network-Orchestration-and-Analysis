@@ -31,10 +31,11 @@ from sandbox.simulation_orchestrator import build_orchestrator
 
 def describe(run: ExperimentRun, runs_dir: Path) -> None:
     """What this run will do, before it does it."""
-    generated = run.M * run.K
     print(f"  run_id        {run.run_id}")
     print(f"  topic         {run.topic}")
-    print(f"  population    M={run.M}  N={run.N}  K={run.K}  alpha={run.alpha}")
+    print(f"  population    M={run.M}  N={run.N}  K={run.K}")
+    print(f"  neighbours    {_describe_neighbours(run)}")
+    print(f"  regime        {_describe_regime(run)}")
     print(f"  language      {run.language_condition}")
     print(f"  model         {run.model_backend_id}")
     print(f"  api_base      {run.api_base or '(hosted provider)'}")
@@ -42,18 +43,97 @@ def describe(run: ExperimentRun, runs_dir: Path) -> None:
     print(f"  seed          {run.seed}")
     print(f"  output        {runs_dir / run.run_id}/")
     print()
-    print(f"  at most {generated} LLM calls (M x K), fewer if memes replace turns")
+    for line in _describe_calls(run):
+        print(f"  {line}")
 
-    if run.api_base is None and run.model_backend_id.startswith("hosted_vllm/"):
+    if run.regime == "bank":
         print()
-        print("  WARNING: model_backend_id is hosted_vllm/* but api_base is unset.")
-        print("           litellm will route on the prefix and never reach your server.")
+        print(f"  probe         {run.probe_question!r}")
+        print(f"                top_logprobs={run.probe_top_logprobs}  "
+              f"mass_floor={run.probe_mass_floor}")
+        print(f"  anchors       1 = {run.stance_low_label}")
+        print(f"                7 = {run.stance_high_label}")
+        print(f"  memory        {run.memory_rounds} rounds of reading and replies")
+        for problem in _probe_language_warnings(run):
+            print()
+            print(f"  WARNING: {problem}")
 
-    checkpoint = runs_dir / run.run_id / "checkpoints" / "latest.json"
-    if checkpoint.exists():
-        print()
-        print("  NOTE: a checkpoint exists, so this RESUMES rather than starting over.")
-        print(f"        Delete {runs_dir / run.run_id}/ or change run_id to start fresh.")
+
+def _describe_neighbours(run: ExperimentRun) -> str:
+    if run.neighbor_strategy == "graph":
+        return (
+            f"graph  WS(M={run.M}, degree={run.graph_degree}, p={run.graph_rewire_p})"
+            f"  reading {run.N} of each neighbourhood"
+        )
+    return f"alpha  alpha={run.alpha}  sampling {run.N} from the whole population"
+
+
+def _describe_regime(run: ExperimentRun) -> str:
+    if run.regime != "bank":
+        return "generated  agents write their own posts, stance self-reported"
+    delivery = (
+        "delivery ON" if run.delivery == "on" else "delivery OFF (E4 control: reads nothing)"
+    )
+    return f"bank  posts from {run.bank_path}, stance by probe  [{delivery}]"
+
+
+def _describe_calls(run: ExperimentRun) -> list[str]:
+    """What this run will cost in calls, counted per regime.
+
+    A bank round is two calls per agent, not one, plus one probe each for
+    round 0 -- so a bank run of the same M and K is about twice the traffic of
+    a generated one, which is worth seeing before starting rather than after.
+    """
+    if run.regime != "bank":
+        return [f"at most {run.M * run.K} LLM calls (M x K), fewer if memes replace turns"]
+
+    replies = 0 if run.delivery == "off" else run.M * run.K
+    probes = run.M * (run.K + 1)  # +1 for the round-0 probe
+    return [
+        f"{replies} reply calls  ({'none: delivery is off' if not replies else 'M x K'})",
+        f"{probes} probe calls  (M x (K+1), including the round-0 probe)",
+        f"{replies + probes} LLM calls in total",
+    ]
+
+
+def _probe_language_warnings(run: ExperimentRun) -> list[str]:
+    """Warns when the probe text is visibly in the wrong script.
+
+    The probe question and the two anchor labels have to be written in the
+    run's own language -- there is no default, deliberately, because an
+    English fallback would probe every arm in English and leave no trace of it
+    in the output. But a config copied from another arm can still carry the
+    wrong arm's question, and the run would look perfectly valid.
+
+    Only the Devanagari arm is checkable. english, hinglish and
+    romanized_hindi are all Roman script, so nothing short of language
+    identification could tell a Hinglish question from an English one, and a
+    heuristic that guessed would cry wolf on every Hinglish config -- which is
+    worse than silence, because a warning nobody believes is a warning nobody
+    reads. For those three arms this says nothing, and the reviewer has to
+    read the question, which describe() prints in full for that reason.
+    """
+    if run.language_condition != "hindi":
+        return []
+    fields = {
+        "probe_question": run.probe_question,
+        "stance_low_label": run.stance_low_label,
+        "stance_high_label": run.stance_high_label,
+    }
+    wrong = [name for name, text in fields.items() if not _has_devanagari(text)]
+    if not wrong:
+        return []
+    return [
+        f"language_condition is hindi but {', '.join(wrong)} contains no "
+        "Devanagari. Every arm must be probed in its own language, or the "
+        "comparison between arms is lost."
+    ]
+
+
+def _has_devanagari(text: str | None) -> bool:
+    """Any character in the Devanagari block."""
+    return bool(text) and any("\u0900" <= ch <= "\u097f" for ch in text)
+
 
 
 def check_server(run: ExperimentRun) -> str | None:

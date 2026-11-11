@@ -121,6 +121,48 @@ def _format_validation_errors(e: ValidationError) -> list[str]:
     return out
 
 
+def _bank_errors(raw: dict) -> list[str]:
+    """Validates a bank-regime run's argument bank at config-load time.
+
+    The bank is loaded here in full, not merely stat()ed, and every problem
+    it reports is folded into this config's error list. A bank with an empty
+    Hindi cell is a config error in exactly the sense the rest of this module
+    means: the run would start, complete, cost its GPU hours, and produce a
+    Hindi arm in which one argument was silently blank -- which is
+    indistinguishable in the output from an argument that failed to persuade.
+    Feature 1's whole premise is that such a thing is caught before anything
+    is spent.
+
+    Reads `regime` from the raw dict for the same reason the rest of this
+    function does: it has to run whether or not Pydantic validation
+    succeeded, so a config with both a bad alpha and a broken bank reports
+    both.
+    """
+    if raw.get("regime") != "bank":
+        return []
+
+    bank_path = raw.get("bank_path")
+    if not isinstance(bank_path, str) or not bank_path.strip():
+        # ExperimentRun's own validator reports the missing field; repeating
+        # it here would put the same problem in the list twice.
+        return []
+
+    path = Path(bank_path)
+    if not path.exists():
+        return [f"bank_path '{bank_path}' not found at {path}"]
+
+    # Imported here rather than at module scope: config_loader is Tier 0 and
+    # bank_manager is Tier 1, so a module-level import would invert the
+    # dependency direction the whole architecture is built on.
+    from sandbox.bank_manager import BankManager, BankValidationError
+
+    try:
+        BankManager(path)
+    except BankValidationError as e:
+        return [f"bank {bank_path}: {problem}" for problem in e.errors]
+    return []
+
+
 def _resolve_git_commit_hash() -> str:
     try:
         result = subprocess.run(
@@ -140,8 +182,9 @@ def _resolve_git_commit_hash() -> str:
 def _referenced_asset_errors(raw: dict) -> list[str]:
     """
     Checks that meme_pool_id (if meme_injection.enabled) resolves to an
-    actual dataset file, and that the persona pool referenced by the run
-    exists. Returns ALL missing-asset errors found, not just the first.
+    actual dataset file, that the persona pool referenced by the run
+    exists, and that a bank-regime run's bank loads and validates. Returns
+    ALL missing-asset errors found, not just the first.
 
     Reads directly from the raw (possibly Pydantic-invalid) dict rather
     than a validated ExperimentRun, so this check runs independently of
@@ -149,6 +192,7 @@ def _referenced_asset_errors(raw: dict) -> list[str]:
     note in load_run_config().
     """
     errors: list[str] = []
+    errors.extend(_bank_errors(raw))
 
     meme_injection = raw.get("meme_injection")
     if isinstance(meme_injection, dict) and meme_injection.get("enabled") is True:

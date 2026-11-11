@@ -175,3 +175,189 @@ def test_unknown_key_error_names_the_field_and_explains(tmp_path, valid_config_d
     message = str(excinfo.value)
     assert "meme_injections: unknown field" in message
     assert "typo" in message
+
+
+# --- RQ1: the bank regime's referenced assets ----------------------------
+
+
+def _bank_config(valid_config_dict, **overrides):
+    valid_config_dict.update(
+        regime="bank",
+        bank_path="data/bank/test_bank.csv",
+        probe_question="Should city bus fares stay subsidised?",
+    )
+    valid_config_dict.update(overrides)
+    return valid_config_dict
+
+
+HEADER = "item_id,arg_id,strength,side,english,hinglish,romanized_hindi,hindi"
+
+
+def test_a_valid_bank_config_loads(valid_config_dict, write_config):
+    run = load_run_config(write_config(_bank_config(valid_config_dict)))
+    assert run.regime == "bank"
+    assert run.bank_path == "data/bank/test_bank.csv"
+
+
+def test_a_missing_bank_file_is_reported_with_its_path(valid_config_dict, write_config):
+    path = write_config(_bank_config(valid_config_dict, bank_path="data/bank/nope.csv"))
+    with pytest.raises(ConfigLoadError) as excinfo:
+        load_run_config(path)
+    assert any("data/bank/nope.csv" in e for e in excinfo.value.errors)
+
+
+def test_a_bank_that_fails_validation_is_rejected_at_config_load(
+    tmp_path, valid_config_dict, write_config
+):
+    """The bank is loaded in full, not merely stat()ed.
+
+    A bank with one empty Hindi cell would otherwise start, complete, cost its
+    GPU hours, and produce a Hindi arm in which one argument was silently
+    blank -- indistinguishable in the output from an argument that failed to
+    persuade. Feature 1's premise is that this is caught before anything is
+    spent.
+    """
+    bank = tmp_path / "broken.csv"
+    bank.write_text(
+        HEADER + "\n"
+        "b1,a1,strong,pro,english text,hinglish text,roman text,\n"
+        "b2,a2,weak,con,english text,hinglish text,roman text,hindi text\n"
+    )
+    path = write_config(_bank_config(valid_config_dict, bank_path=str(bank)))
+
+    with pytest.raises(ConfigLoadError) as excinfo:
+        load_run_config(path)
+    assert any("empty hindi text" in e for e in excinfo.value.errors)
+
+
+def test_a_one_sided_bank_is_rejected(tmp_path, valid_config_dict, write_config):
+    bank = tmp_path / "one_sided.csv"
+    bank.write_text(
+        HEADER + "\n"
+        "b1,a1,strong,pro,e,hi,rh,h\n"
+        "b2,a2,weak,pro,e,hi,rh,h\n"
+    )
+    path = write_config(_bank_config(valid_config_dict, bank_path=str(bank)))
+
+    with pytest.raises(ConfigLoadError) as excinfo:
+        load_run_config(path)
+    assert any("'con' side" in e for e in excinfo.value.errors)
+
+
+def test_a_bank_error_and_a_schema_error_both_surface(
+    tmp_path, valid_config_dict, write_config
+):
+    """Feature 1's accumulation contract, extended to the bank: a config with
+    two independent problems takes one run to fix, not two."""
+    bank = tmp_path / "broken.csv"
+    bank.write_text(HEADER + "\n" + "b1,a1,strong,sideways,e,hi,rh,h\n")
+    path = write_config(_bank_config(valid_config_dict, bank_path=str(bank), alpha=1.5))
+
+    with pytest.raises(ConfigLoadError) as excinfo:
+        load_run_config(path)
+    errors = excinfo.value.errors
+    assert any("alpha" in e for e in errors)
+    assert any("side must be one of" in e for e in errors)
+
+
+def test_bank_regime_without_a_bank_path_is_rejected(valid_config_dict, write_config):
+    config = _bank_config(valid_config_dict)
+    del config["bank_path"]
+    with pytest.raises(ConfigLoadError, match="bank_path"):
+        load_run_config(write_config(config))
+
+
+def test_bank_regime_without_a_probe_question_is_rejected(valid_config_dict, write_config):
+    """The one that would do the most damage silently: an English default
+    would probe every language arm in English."""
+    config = _bank_config(valid_config_dict)
+    del config["probe_question"]
+    with pytest.raises(ConfigLoadError, match="probe_question"):
+        load_run_config(write_config(config))
+
+
+def test_the_generated_regime_never_looks_for_a_bank(valid_config_dict, write_config):
+    """Guards against over-correcting: a generated run with no bank_path must
+    still load, and must not be slowed by a bank it does not use."""
+    run = load_run_config(write_config(valid_config_dict))
+    assert run.regime == "generated"
+    assert run.bank_path is None
+
+
+def test_a_graph_config_loads(valid_config_dict, write_config):
+    valid_config_dict.update(
+        M=8, N=3, neighbor_strategy="graph", graph_degree=4, graph_rewire_p=0.1
+    )
+    run = load_run_config(write_config(valid_config_dict))
+    assert run.neighbor_strategy == "graph"
+    assert run.graph_degree == 4
+
+
+def test_a_graph_config_with_an_impossible_degree_is_rejected(
+    valid_config_dict, write_config
+):
+    valid_config_dict.update(M=8, N=3, neighbor_strategy="graph", graph_degree=10)
+    with pytest.raises(ConfigLoadError, match="less than M"):
+        load_run_config(write_config(valid_config_dict))
+
+
+# --- RQ1: the shipped configs --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name", ["smoke", "smoke_hinglish", "smoke_off"]
+)
+def test_the_shipped_rq1_configs_load(name):
+    """These are the only worked bank-regime examples a researcher has. If one
+    drifts out of sync with the schema it is worse than no example."""
+    from pathlib import Path
+
+    run = load_run_config(Path(f"configs/rq1/{name}.yaml"))
+    assert run.regime == "bank"
+    assert run.neighbor_strategy == "graph"
+    assert (run.M, run.N, run.K, run.graph_degree) == (8, 3, 3, 4)
+    assert run.probe_question
+    assert run.git_commit_hash
+
+
+def test_the_rq1_configs_are_a_matched_set():
+    """Same seed, same graph parameters, same bank: that is what makes the
+    arms comparable. Only the language and the language-dependent text may
+    differ."""
+    from pathlib import Path
+
+    english = load_run_config(Path("configs/rq1/smoke.yaml"))
+    hinglish = load_run_config(Path("configs/rq1/smoke_hinglish.yaml"))
+
+    assert english.seed == hinglish.seed
+    assert english.bank_path == hinglish.bank_path
+    assert (english.M, english.N, english.K) == (hinglish.M, hinglish.N, hinglish.K)
+    assert english.graph_degree == hinglish.graph_degree
+    assert english.graph_rewire_p == hinglish.graph_rewire_p
+    assert english.topic == hinglish.topic
+
+    assert english.language_condition != hinglish.language_condition
+    assert english.probe_question != hinglish.probe_question
+
+
+def test_the_delivery_off_config_differs_only_in_delivery():
+    """And in run_id, so the two arms do not write into the same directory."""
+    from pathlib import Path
+
+    on = load_run_config(Path("configs/rq1/smoke.yaml")).model_dump()
+    off = load_run_config(Path("configs/rq1/smoke_off.yaml")).model_dump()
+
+    differing = {k for k in on if on[k] != off[k]}
+    assert differing == {"delivery", "run_id"}
+
+
+def test_delivery_is_quoted_in_every_shipped_config():
+    """YAML 1.1 reads bare on/off as booleans, so `delivery: off` arrives as
+    False and the schema rejects it. The quotes are load-bearing, and a
+    well-meaning tidy-up would remove them."""
+    import yaml
+    from pathlib import Path
+
+    for name in ("smoke", "smoke_hinglish", "smoke_off"):
+        raw = yaml.safe_load(Path(f"configs/rq1/{name}.yaml").read_text())
+        assert isinstance(raw["delivery"], str), f"{name}: delivery parsed as {raw['delivery']!r}"
