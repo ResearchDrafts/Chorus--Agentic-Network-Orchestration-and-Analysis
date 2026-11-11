@@ -529,3 +529,817 @@ async def test_prompt_is_built_at_most_twice_across_the_retry_budget(
 
     # 2 agents x 3 attempts would be 6 builds; caching gives at most 2 each.
     assert calls["n"] <= 4, calls["n"]
+
+
+# =========================================================================
+# RQ1: the bank regime
+#
+# The generated-regime tests above are untouched. _run_turn branches on the
+# regime, so both paths are exercised from the same orchestrator.
+# =========================================================================
+
+from tests.factories import make_logprob_response  # noqa: E402
+
+FIXTURE_BANK = "data/bank/test_bank.csv"
+
+
+def _bank_run(**overrides) -> ExperimentRun:
+    base = dict(
+        M=8, N=3, K=3, run_id="bank_run", persona_pool_id="pool_20",
+        neighbor_strategy="graph", graph_degree=4, graph_rewire_p=0.1,
+        regime="bank", bank_path=FIXTURE_BANK,
+        probe_question="Should the fare subsidy continue?",
+        stance_low_label="the subsidy should end",
+        stance_high_label="the subsidy should continue",
+        memory_rounds=3,
+    )
+    base.update(overrides)
+    return make_run(**base)
+
+
+def _bank_rows(tmp_path, run_id="bank_run") -> list[Interaction]:
+    return _interactions(tmp_path, run_id)
+
+
+# --- shape ---------------------------------------------------------------
+
+
+async def test_a_bank_run_logs_one_row_per_agent_per_round_plus_round_zero(
+    tmp_path, bank_gateway
+):
+    run = _bank_run()
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    rows = _bank_rows(tmp_path)
+    assert len(rows) == run.M * (run.K + 1)
+    assert sorted({r.turn for r in rows}) == [0, 1, 2, 3]
+    for turn in range(0, run.K + 1):
+        assert len([r for r in rows if r.turn == turn]) == run.M
+
+
+async def test_one_reply_and_one_probe_call_per_agent_round(tmp_path, bank_gateway):
+    """Two calls per agent per round, plus one probe each for round 0."""
+    run = _bank_run()
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    assert bank_gateway.generate.await_count == run.M * run.K
+    assert bank_gateway.score_next_token.await_count == run.M * (run.K + 1)
+
+
+async def test_every_bank_row_carries_the_bank_and_probe_columns(tmp_path, bank_gateway):
+    await build_orchestrator(_bank_run(), bank_gateway, runs_dir=tmp_path).run()
+
+    for row in _bank_rows(tmp_path):
+        assert row.content_type == "bank_item"
+        assert row.meme_id is None
+        assert row.probe_mean is not None
+        assert row.probe_dist is not None and len(row.probe_dist) == 7
+        assert row.probe_mass is not None and row.side_conf is not None
+        if row.turn > 0:
+            assert row.posted_item_id is not None
+            assert len(row.items_read) == 3
+            assert row.reply_text
+
+
+async def test_stance_before_and_after_are_probe_readings(tmp_path, bank_gateway):
+    """A bank agent's stance is what the probe measured, round over round."""
+    bank_gateway.score_next_token.side_effect = (
+        [make_logprob_response(mean=4.0)] * 8      # round 0
+        + [make_logprob_response(mean=6.0)] * 8    # round 1
+        + [make_logprob_response(mean=2.0)] * 8    # round 2
+        + [make_logprob_response(mean=5.0)] * 8    # round 3
+    )
+    await build_orchestrator(_bank_run(), bank_gateway, runs_dir=tmp_path).run()
+
+    rows = _bank_rows(tmp_path)
+    by_turn = {turn: [r for r in rows if r.turn == turn] for turn in range(4)}
+    assert {r.stance_after for r in by_turn[0]} == {4.0}
+    assert {r.stance_after for r in by_turn[1]} == {6.0}
+    assert {r.stance_before for r in by_turn[1]} == {4.0}  # round 0's reading
+    assert {r.stance_before for r in by_turn[2]} == {6.0}
+    assert {r.stance_after for r in by_turn[3]} == {5.0}
+
+
+async def test_round_zero_reads_nothing_and_posts_nothing(tmp_path, bank_gateway):
+    """Not a turn: it measures the starting stance before any agent has read
+    or written anything, so initial_stance is not the only baseline."""
+    await build_orchestrator(_bank_run(), bank_gateway, runs_dir=tmp_path).run()
+
+    for row in (r for r in _bank_rows(tmp_path) if r.turn == 0):
+        assert row.items_read == []
+        assert row.posted_item_id is None
+        assert row.neighbor_agent_ids == []
+        assert row.reply_text == ""
+        assert row.probe_mean is not None
+
+
+async def test_round_zero_makes_no_reply_calls(tmp_path, bank_gateway):
+    await build_orchestrator(_bank_run(K=1), bank_gateway, runs_dir=tmp_path).run()
+    # 8 replies for the single round, none for round 0.
+    assert bank_gateway.generate.await_count == 8
+    assert bank_gateway.score_next_token.await_count == 16
+
+
+async def test_round_zero_is_checkpointed_before_round_one(tmp_path, bank_gateway):
+    """So a crash in round 1 does not cost the starting measurement, and a
+    resume cannot probe round 0 twice."""
+    from sandbox.checkpoint_manager import CheckpointManager
+
+    bank_gateway.generate.side_effect = RuntimeError("boom")
+    with pytest.raises(RuntimeError):
+        await build_orchestrator(_bank_run(), bank_gateway, runs_dir=tmp_path).run()
+
+    assert CheckpointManager(tmp_path).load("bank_run").last_completed_turn == 0
+    assert {r.turn for r in _bank_rows(tmp_path)} == {0}
+
+
+# --- no numbers reach the model ------------------------------------------
+
+
+async def test_no_prompt_a_bank_run_sends_contains_a_stance_line(tmp_path, bank_gateway):
+    await build_orchestrator(_bank_run(), bank_gateway, runs_dir=tmp_path).run()
+
+    for call in bank_gateway.generate.await_args_list:
+        assert "STANCE" not in call.args[0]
+    for call in bank_gateway.score_next_token.await_args_list:
+        assert "STANCE" not in call.args[0]
+
+
+async def test_no_prompt_a_bank_run_sends_contains_a_position_or_an_agent_id(
+    tmp_path, bank_gateway
+):
+    await build_orchestrator(_bank_run(), bank_gateway, runs_dir=tmp_path).run()
+
+    prompts = [c.args[0] for c in bank_gateway.generate.await_args_list] + [
+        c.args[0] for c in bank_gateway.score_next_token.await_args_list
+    ]
+    assert prompts
+    for prompt in prompts:
+        assert "position" not in prompt.lower()
+        assert "agent_" not in prompt
+
+
+# --- sides and items ------------------------------------------------------
+
+
+async def test_the_side_follows_the_last_probe_reading(tmp_path, bank_gateway):
+    """pro above the midpoint, con below. Everyone reads 6.0 at round 0, so
+    every round-1 post must be a pro item."""
+    bank = __import__("sandbox.bank_manager", fromlist=["BankManager"]).BankManager(FIXTURE_BANK)
+    bank_gateway.score_next_token.return_value = make_logprob_response(mean=6.0)
+    await build_orchestrator(_bank_run(K=1), bank_gateway, runs_dir=tmp_path).run()
+
+    posted = [r.posted_item_id for r in _bank_rows(tmp_path) if r.turn == 1]
+    assert posted
+    assert all(bank.side_of(item) == "pro" for item in posted)
+
+
+async def test_a_low_reading_puts_every_agent_on_the_con_side(tmp_path, bank_gateway):
+    bank = __import__("sandbox.bank_manager", fromlist=["BankManager"]).BankManager(FIXTURE_BANK)
+    bank_gateway.score_next_token.return_value = make_logprob_response(mean=2.0)
+    await build_orchestrator(_bank_run(K=1), bank_gateway, runs_dir=tmp_path).run()
+
+    posted = [r.posted_item_id for r in _bank_rows(tmp_path) if r.turn == 1]
+    assert all(bank.side_of(item) == "con" for item in posted)
+
+
+async def test_a_reading_exactly_at_the_midpoint_is_broken_by_a_seeded_draw(
+    tmp_path, bank_gateway
+):
+    """Never clamped to one side and never left undefined: a seeded draw, so
+    the same seed splits the population the same way every time."""
+    bank = __import__("sandbox.bank_manager", fromlist=["BankManager"]).BankManager(FIXTURE_BANK)
+    bank_gateway.score_next_token.return_value = make_logprob_response(mean=4.0)
+
+    for base in ("a", "b"):
+        await build_orchestrator(
+            _bank_run(M=20, N=3, K=1, graph_degree=4, seed=5),
+            bank_gateway,
+            runs_dir=tmp_path / base,
+        ).run()
+
+    def sides(where):
+        return [
+            (r.speaker_agent_id, bank.side_of(r.posted_item_id))
+            for r in sorted(_bank_rows(where), key=lambda r: r.speaker_agent_id)
+            if r.turn == 1
+        ]
+
+    assert sides(tmp_path / "a") == sides(tmp_path / "b")   # reproducible
+    assert len({side for _, side in sides(tmp_path / "a")}) == 2  # genuinely split
+
+
+async def test_an_agent_reads_its_neighbours_posted_items(tmp_path, bank_gateway):
+    """items_read is exactly what the neighbours posted that round, in
+    delivery order."""
+    await build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path).run()
+
+    rows = _bank_rows(tmp_path)
+    for turn in (1, 2):
+        posted = {r.speaker_agent_id: r.posted_item_id for r in rows if r.turn == turn}
+        for row in (r for r in rows if r.turn == turn):
+            assert row.items_read == [posted[n] for n in row.neighbor_agent_ids]
+
+
+async def test_every_row_has_exactly_n_graph_neighbours(tmp_path, bank_gateway):
+    run = _bank_run()
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    for row in (r for r in _bank_rows(tmp_path) if r.turn > 0):
+        assert len(row.neighbor_agent_ids) == run.N
+        assert row.speaker_agent_id not in row.neighbor_agent_ids
+
+
+async def test_neighbours_come_from_the_graph(tmp_path, bank_gateway):
+    run = _bank_run()
+    orchestrator = build_orchestrator(run, bank_gateway, runs_dir=tmp_path)
+    edges = orchestrator._interaction_engine.edges()
+    await orchestrator.run()
+
+    adjacency: dict[str, set[str]] = {}
+    for a, b in edges:
+        adjacency.setdefault(a, set()).add(b)
+        adjacency.setdefault(b, set()).add(a)
+
+    for row in (r for r in _bank_rows(tmp_path) if r.turn > 0):
+        assert set(row.neighbor_agent_ids) <= adjacency[row.speaker_agent_id]
+
+
+async def test_graph_edges_csv_is_written_once_at_run_start(tmp_path, bank_gateway):
+    """Analysis needs the structure the run actually used; rebuilding it from
+    the config afterwards would depend on this networkx version producing the
+    same graph for the same seed."""
+    run = _bank_run()
+    orchestrator = build_orchestrator(run, bank_gateway, runs_dir=tmp_path)
+    expected = orchestrator._interaction_engine.edges()
+    await orchestrator.run()
+
+    path = tmp_path / "bank_run" / "graph_edges.csv"
+    lines = path.read_text().splitlines()
+    assert lines[0] == "agent_a,agent_b"
+    assert [tuple(line.split(",")) for line in lines[1:]] == expected
+    assert len(lines) - 1 == run.M * run.graph_degree // 2
+
+
+async def test_no_graph_edges_file_under_alpha_sampling(tmp_path, bank_gateway):
+    await build_orchestrator(
+        _bank_run(neighbor_strategy="alpha"), bank_gateway, runs_dir=tmp_path
+    ).run()
+    assert not (tmp_path / "bank_run" / "graph_edges.csv").exists()
+
+
+# --- delivery: off, the E4 control ---------------------------------------
+
+
+async def test_delivery_off_makes_no_reply_calls_but_probes_every_round(
+    tmp_path, bank_gateway
+):
+    """The control measures how far stance drifts from the probing alone, so
+    the probes must all happen and the replies must all not."""
+    run = _bank_run(delivery="off")
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    assert bank_gateway.generate.await_count == 0
+    assert bank_gateway.score_next_token.await_count == run.M * (run.K + 1)
+
+
+async def test_delivery_off_rows_read_nothing_and_still_succeed(tmp_path, bank_gateway):
+    run = _bank_run(delivery="off")
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    rows = _bank_rows(tmp_path)
+    assert len(rows) == run.M * (run.K + 1)
+    for row in rows:
+        assert row.items_read == []
+        assert row.reply_text == ""
+        assert row.api_call_status == "success"
+        assert row.probe_mean is not None
+
+
+async def test_delivery_off_still_resolves_neighbours_and_posts(tmp_path, bank_gateway):
+    """Sides, items and neighbours are still resolved, so every seeded stream
+    consumes identically to a delivery-on arm. The control then differs from
+    the treatment in what agents SAW and in nothing else."""
+    on, off = tmp_path / "on", tmp_path / "off"
+    await build_orchestrator(_bank_run(seed=3), bank_gateway, runs_dir=on).run()
+    await build_orchestrator(
+        _bank_run(seed=3, delivery="off"), bank_gateway, runs_dir=off
+    ).run()
+
+    def signature(where):
+        return [
+            (r.turn, r.speaker_agent_id, tuple(r.neighbor_agent_ids), r.posted_item_id)
+            for r in _bank_rows(where)
+        ]
+
+    assert signature(on) == signature(off)
+
+
+async def test_delivery_off_prompts_show_no_feed_and_no_memory(tmp_path, bank_gateway):
+    await build_orchestrator(
+        _bank_run(delivery="off"), bank_gateway, runs_dir=tmp_path
+    ).run()
+
+    for call in bank_gateway.score_next_token.await_args_list:
+        assert "Posts in your feed" not in call.args[0]
+        assert "Earlier in this discussion" not in call.args[0]
+
+
+async def test_delivery_off_probes_carry_the_lean_only_at_round_zero(
+    tmp_path, bank_gateway
+):
+    """The reason include_lean is explicit rather than inferred from an empty
+    history: a delivery-off arm has an empty history on every round, and
+    inferring would re-anchor it to its starting lean at every probe."""
+    run = _bank_run(delivery="off", K=2)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    prompts = [c.args[0] for c in bank_gateway.score_next_token.await_args_list]
+    # "the view that" is the phrase every one of the seven lean sentences
+    # shares; matching on "hold the view that" alone would miss the two that
+    # read "somewhat lean towards".
+    with_lean = [p for p in prompts if "the view that" in p]
+    assert len(with_lean) == run.M  # round 0 only, one per agent
+    assert len(prompts) == run.M * (run.K + 1)
+
+
+# --- memory ---------------------------------------------------------------
+
+
+async def test_memory_accumulates_reads_and_replies_across_rounds(tmp_path, bank_gateway):
+    bank_gateway.generate.side_effect = [
+        make_backend_response(text=f"reply number {i}") for i in range(100)
+    ]
+    await build_orchestrator(_bank_run(K=3), bank_gateway, runs_dir=tmp_path).run()
+
+    prompts = [c.args[0] for c in bank_gateway.generate.await_args_list]
+    round_one = prompts[:8]
+    round_three = prompts[16:24]
+
+    assert all("Earlier in this discussion" not in p for p in round_one)
+    assert all("Earlier in this discussion" in p for p in round_three)
+    assert all(p.count("You replied:") == 2 for p in round_three)
+
+
+async def test_memory_is_capped_at_memory_rounds(tmp_path, bank_gateway):
+    await build_orchestrator(_bank_run(K=5, memory_rounds=2), bank_gateway, runs_dir=tmp_path).run()
+
+    prompts = [c.args[0] for c in bank_gateway.generate.await_args_list]
+    assert all(p.count("You replied:") <= 2 for p in prompts)
+    assert any(p.count("You replied:") == 2 for p in prompts)
+
+
+async def test_the_probe_sees_this_rounds_reply(tmp_path, bank_gateway):
+    """Phase B runs after Phase A precisely so the probe reads the reply the
+    agent just wrote. That is the agent's own output, read by nobody else, so
+    it is not a Fix F violation."""
+    bank_gateway.generate.return_value = make_backend_response(text="MARKER-THIS-ROUND")
+    await build_orchestrator(_bank_run(K=1), bank_gateway, runs_dir=tmp_path).run()
+
+    round_one_probes = [c.args[0] for c in bank_gateway.score_next_token.await_args_list][8:]
+    assert len(round_one_probes) == 8
+    assert all("MARKER-THIS-ROUND" in p for p in round_one_probes)
+
+
+async def test_the_probe_is_never_written_into_memory(tmp_path, bank_gateway):
+    """The whole reason the probe is a separate call: measuring an agent must
+    not change what it is shown next round."""
+    bank_gateway.score_next_token.return_value = make_logprob_response(
+        top_logprobs=[("5", -0.01), ("PROBE-ONLY-TOKEN", -9.0)]
+    )
+    await build_orchestrator(_bank_run(K=3), bank_gateway, runs_dir=tmp_path).run()
+
+    for call in bank_gateway.generate.await_args_list:
+        assert "PROBE-ONLY-TOKEN" not in call.args[0]
+        assert "Answer with a single digit" not in call.args[0]
+        assert "Should the fare subsidy continue?" not in call.args[0]
+
+
+# --- Fix F ---------------------------------------------------------------
+
+
+async def test_no_agent_reads_another_agents_same_round_reply(tmp_path, bank_gateway):
+    """Fix F, in the bank regime. Posts are bank items resolved before
+    dispatch, so a same-round reply cannot reach another agent's feed -- and
+    this checks the replies themselves never appear in anyone else's prompt."""
+    counter = iter(range(1, 500))
+    bank_gateway.generate.side_effect = lambda *a, **k: make_backend_response(
+        text=f"ROUNDMARKER-{next(counter)}"
+    )
+    await build_orchestrator(_bank_run(K=3), bank_gateway, runs_dir=tmp_path).run()
+
+    rows = _bank_rows(tmp_path)
+    for turn in (1, 2, 3):
+        this_round = {r.reply_text for r in rows if r.turn == turn}
+        block = [c.args[0] for c in bank_gateway.generate.await_args_list][
+            (turn - 1) * 8 : turn * 8
+        ]
+        for prompt in block:
+            for marker in this_round:
+                assert marker not in prompt, f"round {turn} prompt carried {marker!r}"
+
+
+async def test_items_are_resolved_before_any_dispatch(tmp_path, bank_gateway):
+    """An agent's own posted item must not depend on anyone's turn-t output.
+    Driven by making every probe differ: if items were resolved mid-dispatch,
+    later agents' sides would reflect earlier agents' new readings."""
+    readings = iter([make_logprob_response(mean=m) for m in [4] * 8 + [6, 2] * 50])
+    bank_gateway.score_next_token.side_effect = lambda *a, **k: next(readings)
+
+    first, second = tmp_path / "a", tmp_path / "b"
+    for where in (first, second):
+        readings = iter([make_logprob_response(mean=m) for m in [4] * 8 + [6, 2] * 50])
+        bank_gateway.score_next_token.side_effect = lambda *a, **k: next(readings)
+        await build_orchestrator(_bank_run(seed=17), bank_gateway, runs_dir=where).run()
+
+    def signature(where):
+        return [(r.turn, r.speaker_agent_id, r.posted_item_id) for r in _bank_rows(where)]
+
+    assert signature(first) == signature(second)
+
+
+# --- the error taxonomy ---------------------------------------------------
+
+
+async def test_a_reply_failure_is_logged_and_not_applied(tmp_path, bank_gateway):
+    """No invented reply, and no stance record: Fix I, unchanged."""
+    bank_gateway.generate.side_effect = FatalGatewayError("bad key")
+    run = _bank_run(K=1)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    rows = _bank_rows(tmp_path)
+    round_one = [r for r in rows if r.turn == 1]
+    assert len(round_one) == run.M
+    for row in round_one:
+        assert row.api_call_status == "failed_logged_null"
+        assert row.reply_text == ""
+        assert row.probe_mean is None
+        assert row.stance_after == row.stance_before
+
+
+async def test_a_failed_reply_spends_no_probe_call(tmp_path, bank_gateway):
+    """The agent will not be applied this round whatever the probe says, so
+    probing it would spend a call on a reading nothing can consume."""
+    bank_gateway.generate.side_effect = FatalGatewayError("bad key")
+    run = _bank_run(K=1)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    assert bank_gateway.score_next_token.await_count == run.M  # round 0 only
+
+
+async def test_a_probe_below_the_mass_floor_is_logged_and_not_applied(
+    tmp_path, bank_gateway
+):
+    """ProbeMassTooLow is a per-agent event, not a reason to end the run: the
+    model answered something other than a scale point."""
+    bank_gateway.score_next_token.side_effect = (
+        [make_logprob_response(mean=5.0)] * 8                    # round 0 succeeds
+        + [make_logprob_response(mean=5.0, off_scale=0.9)] * 8   # round 1 is off-scale
+    )
+    await build_orchestrator(_bank_run(K=1), bank_gateway, runs_dir=tmp_path).run()
+
+    round_one = [r for r in _bank_rows(tmp_path) if r.turn == 1]
+    assert len(round_one) == 8
+    for row in round_one:
+        assert row.api_call_status == "failed_logged_null"
+        assert row.probe_mean is None and row.probe_dist is None
+        assert row.stance_after == row.stance_before
+        assert row.reply_text  # the reply happened; only the measurement failed
+
+
+async def test_a_failed_probe_leaves_no_stance_record_or_memory_slot(
+    tmp_path, bank_gateway
+):
+    from sandbox.models import Agent
+
+    bank_gateway.score_next_token.side_effect = (
+        [make_logprob_response(mean=5.0)] * 8                   # round 0
+        + [make_logprob_response(mean=5.0, off_scale=0.9)] * 8  # round 1 fails
+        + [make_logprob_response(mean=6.0)] * 8                 # round 2
+    )
+    await build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path).run()
+
+    agents = [
+        Agent.model_validate_json(line)
+        for line in (tmp_path / "bank_run" / "agents_final.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    for agent in agents:
+        assert [r.turn for r in agent.stance_history] == [0, 2]  # round 1 absent
+
+    # Round 2's prompts remember round 2's own feed only, never round 1's.
+    round_two_prompts = [c.args[0] for c in bank_gateway.generate.await_args_list][8:]
+    assert all(p.count("You replied:") == 0 for p in round_two_prompts)
+
+
+async def test_a_fatal_probe_error_is_absorbed_per_agent(tmp_path, bank_gateway):
+    bank_gateway.score_next_token.side_effect = FatalGatewayError("no logprobs")
+    await build_orchestrator(_bank_run(K=1), bank_gateway, runs_dir=tmp_path).run()
+
+    rows = _bank_rows(tmp_path)
+    assert len(rows) == 16
+    assert all(r.api_call_status == "failed_logged_null" for r in rows)
+
+
+async def test_an_unexpected_exception_still_aborts_a_bank_run(tmp_path, bank_gateway):
+    """Only the designed failure modes get soft handling. gather(...,
+    return_exceptions=True) flattens real bugs into return values, so _unwrap
+    has to re-raise them."""
+    bank_gateway.generate.side_effect = RuntimeError("nobody planned for this")
+    with pytest.raises(RuntimeError, match="nobody planned for"):
+        await build_orchestrator(_bank_run(), bank_gateway, runs_dir=tmp_path).run()
+
+
+async def test_a_cost_ceiling_still_aborts_a_bank_run(tmp_path, bank_gateway):
+    bank_gateway.score_next_token.side_effect = CostCeilingExceeded(10.0, 5.0)
+    with pytest.raises(CostCeilingExceeded):
+        await build_orchestrator(_bank_run(), bank_gateway, runs_dir=tmp_path).run()
+
+
+async def test_a_probe_failure_at_round_zero_does_not_abort_the_run(
+    tmp_path, bank_gateway
+):
+    """An agent with no round-0 reading falls back to initial_stance for its
+    first side assignment -- a configured value, not a fabricated one -- and
+    is probed again next round like everyone else."""
+    bank_gateway.score_next_token.side_effect = [
+        make_logprob_response(mean=5.0, off_scale=0.9)
+    ] + [make_logprob_response(mean=5.0)] * 100
+
+    await build_orchestrator(_bank_run(K=1), bank_gateway, runs_dir=tmp_path).run()
+
+    rows = _bank_rows(tmp_path)
+    failed = [r for r in rows if r.api_call_status == "failed_logged_null"]
+    assert len(failed) == 1 and failed[0].turn == 0
+    assert len([r for r in rows if r.turn == 1]) == 8
+
+
+# --- token accounting -----------------------------------------------------
+
+
+async def test_token_counts_are_summed_over_both_calls(tmp_path, bank_gateway):
+    """A round is two calls, and every analysis reads these columns as "what
+    this agent-round cost"."""
+    bank_gateway.generate.return_value = make_backend_response(
+        prompt_tokens=100, completion_tokens=20, latency_ms=50
+    )
+    bank_gateway.score_next_token.return_value = make_logprob_response(
+        mean=5.0, prompt_tokens=70, completion_tokens=1, latency_ms=10
+    )
+    await build_orchestrator(_bank_run(K=1), bank_gateway, runs_dir=tmp_path).run()
+
+    rows = _bank_rows(tmp_path)
+    for row in (r for r in rows if r.turn == 1):
+        assert row.prompt_token_count == 170
+        assert row.completion_token_count == 21
+        assert row.latency_ms == 60
+    for row in (r for r in rows if r.turn == 0):
+        assert row.prompt_token_count == 70  # probe only
+        assert row.completion_token_count == 1
+
+
+# --- wiring ---------------------------------------------------------------
+
+
+def test_build_orchestrator_selects_the_graph_strategy_and_the_bank():
+    from sandbox.bank_manager import BankManager
+    from sandbox.interaction_engine import AlphaSampling, GraphSampling
+
+    graph = build_orchestrator(_bank_run(), mock_gateway_stub())
+    assert isinstance(graph._interaction_engine, GraphSampling)
+    assert isinstance(graph._bank, BankManager)
+
+    alpha = build_orchestrator(_run(), mock_gateway_stub())
+    assert isinstance(alpha._interaction_engine, AlphaSampling)
+    assert alpha._bank is None
+
+
+def mock_gateway_stub():
+    from unittest.mock import create_autospec
+
+    from sandbox.model_gateway import ModelGateway
+
+    gateway = create_autospec(ModelGateway, instance=True)
+    gateway.model_backend_id = "gpt-4o"
+    gateway.supports_vision = True
+    return gateway
+
+
+def test_the_graph_is_built_from_the_graph_seed():
+    """So the four language arms of a trial share a structure."""
+    english = build_orchestrator(_bank_run(language_condition="english"), mock_gateway_stub())
+    hindi = build_orchestrator(_bank_run(language_condition="hindi"), mock_gateway_stub())
+    other_seed = build_orchestrator(_bank_run(seed=999), mock_gateway_stub())
+
+    assert english._interaction_engine.edges() == hindi._interaction_engine.edges()
+    assert english._interaction_engine.edges() != other_seed._interaction_engine.edges()
+
+
+def test_a_bank_orchestrator_without_a_bank_raises():
+    """Rather than failing on the first pick, with the run directory and the
+    config already written."""
+    from sandbox.simulation_orchestrator import SimulationOrchestrator
+
+    run = _bank_run()
+    with pytest.raises(ValueError, match="requires a BankManager"):
+        SimulationOrchestrator(
+            run=run,
+            agent_manager=None, interaction_engine=None, meme_pool=None,
+            gateway=None, logger=None, checkpoint_mgr=None, prompt_builder=None,
+            seeds=None, bank=None,
+        )
+
+
+def test_the_graph_nodes_match_the_population_ids():
+    """agent_id_for is shared by the wiring and by initialize_population, so a
+    drift between them would build a graph whose nodes are not the run's
+    agents."""
+    orchestrator = build_orchestrator(_bank_run(M=12, graph_degree=4), mock_gateway_stub())
+    nodes = {a for edge in orchestrator._interaction_engine.edges() for a in edge}
+    orchestrator._agent_manager.initialize_population()
+    population = {a.agent_id for a in orchestrator._agent_manager.all_agents()}
+    assert population == nodes
+
+
+# --- resume ---------------------------------------------------------------
+
+
+def _crash_in_round(bank_gateway, round_number: int, agents: int = 8):
+    """Lets `round_number - 1` rounds of replies succeed, then fails them all.
+
+    Failing every agent in the round matters: the orchestrator writes rows
+    only after asyncio.gather returns, and _unwrap re-raises before the write
+    loop, so a round in which everyone fails leaves no partial rows behind. A
+    round in which only some fail would leave rows with no checkpoint, which
+    is the known re-logging gap and a different situation from this one.
+    """
+    bank_gateway.generate.side_effect = [
+        make_backend_response(text=f"reply in round {r}")
+        for r in range(1, round_number)
+        for _ in range(agents)
+    ] + [RuntimeError("boom")] * (agents * 10)
+
+
+async def test_resume_continues_a_bank_run_from_the_checkpoint(tmp_path, bank_gateway):
+    _crash_in_round(bank_gateway, 3)
+    with pytest.raises(RuntimeError):
+        await build_orchestrator(_bank_run(K=4), bank_gateway, runs_dir=tmp_path).run()
+    assert {r.turn for r in _bank_rows(tmp_path)} == {0, 1, 2}
+
+    bank_gateway.generate.side_effect = None
+    bank_gateway.generate.return_value = make_backend_response(text="a resumed reply")
+    await build_orchestrator(_bank_run(K=4), bank_gateway, runs_dir=tmp_path).run()
+
+    assert {r.turn for r in _bank_rows(tmp_path)} == {0, 1, 2, 3, 4}
+
+
+async def test_a_resume_does_not_probe_round_zero_again(tmp_path, bank_gateway):
+    """Two turn-0 rows would mean two turn-0 records in every agent's history
+    and a doubled starting measurement in the dataset."""
+    _crash_in_round(bank_gateway, 2)
+    with pytest.raises(RuntimeError):
+        await build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path).run()
+
+    bank_gateway.generate.side_effect = None
+    bank_gateway.generate.return_value = make_backend_response(text="a resumed reply")
+    await build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path).run()
+
+    round_zero = [r for r in _bank_rows(tmp_path) if r.turn == 0]
+    assert len(round_zero) == 8
+    assert len({r.speaker_agent_id for r in round_zero}) == 8
+
+
+async def test_a_resumed_bank_run_posts_the_items_it_would_have_posted(
+    tmp_path, bank_gateway
+):
+    """The bank cycle counts are not in the checkpoint, so without rebuilding
+    them from the log a resumed run would restart every sender's cycle and
+    post items it had already used."""
+    clean = tmp_path / "clean"
+    bank_gateway.generate.return_value = make_backend_response(text="a reply")
+    await build_orchestrator(_bank_run(K=4), bank_gateway, runs_dir=clean).run()
+
+    crashed = tmp_path / "crashed"
+    _crash_in_round(bank_gateway, 3)
+    with pytest.raises(RuntimeError):
+        await build_orchestrator(_bank_run(K=4), bank_gateway, runs_dir=crashed).run()
+    bank_gateway.generate.side_effect = None
+    bank_gateway.generate.return_value = make_backend_response(text="a reply")
+    await build_orchestrator(_bank_run(K=4), bank_gateway, runs_dir=crashed).run()
+
+    def posted(where):
+        return [
+            (r.turn, r.speaker_agent_id, r.posted_item_id, tuple(r.items_read))
+            for r in _bank_rows(where)
+        ]
+
+    assert posted(crashed) == posted(clean)
+
+
+async def test_restored_bank_counts_match_an_uninterrupted_runs(tmp_path, bank_gateway):
+    """Checked directly, not only through the output: the counts are what the
+    next pick reads, so an off-by-one here would surface as a subtly different
+    item sequence rather than as an error."""
+    bank_gateway.generate.return_value = make_backend_response(text="a reply")
+    uninterrupted = build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path / "a")
+    await uninterrupted.run()
+
+    resumed = build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path / "a")
+    resumed._agent_manager.initialize_population()
+    resumed._restore_bank_state()
+
+    assert resumed._bank.post_counts() == uninterrupted._bank.post_counts()
+    assert sum(resumed._bank.post_counts().values()) == 8 * 2
+
+
+async def test_a_resumed_run_remembers_the_rounds_it_already_ran(tmp_path, bank_gateway):
+    """Remembered rounds cannot be checkpointed without putting every post's
+    text into agent state, so they are rebuilt from the log. Without that, a
+    resumed run would show its agents an empty memory and change the stimulus
+    mid-run -- the same defect _rebuild_last_posts exists to prevent in the
+    generated regime."""
+    _crash_in_round(bank_gateway, 3)
+    with pytest.raises(RuntimeError):
+        await build_orchestrator(_bank_run(K=4), bank_gateway, runs_dir=tmp_path).run()
+
+    resumed = build_orchestrator(_bank_run(K=4), bank_gateway, runs_dir=tmp_path)
+    resumed._agent_manager.restore_from_snapshot(
+        __import__("sandbox.checkpoint_manager", fromlist=["CheckpointManager"])
+        .CheckpointManager(tmp_path)
+        .load("bank_run")
+        .agent_snapshot
+    )
+    resumed._restore_bank_state()
+
+    assert len(resumed._history) == 8
+    for remembered in resumed._history.values():
+        assert len(remembered) == 2          # rounds 1 and 2
+        assert all(r.posts_read for r in remembered)
+        assert all(r.reply_text for r in remembered)
+
+    bank_gateway.generate.side_effect = None
+    bank_gateway.generate.return_value = make_backend_response(text="a resumed reply")
+    await resumed.run()
+
+    round_three_prompts = [c.args[0] for c in bank_gateway.generate.await_args_list][-16:-8]
+    assert all("Earlier in this discussion" in p for p in round_three_prompts)
+    assert all(p.count("You replied:") == 2 for p in round_three_prompts)
+
+
+async def test_rebuilt_memory_is_capped_at_the_window(tmp_path, bank_gateway):
+    bank_gateway.generate.return_value = make_backend_response(text="a reply")
+    await build_orchestrator(
+        _bank_run(K=5, memory_rounds=2), bank_gateway, runs_dir=tmp_path
+    ).run()
+
+    resumed = build_orchestrator(_bank_run(K=5, memory_rounds=2), bank_gateway, runs_dir=tmp_path)
+    resumed._restore_bank_state()
+    assert all(len(v) == 2 for v in resumed._history.values())
+
+
+async def test_a_failed_round_is_not_rebuilt_into_memory(tmp_path, bank_gateway):
+    """Fix I again, on the resume path: a round that was never applied is not
+    in the memory an uninterrupted run would be carrying."""
+    bank_gateway.score_next_token.side_effect = (
+        [make_logprob_response(mean=5.0)] * 8                   # round 0
+        + [make_logprob_response(mean=5.0, off_scale=0.9)] * 8  # round 1 fails
+        + [make_logprob_response(mean=5.0)] * 80
+    )
+    bank_gateway.generate.return_value = make_backend_response(text="a reply")
+    await build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path).run()
+
+    resumed = build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path)
+    resumed._restore_bank_state()
+    for remembered in resumed._history.values():
+        assert len(remembered) == 1  # round 2 only
+
+
+async def test_re_logged_rows_do_not_double_count_the_bank_cycle(tmp_path, bank_gateway):
+    """A run interrupted mid-turn can leave rows with no checkpoint, and the
+    resumed pass re-logs that turn. Keyed on (turn, speaker) with the last
+    write kept, which is the rule export_csv applies on read -- otherwise the
+    rebuilt counts would be too high and the resumed run would skip items."""
+    bank_gateway.generate.return_value = make_backend_response(text="a reply")
+    await build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path).run()
+
+    path = tmp_path / "bank_run" / "interactions.jsonl"
+    original = path.read_text()
+    path.write_text(original + original)  # every row logged twice
+
+    resumed = build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path)
+    resumed._restore_bank_state()
+    assert sum(resumed._bank.post_counts().values()) == 8 * 2  # not 32
+
+
+async def test_rerunning_a_completed_bank_run_is_a_no_op(tmp_path, bank_gateway):
+    bank_gateway.generate.return_value = make_backend_response(text="a reply")
+    await build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path).run()
+    rows_before = len(_bank_rows(tmp_path))
+    replies_before = bank_gateway.generate.await_count
+    probes_before = bank_gateway.score_next_token.await_count
+
+    await build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path).run()
+
+    assert len(_bank_rows(tmp_path)) == rows_before
+    assert bank_gateway.generate.await_count == replies_before
+    assert bank_gateway.score_next_token.await_count == probes_before

@@ -89,3 +89,23 @@ def text_only_gateway(mock_gateway):
     mock_gateway.supports_vision = False
     mock_gateway.model_backend_id = "gpt-3.5-turbo"
     return mock_gateway
+
+
+@pytest.fixture
+def bank_gateway(mock_gateway):
+    """A gateway whose replies look like bank-regime replies.
+
+    mock_gateway's default reply is "STANCE: 5.0\nmy neighbours shifted me",
+    which is the shape the generated regime's parser needs. A bank reply is
+    parsed for nothing and is simply prose, and the difference is not
+    cosmetic: the orchestrator writes the reply verbatim into the agent's
+    memory, so a mock emitting a STANCE line puts the literal word STANCE into
+    later prompts and makes the "no prompt mentions STANCE" audit fail against
+    the fixture rather than against the production code.
+
+    The probe read stays mock_gateway's constant 5.0.
+    """
+    mock_gateway.generate.return_value = make_backend_response(
+        text="The cost point is the one that lands for me."
+    )
+    return mock_gateway

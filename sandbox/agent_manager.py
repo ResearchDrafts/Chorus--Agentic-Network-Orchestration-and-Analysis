@@ -15,6 +15,19 @@ from pathlib import Path
 from sandbox.models import Agent, ExperimentRun, Interaction, StanceRecord
 
 
+def agent_id_for(index: int) -> str:
+    """The canonical agent id for a population index.
+
+    Exists because GraphSampling has to be constructed from the population's
+    ids before the population exists -- build_orchestrator wires the graph,
+    and initialize_population runs later -- so two places need to agree on
+    this format exactly. A drift between them would build a graph whose nodes
+    are not the run's agents, and the first symptom would be every agent
+    raising "not a node in this run's graph" on turn 1.
+    """
+    return f"agent_{index:04d}"
+
+
 class AgentManager:
     def __init__(self, run: ExperimentRun, rng: random.Random):
         self._run = run
@@ -39,7 +52,7 @@ class AgentManager:
             persona = personas[i % len(personas)]  # cycle if M > pool size
             stance = self._draw_initial_stance()
             agent = Agent(
-                agent_id=f"agent_{i:04d}",
+                agent_id=agent_id_for(i),
                 run_id=self._run.run_id,
                 persona=persona,
                 language_condition=self._run.language_condition,
