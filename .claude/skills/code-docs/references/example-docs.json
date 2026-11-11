@@ -1,0 +1,250 @@
+{
+  "project": {
+    "name": "sample",
+    "summary": "Command-line todo list backed by SQLite, plus a small web fetch helper.",
+    "repo_url": "",
+    "base_ref": "c5259b4f98"
+  },
+  "externals": [
+    {
+      "name": "User",
+      "kind": "entity",
+      "note": "runs the CLI"
+    },
+    {
+      "name": "todos.db",
+      "kind": "store",
+      "note": "SQLite file"
+    },
+    {
+      "name": "HTTP API",
+      "kind": "entity",
+      "note": "server at baseUrl, not in this repo"
+    }
+  ],
+  "folders": {
+    ".": "Repo root.",
+    "app": "Python package: CLI, storage, validation.",
+    "tests": "pytest suite for storage and validation.",
+    "web": "Browser-side helpers for fetching and showing todos."
+  },
+  "files": {
+    "app/__init__.py": {
+      "summary": "Empty package marker.",
+      "hash": "da39a3ee5e6b"
+    },
+    "app/cli.py": {
+      "summary": "Argparse entry point. Parses add/list/done and calls TodoStore on todos.db.",
+      "hash": "ed4f1c797c78"
+    },
+    "app/store.py": {
+      "summary": "TodoStore wraps a SQLite connection with add, complete and list operations on a todos table.",
+      "hash": "1ade673a1203"
+    },
+    "app/validate.py": {
+      "summary": "Title cleaning: rejects empty titles, collapses whitespace, truncates to MAX_LEN (120).",
+      "hash": "84729f626ed6"
+    },
+    "tests/test_store.py": {
+      "summary": "pytest tests for TodoStore and clean_title.",
+      "hash": "784ea099d8e7"
+    },
+    "web/api.js": {
+      "summary": "Fetches todos from an HTTP API, renders them as list items, and polls on an interval.",
+      "hash": "656b8da49970"
+    }
+  },
+  "functions": {
+    "app/cli.py::main": "Parses argv (cmd plus optional title), opens TodoStore('todos.db') and runs add, done or list, printing the result.",
+    "app/store.py::TodoStore": "Owns one sqlite3 connection and the todos table.",
+    "app/store.py::TodoStore.__init__": "Connects to the database at path and creates the todos table if missing.",
+    "app/store.py::TodoStore.add": "Cleans the title with clean_title, inserts it with done=0 and returns the new row id.",
+    "app/store.py::TodoStore.complete": "Sets done=1 for todo_id. Returns True only if exactly one row changed.",
+    "app/store.py::TodoStore.list": "Selects all rows and returns them as dicts with id, title and a bool done.",
+    "app/validate.py::clean_title": "Raises ValueError for None or blank input, collapses internal whitespace, then truncates to 120 chars.",
+    "tests/test_store.py::TestStore": "Groups TodoStore tests on an in-memory database.",
+    "tests/test_store.py::TestStore.test_add_and_list": "Adds a messy title and checks list() returns it cleaned and not done.",
+    "tests/test_store.py::TestStore.test_complete_marks_done": "Completes a new todo and checks it is reported done.",
+    "tests/test_store.py::TestStore.test_complete_missing_id": "complete() on an unknown id returns False.",
+    "tests/test_store.py::test_clean_title_rejects_empty": "Empty, blank and None titles raise ValueError.",
+    "tests/test_store.py::test_clean_title_truncates": "A 500-char title is cut to 120.",
+    "web/api.js::fetchTodos": "GETs baseUrl/todos and returns the parsed JSON.",
+    "web/api.js::renderList": "Replaces el.innerHTML with one li per todo title.",
+    "web/api.js::Poller": "Unclear from code",
+    "web/api.js::Poller.constructor": "Stores intervalMs.",
+    "web/api.js::Poller.start": "Calls fn every intervalMs via setInterval and keeps the timer id."
+  },
+  "changes": {
+    "base_ref": "c5259b4f98",
+    "base_note": "merge-base with main",
+    "files": [
+      {
+        "path": "app/cli.py",
+        "status": "modified",
+        "reason": "New 'done' command that calls TodoStore.complete.",
+        "added": [],
+        "modified": [
+          "app/cli.py::main"
+        ],
+        "removed": []
+      },
+      {
+        "path": "app/store.py",
+        "status": "modified",
+        "reason": "Added complete(); add() now validates titles.",
+        "added": [
+          "app/store.py::TodoStore.complete"
+        ],
+        "modified": [
+          "app/store.py::TodoStore.add"
+        ],
+        "removed": []
+      },
+      {
+        "path": "app/validate.py",
+        "status": "added",
+        "reason": "New title validation used by add().",
+        "added": [
+          "app/validate.py::clean_title"
+        ],
+        "modified": [],
+        "removed": []
+      },
+      {
+        "path": "tests/test_store.py",
+        "status": "added",
+        "reason": "Tests for the new behaviour.",
+        "added": [
+          "tests/test_store.py::TestStore",
+          "tests/test_store.py::TestStore.test_add_and_list",
+          "tests/test_store.py::TestStore.test_complete_marks_done",
+          "tests/test_store.py::TestStore.test_complete_missing_id",
+          "tests/test_store.py::test_clean_title_rejects_empty",
+          "tests/test_store.py::test_clean_title_truncates"
+        ],
+        "modified": [],
+        "removed": []
+      }
+    ],
+    "commits": [
+      {
+        "sha": "6bdf2fc",
+        "subject": "add complete() and title validation",
+        "files": [
+          "app/store.py",
+          "app/validate.py"
+        ]
+      },
+      {
+        "sha": "working tree",
+        "subject": "Uncommitted changes",
+        "files": [
+          "tests/"
+        ]
+      }
+    ]
+  },
+  "dfd": {
+    "note": "",
+    "level0": "flowchart LR\n  U[User] -- \"command + title\" --> S((app))\n  S -- \"rows\" --> DB[(todos.db)]\n  DB -- \"rows\" --> S\n  S -- \"printed result\" --> U",
+    "level1": "flowchart LR\n  U[User] -- argv --> P1[cli.py<br/>main]\n  P1 -- title --> P2[validate.py<br/>clean_title]\n  P2 -- clean title --> P3[store.py<br/>TodoStore]\n  P1 -- todo_id --> P3\n  P3 -- SQL --> DB[(todos.db)]\n  DB -- rows --> P3\n  P3 -- dicts / id / bool --> P1\n  P1 -- stdout --> U\n  P4[api.js<br/>fetchTodos] -- GET /todos --> API[HTTP API]\n  P4 -- todos --> P5[renderList]"
+  },
+  "sequences": [
+    {
+      "title": "cli add",
+      "entry": "app/cli.py::main",
+      "mermaid": "sequenceDiagram\n  actor U as User\n  participant C as cli.py\n  participant S as TodoStore\n  participant V as validate.py\n  participant DB as todos.db\n  U->>C: main([\"add\", title])\n  C->>S: add(title)\n  S->>V: clean_title(title)\n  V-->>S: cleaned title\n  S->>DB: INSERT todos\n  DB-->>S: lastrowid\n  S-->>C: id\n  C-->>U: print id"
+    },
+    {
+      "title": "cli done",
+      "entry": "app/cli.py::main",
+      "mermaid": "sequenceDiagram\n  actor U as User\n  participant C as cli.py\n  participant S as TodoStore\n  participant DB as todos.db\n  U->>C: main([\"done\", id])\n  C->>S: complete(int(id))\n  S->>DB: UPDATE todos SET done = 1\n  DB-->>S: rowcount\n  S-->>C: True or False"
+    }
+  ],
+  "skipped_flows": [
+    {
+      "name": "cli list",
+      "reason": "Same shape as add without validation."
+    },
+    {
+      "name": "web Poller",
+      "reason": "No caller in this repo."
+    }
+  ],
+  "tests": {
+    "command": "python -m pytest -q",
+    "groups": [
+      {
+        "file": "tests/test_store.py",
+        "summary": "Storage and validation behaviour added in this change.",
+        "tests": [
+          {
+            "id": "tests/test_store.py::TestStore.test_add_and_list",
+            "summary": "Round trip with title cleaning.",
+            "covers": [
+              "app/store.py::TodoStore.add",
+              "app/store.py::TodoStore.list"
+            ]
+          },
+          {
+            "id": "tests/test_store.py::TestStore.test_complete_marks_done",
+            "summary": "complete() flips done.",
+            "covers": [
+              "app/store.py::TodoStore.complete"
+            ]
+          },
+          {
+            "id": "tests/test_store.py::TestStore.test_complete_missing_id",
+            "summary": "Unknown id returns False.",
+            "covers": [
+              "app/store.py::TodoStore.complete"
+            ]
+          },
+          {
+            "id": "tests/test_store.py::test_clean_title_rejects_empty",
+            "summary": "Blank input rejected (3 cases).",
+            "covers": [
+              "app/validate.py::clean_title"
+            ]
+          },
+          {
+            "id": "tests/test_store.py::test_clean_title_truncates",
+            "summary": "Long titles truncated to 120.",
+            "covers": [
+              "app/validate.py::clean_title"
+            ]
+          }
+        ]
+      }
+    ],
+    "results": {
+      "tests/test_store.py::TestStore.test_add_and_list": {
+        "status": "pass",
+        "time": "0.001",
+        "message": null
+      },
+      "tests/test_store.py::TestStore.test_complete_marks_done": {
+        "status": "pass",
+        "time": "0.000",
+        "message": null
+      },
+      "tests/test_store.py::TestStore.test_complete_missing_id": {
+        "status": "pass",
+        "time": "0.000",
+        "message": null
+      },
+      "tests/test_store.py::test_clean_title_rejects_empty": {
+        "status": "pass",
+        "time": "0.000",
+        "message": null
+      },
+      "tests/test_store.py::test_clean_title_truncates": {
+        "status": "pass",
+        "time": "0.000",
+        "message": null
+      }
+    },
+    "ran_at": "2026-11-11T11:52:07",
+    "report": "docs/code-docs/junit.xml"
+  }
+}

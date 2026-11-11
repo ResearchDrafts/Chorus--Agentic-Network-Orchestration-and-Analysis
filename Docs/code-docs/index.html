@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sandbox Internals</title>
+<style>
+:root{--bg:#fafaf9;--panel:#fff;--ink:#1c1917;--mute:#78716c;--line:#e7e5e4;--acc:#2563eb;
+--add:#16a34a;--mod:#d97706;--del:#dc2626;--non:#a8a29e;--chip:#f5f5f4;--hl:#fef9c3}
+@media (prefers-color-scheme:dark){:root{--bg:#141413;--panel:#1e1e1c;--ink:#ecebe8;--mute:#9b9890;
+--line:#33322f;--acc:#60a5fa;--add:#4ade80;--mod:#fbbf24;--del:#f87171;--non:#6b6964;--chip:#2a2a27;--hl:#3f3a17}}
+*{box-sizing:border-box}body{margin:0;font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;background:var(--bg);color:var(--ink)}
+code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+header{position:sticky;top:0;z-index:5;background:var(--panel);border-bottom:1px solid var(--line);padding:10px 20px;display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+header h1{font-size:16px;margin:0}header .meta{color:var(--mute);font-size:12px}
+nav{display:flex;gap:2px;flex-wrap:wrap}nav button{border:0;background:none;color:var(--mute);padding:6px 11px;border-radius:6px;cursor:pointer;font:inherit}
+nav button.on{background:var(--chip);color:var(--ink);font-weight:600}
+#search{margin-left:auto;position:relative}#search input{width:260px;padding:6px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink)}
+#hits{position:absolute;right:0;top:34px;width:440px;max-height:60vh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 24px #0003;display:none}
+#hits div{padding:6px 10px;cursor:pointer;border-bottom:1px solid var(--line)}#hits div:hover{background:var(--chip)}
+main{max-width:1250px;margin:0 auto;padding:20px}section.tab{display:none}section.tab.on{display:block}
+h2{font-size:18px;margin:4px 0 12px}h3{font-size:15px;margin:18px 0 8px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px}
+.card b{font-size:22px;display:block}.card span{color:var(--mute);font-size:12px}
+table{border-collapse:collapse;width:100%;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}th{font-size:12px;color:var(--mute);font-weight:600;background:var(--chip)}
+.b{display:inline-block;font-size:11px;font-weight:600;padding:1px 7px;border-radius:99px;color:#fff;white-space:nowrap}
+.b.added,.b.pass{background:var(--add)}.b.modified,.b.skip{background:var(--mod)}.b.deleted,.b.fail,.b.error,.b.removed{background:var(--del)}
+.b.untouched,.b.notrun{background:var(--non)}.b.unclear{background:#7c3aed}
+.chip{display:inline-block;background:var(--chip);border-radius:5px;padding:0 6px;margin:2px 3px 2px 0;font-size:12px;cursor:pointer}
+.chip.added{box-shadow:inset 3px 0 var(--add)}.chip.modified{box-shadow:inset 3px 0 var(--mod)}.chip.removed{box-shadow:inset 3px 0 var(--del);cursor:default;text-decoration:line-through}
+.mute{color:var(--mute)}a{color:var(--acc);cursor:pointer;text-decoration:none}
+.tree{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 6px}
+.row{display:flex;gap:8px;align-items:baseline;padding:3px 8px;border-radius:6px;position:relative}.row:hover{background:var(--chip)}
+.row .tw{width:14px;color:var(--mute);cursor:pointer;user-select:none}.row .nm{font-weight:600;white-space:nowrap;cursor:pointer}
+.row .ds{color:var(--mute);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kids{margin-left:18px;border-left:1px dashed var(--line)}.kids.shut{display:none}
+.pop{display:none;position:absolute;left:40%;top:22px;z-index:4;width:min(560px,60vw);background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 24px #0003;padding:8px 10px;font-size:12.5px}
+.row.folder:hover>.pop{display:block}.pop div{padding:2px 0;border-bottom:1px solid var(--line)}
+.dots{display:inline-flex;gap:2px}.dots i{width:7px;height:7px;border-radius:2px;display:inline-block}
+.mmwrap{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:16px;overflow:auto}
+.mmwrap .hd{display:flex;justify-content:space-between;gap:10px;margin-bottom:8px}.mm svg{max-width:100%;height:auto}.mmwrap.big .mm svg{max-width:none}
+.mm-error{color:var(--del);white-space:pre-wrap;font-family:monospace;font-size:12px}
+.file{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:12px;scroll-margin-top:80px}
+.file .top{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}.file .top code{font-weight:700;font-size:13.5px}
+.fns{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:8px;margin-top:10px}
+details.fn{border:1px solid var(--line);border-radius:8px;padding:6px 10px;background:var(--bg);scroll-margin-top:80px}
+details.fn summary{cursor:pointer;list-style:none}details.fn summary::-webkit-details-marker{display:none}
+details.fn summary code{font-weight:600}.io{display:grid;grid-template-columns:34px 1fr;gap:2px 6px;margin:6px 0;font-size:12.5px}
+.io .k{color:var(--mute);font-weight:600}.flash{animation:fl 1.6s}@keyframes fl{0%,40%{background:var(--hl)}}
+.bar{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--chip);margin:6px 0 14px}
+.toolbar{display:flex;gap:14px;align-items:center;margin-bottom:12px;color:var(--mute);font-size:13px}
+.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--mute);margin:-4px 0 12px}
+</style>
+</head>
+<body>
+<header>
+  <div><h1 id="pname">Code docs</h1><div class="meta" id="pmeta"></div></div>
+  <nav id="nav"></nav>
+  <div id="search"><input id="q" placeholder="Search files and functions  ( / )" autocomplete="off"><div id="hits"></div></div>
+</header>
+<main id="main"></main>
+<script src="data.js"></script>
+<script>
+const D = window.CODEDOCS, INV = D.inventory, S = INV.symbols, F = INV.files;
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const UNCLEAR = "Unclear from code";
+const fileStatus = {}; (D.changes.files||[]).forEach(f => fileStatus[f.path] = f.status);
+const symStatus = {}; (D.changes.files||[]).forEach(f => { f.added.forEach(s=>symStatus[s]="added"); f.modified.forEach(s=>symStatus[s]="modified"); });
+const badge = (st, txt) => `<span class="b ${st||'untouched'}">${esc(txt||st||'untouched')}</span>`;
+const sumOf = id => D.functions[id] || "";
+const fsum = p => (D.files[p]||{}).summary || "";
+const first = s => (s||"").split(/(?<=\.)\s/)[0];
+const anchor = s => "a-" + s.replace(/[^A-Za-z0-9]/g, "_");
+const loc = (file, line) => {
+  const u = D.project.repo_url, h = INV.git_head;
+  const t = `${esc(file)}:${line}`;
+  return u && h ? `<a class="mono" href="${esc(u)}/blob/${h}/${esc(file)}#L${line}" target="_blank">${t}</a>` : `<span class="mono mute">${t}</span>`;
+};
+const symChip = (id, cls) => S[id] ? `<span class="chip ${cls||''}" onclick="go('${esc(id)}')">${esc(S[id].qualname)}</span>` : `<span class="chip ${cls||''}">${esc(id.split("::").pop())}</span>`;
+
+const TABS = [["changes","Changes by Claude"],["map","Folder map"],["dfd","Data flow"],["seq","Sequences"],["files","Files & functions"],["tests","Tests"]];
+document.getElementById("nav").innerHTML = TABS.map(([k,v]) => `<button data-tab="${k}">${v}</button>`).join("");
+document.getElementById("main").innerHTML = TABS.map(([k]) => `<section class="tab" id="tab-${k}"></section>`).join("");
+document.getElementById("pname").textContent = D.project.name || "Code docs";
+document.title = (D.project.name || "Code") + " docs";
+document.getElementById("pmeta").textContent = [D.project.summary, INV.git_head && "at " + INV.git_head, "generated " + INV.generated].filter(Boolean).join("  |  ");
+
+/* ---------- Changes ---------- */
+function renderChanges() {
+  const fs = D.changes.files || [], c = k => fs.filter(f => f.status === k).length;
+  const n = k => fs.reduce((a, f) => a + (f[k]||[]).length, 0);
+  const res = Object.values(D.tests.results||{});
+  const pass = res.filter(r=>r.status==="pass").length, fail = res.filter(r=>r.status==="fail"||r.status==="error").length;
+  let h = `<h2>What changed</h2><div class="mute" style="margin:-8px 0 12px">Compared with <code>${esc(D.changes.base_ref||"?")}</code> ${esc(D.changes.base_note?"("+D.changes.base_note+")":"")}</div>
+  <div class="cards">
+   <div class="card"><b style="color:var(--add)">${c("added")}</b><span>files added</span></div>
+   <div class="card"><b style="color:var(--mod)">${c("modified")}</b><span>files modified</span></div>
+   <div class="card"><b style="color:var(--del)">${c("deleted")}</b><span>files deleted</span></div>
+   <div class="card"><b>+${n("added")} ~${n("modified")} -${n("removed")}</b><span>functions / classes</span></div>
+   <div class="card"><b>${res.length ? `<span style="color:var(--add)">${pass}</span> / <span style="color:var(--del)">${fail}</span>` : "not run"}</b><span>tests pass / fail</span></div>
+  </div>`;
+  if (!fs.length) return h + `<p class="mute">No changes against the base ref.</p>`;
+  h += `<table><tr><th>Status</th><th>File</th><th>Why</th><th>Functions touched</th></tr>` + fs.map(f => `<tr>
+    <td>${badge(f.status)}</td><td><a class="mono" onclick="goFile('${esc(f.path)}')">${esc(f.path)}</a></td>
+    <td>${esc(f.reason)}</td>
+    <td>${f.added.map(s=>symChip(s,"added")).join("")}${f.modified.map(s=>symChip(s,"modified")).join("")}${f.removed.map(s=>`<span class="chip removed">${esc(s.split("::").pop())}</span>`).join("")}</td></tr>`).join("") + `</table>
+    <div class="legend" style="margin-top:8px"><span><span class="chip added">name</span>added</span><span><span class="chip modified">name</span>modified</span><span><span class="chip removed">name</span>removed</span></div>`;
+  if ((D.changes.commits||[]).length) h += `<h3>Commits</h3><table><tr><th>Commit</th><th>Message</th><th>Files</th></tr>` +
+    D.changes.commits.map(c => `<tr><td class="mono">${esc(c.sha)}</td><td>${esc(c.subject)}</td><td class="mono mute">${c.files.map(esc).join("<br>")}</td></tr>`).join("") + `</table>`;
+  return h;
+}
+
+/* ---------- Folder map ---------- */
+function renderMap() {
+  const folders = Object.keys(INV.folders).sort(), files = Object.keys(F).sort();
+  const kidsOf = p => folders.filter(f => f !== p && (p === "." ? !f.includes("/") : f.startsWith(p + "/") && !f.slice(p.length+1).includes("/")));
+  const filesIn = p => files.filter(f => (f.includes("/") ? f.slice(0, f.lastIndexOf("/")) : ".") === p);
+  const allFilesUnder = p => files.filter(f => p === "." || f.startsWith(p + "/"));
+  const dots = list => `<span class="dots">${list.filter(f=>fileStatus[f]).slice(0,30).map(f=>`<i style="background:var(--${fileStatus[f]==="added"?"add":fileStatus[f]==="deleted"?"del":"mod"})"></i>`).join("")}</span>`;
+  const node = (p, depth) => {
+    const kids = kidsOf(p), fl = filesIn(p), under = allFilesUnder(p);
+    const name = p === "." ? (D.project.name || "root") + "/" : p.split("/").pop() + "/";
+    const pop = fl.length ? `<div class="pop"><b>${esc(p)}</b> ${fl.length} files<br>` + fl.map(f => `<div><code>${esc(f.split("/").pop())}</code> ${fileStatus[f]?badge(fileStatus[f]):""} <span class="mute">${esc(first(fsum(f)) || F[f].lang)}</span></div>`).join("") + `</div>` : "";
+    let h = `<div class="row folder"><span class="tw" onclick="tog(this)">${depth<2?"▾":"▸"}</span><span class="nm" onclick="tog(this)">📁 ${esc(name)}</span>
+      <span class="mute" style="font-size:12px">${under.length}</span>${dots(under)}<span class="ds">${esc(D.folders[p]||"")}</span>${pop}</div>
+      <div class="kids${depth<2?"":" shut"}">`;
+    kids.forEach(k => h += node(k, depth + 1));
+    fl.forEach(f => h += `<div class="row"><span class="tw"></span><a class="nm mono" onclick="goFile('${esc(f)}')" title="${esc(fsum(f))}">${esc(f.split("/").pop())}</a>
+      ${fileStatus[f]?badge(fileStatus[f]):""}<span class="ds">${esc(first(fsum(f)) || (F[f].source ? "" : F[f].lang === "other" ? "" : F[f].lang))}</span></div>`);
+    return h + `</div>`;
+  };
+  return `<h2>Folder map</h2><div class="legend"><span>Hover a folder to list its files. Click to expand. Coloured squares = changed files (<span style="color:var(--add)">added</span>, <span style="color:var(--mod)">modified</span>, <span style="color:var(--del)">deleted</span>).</span></div>
+    <div class="tree">${node(".", 0)}</div>`;
+}
+window.tog = el => { const r = el.closest(".row"), k = r.nextElementSibling; k.classList.toggle("shut"); r.querySelector(".tw").textContent = k.classList.contains("shut") ? "▸" : "▾"; };
+
+/* ---------- Diagrams ---------- */
+let mmN = 0;
+const mmBox = (title, code, extra) => code ? `<div class="mmwrap"><div class="hd"><b>${esc(title)}</b><span>${extra||""} <a onclick="this.closest('.mmwrap').classList.toggle('big')">full size</a></span></div><div class="mm" data-code="${esc(code)}"></div></div>` : "";
+const extLegend = () => (D.externals||[]).length ? `<div class="legend">Outside the code: ${D.externals.map(e=>`<span><b>${esc(e.name)}</b> ${esc(e.kind||"")}${e.note?" ("+esc(e.note)+")":""}</span>`).join("")}</div>` : "";
+function renderDfd() {
+  const d = D.dfd || {};
+  return `<h2>Data flow diagrams</h2>${d.note?`<p class="mute">${esc(d.note)}</p>`:""}${extLegend()}
+   ${mmBox("Level 0: context", d.level0)}${mmBox("Level 1: main processes", d.level1)}`;
+}
+function renderSeq() {
+  const s = D.sequences || [];
+  let h = `<h2>Sequence diagrams</h2>${extLegend()}`;
+  if (s.length > 1) h += `<p>${s.map((x,i)=>`<a onclick="document.getElementById('seq${i}').scrollIntoView({behavior:'smooth'})">${esc(x.title)}</a>`).join(" &middot; ")}</p>`;
+  h += s.map((x,i) => `<div id="seq${i}">${mmBox(x.title, x.mermaid, x.entry && S[x.entry] ? "entry: " + symChip(x.entry) : "")}${x.summary?`<p class="mute" style="margin:-8px 0 16px">${esc(x.summary)}</p>`:""}</div>`).join("");
+  if ((D.skipped_flows||[]).length) h += `<h3>Flows not diagrammed</h3><table><tr><th>Flow</th><th>Why</th></tr>${D.skipped_flows.map(f=>`<tr><td>${esc(f.name)}</td><td>${esc(f.reason)}</td></tr>`).join("")}</table>`;
+  return h;
+}
+window.CODEDOCS_PENDING = 0;
+async function renderMermaid(sec) {
+  const els = [...sec.querySelectorAll(".mm[data-code]:not([data-done])")];
+  if (!els.length) return;
+  window.CODEDOCS_PENDING += els.length;
+  await mermaidReady;
+  for (const el of els) {
+    el.dataset.done = 1;
+    try {
+      if (!window.mermaid) throw new Error("Mermaid failed to load (offline?). Put mermaid.min.js next to index.html.");
+      const { svg } = await mermaid.render("mm" + (mmN++), el.dataset.code);
+      el.innerHTML = svg;
+    } catch (e) { el.innerHTML = `<div class="mm-error">Diagram error: ${esc(e.message || e)}</div><pre class="mono mute">${esc(el.dataset.code)}</pre>`; }
+    window.CODEDOCS_PENDING--;
+  }
+}
+
+/* ---------- Files & functions ---------- */
+let changedOnly = false;
+function sig(s) {
+  const ps = (s.params||[]).filter(p => p.name !== "self" && p.name !== "cls").map(p => p.name).join(", ");
+  return s.kind === "class" ? `class ${s.name}${s.bases&&s.bases.length?"("+s.bases.join(", ")+")":""}` : `${s.is_async?"async ":""}${s.name}(${ps})`;
+}
+function fnCard(id) {
+  const s = S[id], st = symStatus[id], txt = sumOf(id);
+  const ps = (s.params||[]).filter(p => p.name !== "self" && p.name !== "cls");
+  const inp = s.kind === "class" ? (s.bases&&s.bases.length ? "extends " + esc(s.bases.join(", ")) : "") :
+    ps.length ? ps.map(p => `<code>${esc(p.name)}</code>${p.type?`: <span class="mono mute">${esc(p.type)}</span>`:""}${p.default!=null?` <span class="mute">= ${esc(p.default)}</span>`:""}`).join(", ") : "<span class='mute'>none</span>";
+  const out = s.kind === "class" ? "" : s.returns ? `<span class="mono">${esc(s.returns)}</span>` : "<span class='mute'>not annotated</span>";
+  const open = st || (s.public && !s.is_test) ? " open" : "";
+  return `<details class="fn" id="${anchor(id)}"${open}><summary><code>${esc(sig(s))}</code> ${st?badge(st):""} ${txt===UNCLEAR?badge("unclear","unclear"):""}
+      <span class="mute" style="font-size:11px">${s.kind}${s.qualname.includes(".")?" of "+esc(s.qualname.split(".").slice(0,-1).join(".")):""}</span></summary>
+    <div class="io">${s.kind==="class"?"":`<span class="k">In</span><span>${inp}</span><span class="k">Out</span><span>${out}</span>`}</div>
+    <div>${esc(txt) || "<span class='mute'>no summary</span>"}</div><div style="margin-top:4px">${loc(s.file, s.line)}</div></details>`;
+}
+function renderFiles() {
+  const list = Object.keys(F).filter(f => F[f].source && (!changedOnly || fileStatus[f])).sort();
+  const byFile = {}; Object.keys(S).forEach(id => (byFile[S[id].file] ||= []).push(id));
+  return `<h2>Files & functions</h2><div class="toolbar"><label><input type="checkbox" ${changedOnly?"checked":""} onchange="changedOnly=this.checked;rerender('files')"> changed files only</label>
+    <span>${list.length} files, ${Object.keys(S).length} symbols. Public and changed functions open by default.</span></div>` +
+    list.map(f => {
+      const ids = (byFile[f]||[]).sort((a,b)=>S[a].line-S[b].line);
+      return `<div class="file" id="${anchor(f)}"><div class="top"><code>${esc(f)}</code>${badge(fileStatus[f])}<span class="mute">${F[f].lines} lines, ${esc(F[f].lang)}${F[f].parser==="regex"?" (regex parse)":""}</span></div>
+      <div style="margin-top:4px">${esc(fsum(f)) || "<span class='mute'>no summary</span>"}</div>
+      ${ids.length?`<div class="fns">${ids.map(fnCard).join("")}</div>`:""}</div>`;
+    }).join("");
+}
+
+/* ---------- Tests ---------- */
+function renderTests() {
+  const t = D.tests || {}, R = t.results || {}, groups = t.groups || [];
+  const ids = groups.flatMap(g => (g.tests||[]).map(x => x.id));
+  const st = id => R[id] ? R[id].status : "notrun";
+  const cnt = k => ids.filter(id => st(id) === k).length;
+  const pct = k => ids.length ? 100 * cnt(k) / ids.length : 0;
+  let h = `<h2>Tests added or changed</h2>
+   <div class="cards"><div class="card"><b>${ids.length}</b><span>tests documented</span></div>
+    <div class="card"><b style="color:var(--add)">${cnt("pass")}</b><span>passed</span></div>
+    <div class="card"><b style="color:var(--del)">${cnt("fail")+cnt("error")}</b><span>failed</span></div>
+    <div class="card"><b style="color:var(--mod)">${cnt("skip")}</b><span>skipped</span></div>
+    <div class="card"><b style="color:var(--non)">${cnt("notrun")}</b><span>not run</span></div></div>
+   <div class="bar"><i style="width:${pct("pass")}%;background:var(--add)"></i><i style="width:${pct("fail")+pct("error")}%;background:var(--del)"></i><i style="width:${pct("skip")}%;background:var(--mod)"></i></div>
+   <p>Run: <code>${esc(t.command || "not recorded")}</code> ${t.ran_at?`<span class="mute">last run ${esc(t.ran_at)}</span>`:`<span class="b notrun">not run</span>`}</p>`;
+  if (!groups.length) return h + `<p class="mute">No tests were added or changed.</p>`;
+  h += groups.map(g => `<h3><a class="mono" onclick="goFile('${esc(g.file)}')">${esc(g.file)}</a> ${badge(fileStatus[g.file])}</h3>
+    ${g.summary?`<p style="margin-top:-4px">${esc(g.summary)}</p>`:""}
+    <table><tr><th>Result</th><th>Test</th><th>What it checks</th><th>Covers</th></tr>${(g.tests||[]).map(x => `<tr>
+      <td>${badge(st(x.id), st(x.id)==="notrun"?"not run":st(x.id))}${R[x.id]&&R[x.id].message?`<div class="mute" style="font-size:11px;max-width:220px">${esc(R[x.id].message)}</div>`:""}</td>
+      <td><a class="mono" onclick="go('${esc(x.id)}')">${esc(S[x.id]?S[x.id].qualname:x.id)}</a></td><td>${esc(x.summary)}</td>
+      <td>${(x.covers||[]).map(c=>symChip(c)).join("")}</td></tr>`).join("")}</table>`).join("");
+  if ((t.unmatched||[]).length) h += `<p class="mute">${t.unmatched.length} results in the report did not match a documented test.</p>`;
+  return h;
+}
+
+/* ---------- navigation, search ---------- */
+const R = {changes: renderChanges, map: renderMap, dfd: renderDfd, seq: renderSeq, files: renderFiles, tests: renderTests};
+const done = {};
+window.rerender = k => { done[k] = 0; show(k); };
+function show(k) {
+  document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.tab === k));
+  document.querySelectorAll("section.tab").forEach(s => s.classList.toggle("on", s.id === "tab-" + k));
+  const sec = document.getElementById("tab-" + k);
+  if (!done[k]) { sec.innerHTML = R[k](); done[k] = 1; }
+  renderMermaid(sec);
+  if (location.hash.slice(1) !== k) history.replaceState(null, "", "#" + k);
+}
+const flash = el => { if (!el) return; el.scrollIntoView({behavior:"smooth", block:"center"}); el.classList.remove("flash"); void el.offsetWidth; el.classList.add("flash"); };
+window.goFile = f => { if (changedOnly && !fileStatus[f]) { changedOnly = false; done.files = 0; } show("files"); flash(document.getElementById(anchor(f))); };
+window.go = id => { if (!S[id]) return; if (changedOnly && !fileStatus[S[id].file]) { changedOnly = false; done.files = 0; } show("files"); const el = document.getElementById(anchor(id)); if (el) { el.open = true; flash(el); } };
+document.getElementById("nav").onclick = e => e.target.dataset.tab && show(e.target.dataset.tab);
+const q = document.getElementById("q"), hits = document.getElementById("hits");
+q.oninput = () => {
+  const v = q.value.trim().toLowerCase();
+  if (!v) { hits.style.display = "none"; return; }
+  const fr = Object.keys(F).filter(f => F[f].source && (f.toLowerCase().includes(v) || fsum(f).toLowerCase().includes(v))).slice(0, 8).map(f => `<div onclick="goFile('${esc(f)}')"><code>${esc(f)}</code> <span class="mute">${esc(first(fsum(f)))}</span></div>`);
+  const sr = Object.keys(S).filter(id => S[id].qualname.toLowerCase().includes(v) || sumOf(id).toLowerCase().includes(v)).slice(0, 25).map(id => `<div onclick="go('${esc(id)}')"><code>${esc(S[id].qualname)}</code> <span class="mute">${esc(S[id].file)}</span><br><span class="mute" style="font-size:12px">${esc(first(sumOf(id)))}</span></div>`);
+  hits.innerHTML = fr.concat(sr).join("") || "<div class='mute'>no matches</div>"; hits.style.display = "block";
+};
+hits.onclick = () => { hits.style.display = "none"; };
+document.addEventListener("keydown", e => { if (e.key === "/" && document.activeElement !== q) { e.preventDefault(); q.focus(); } if (e.key === "Escape") hits.style.display = "none"; });
+
+/* ---------- Mermaid loader: CDN first, local mermaid.min.js fallback ---------- */
+const mermaidReady = new Promise(res => {
+  const init = () => { if (window.mermaid) mermaid.initialize({startOnLoad:false, securityLevel:"strict",
+      theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default", flowchart:{htmlLabels:true}, sequence:{showSequenceNumbers:false}}); res(); };
+  const load = (src, next) => { const s = document.createElement("script"); s.src = src; s.onload = init; s.onerror = next; document.head.appendChild(s); };
+  load("https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js", () => load("mermaid.min.js", init));
+});
+const start = TABS.some(([k]) => k === location.hash.slice(1)) ? location.hash.slice(1) : "changes";
+show(start);
+mermaidReady.then(() => { window.CODEDOCS_READY = true; });
+</script>
+</body>
+</html>
