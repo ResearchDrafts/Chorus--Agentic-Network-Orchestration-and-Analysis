@@ -4,7 +4,7 @@ import pytest
 import yaml
 
 from sandbox.model_gateway import ModelGateway
-from tests.factories import make_backend_response
+from tests.factories import make_backend_response, make_logprob_response
 
 
 def _base_config_dict() -> dict:
@@ -66,6 +66,18 @@ def mock_gateway():
     """
     gateway = create_autospec(ModelGateway, instance=True)
     gateway.generate.return_value = make_backend_response()
+    # The bank regime's second call. autospec already produced an AsyncMock
+    # for it, for the same reason it did for generate(), so only the return
+    # value is set here.
+    #
+    # The default read is all mass on 5, so probe_mean is 5.0 for every agent
+    # on every round. Constant on purpose: the orchestrator assigns sides from
+    # probe_mean, so a constant read gives every test a known, identical side
+    # assignment in every language arm, which is what the matched-set
+    # comparison needs. Tests that want movement or a side split override:
+    #     mock_gateway.score_next_token.return_value = make_logprob_response(mean=2.0)
+    #     mock_gateway.score_next_token.side_effect = [...]
+    gateway.score_next_token.return_value = make_logprob_response(mean=5.0)
     gateway.model_backend_id = "gpt-4o"
     gateway.supports_vision = True
     return gateway
