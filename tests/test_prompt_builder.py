@@ -371,3 +371,508 @@ def test_stance_values_render_without_trailing_zeroes(meme_lookup):
     )
     assert "position is 4 on a scale" in built.text
     assert "(position 6.5)" in built.text
+
+
+# =========================================================================
+# RQ1: the bank regime
+#
+# The generated-regime tests above are untouched and must stay passing: the
+# two regimes share build_discussion_prompt and the brief requires the old
+# path to be unaffected.
+# =========================================================================
+
+from sandbox.prompt_builder import LEAN_SENTENCES, RoundMemory  # noqa: E402
+
+BANK_RUN = dict(
+    regime="bank",
+    bank_path="data/bank/test_bank.csv",
+    probe_question="Should the fare subsidy continue?",
+    topic="whether the fare subsidy should continue",
+    stance_low_label="the subsidy should end",
+    stance_high_label="the subsidy should continue",
+)
+
+# Digit-free fixtures. The no-number audit cannot tell a leaked position from
+# a persona that happens to contain a numeral, so none of these contain one.
+PERSONA = "a bus commuter in Pune who reads the news every morning"
+FEED = ["Families already spend a large share of income on this.",
+        "Someone has to pay for it, and the bill lands on working people."]
+HISTORY = [
+    RoundMemory(posts_read=["An earlier cost argument."], reply_text="That matches what I see."),
+    RoundMemory(posts_read=["A later access argument."], reply_text="I am less sure now."),
+]
+
+
+def _bank_builder(**run_overrides) -> PromptBuilder:
+    overrides = {**BANK_RUN, **run_overrides}
+    return PromptBuilder(
+        make_run(**overrides), supports_vision=True, meme_lookup=lambda meme_id: None
+    )
+
+
+def _bank_agent(initial_stance: float = 6.0, **overrides):
+    return make_agent(persona=PERSONA, initial_stance=initial_stance, **overrides)
+
+
+def _reply(builder, *, turn=2, posts=None, history=None, agent=None) -> str:
+    return builder.build_discussion_prompt(
+        agent or _bank_agent(),
+        [],
+        turn,
+        delivered_posts=FEED if posts is None else posts,
+        history_rounds=HISTORY if history is None else history,
+    ).text
+
+
+def _stimulus(prompt: str, builder: PromptBuilder) -> str:
+    """Everything before the language directive: persona, topic, lean, memory,
+    feed. The sections the brief requires to be free of position numbers."""
+    directive = LANGUAGE_DIRECTIVES[builder._run.language_condition]
+    assert directive in prompt
+    return prompt.split(directive)[0]
+
+
+# --- the fourth language condition ---------------------------------------
+
+
+def test_the_fourth_directive_exists_and_is_distinct():
+    assert set(LANGUAGE_DIRECTIVES) == {"english", "hinglish", "romanized_hindi", "hindi"}
+    assert len(set(LANGUAGE_DIRECTIVES.values())) == 4
+
+
+def test_romanized_hindi_names_roman_script_and_rules_out_devanagari():
+    """The condition is Hindi in Roman script. A directive that said only
+    "Hindi" would be indistinguishable from the Devanagari arm's."""
+    directive = LANGUAGE_DIRECTIVES["romanized_hindi"]
+    assert "Roman" in directive
+    assert "Devanagari" in directive
+    assert "Hinglish" not in directive
+
+
+def test_all_four_conditions_render_a_bank_prompt():
+    for condition in LANGUAGE_DIRECTIVES:
+        prompt = _reply(_bank_builder(language_condition=condition))
+        assert LANGUAGE_DIRECTIVES[condition] in prompt
+
+
+# --- no numbers reach an agent (the property the design turns on) --------
+
+
+@pytest.mark.parametrize("turn", [1, 2, 5])
+def test_no_digit_appears_in_the_persona_memory_or_feed_sections(turn):
+    """The reason the probe exists. An agent that can see a position number
+    does not have to read the arguments to answer: it can move its own number
+    towards the numbers it was shown, and the result would look exactly like
+    persuasion."""
+    builder = _bank_builder()
+    stimulus = _stimulus(_reply(builder, turn=turn), builder)
+
+    offenders = [ch for ch in stimulus if ch.isdigit()]
+    assert not offenders, f"digit(s) {offenders} in:\n{stimulus}"
+
+
+def test_no_agent_id_appears_in_a_bank_reply_prompt():
+    """An id is a stable handle an agent could track across rounds
+    ("agent_0012 always says this"), which turns a feed of arguments into a
+    feed of sources."""
+    prompt = _reply(_bank_builder())
+    assert "agent_" not in prompt
+    assert "agent_0000" not in prompt
+
+
+def test_the_bank_prompt_never_states_a_position():
+    prompt = _reply(_bank_builder())
+    assert "position" not in prompt.lower()
+    assert "on a scale" not in prompt.lower()
+
+
+def test_the_bank_prompt_asks_for_no_stance_line():
+    """A bank reply is asked only to be a reply. Nothing parses it for a
+    number, so there is no output contract and no retry-on-parse path."""
+    prompt = _reply(_bank_builder())
+    assert "STANCE" not in prompt
+    assert "Reply to these posts in 1 to 2 sentences." in prompt
+
+
+# --- section order and content -------------------------------------------
+
+
+def test_the_sections_appear_in_the_specified_order():
+    builder = _bank_builder()
+    prompt = _reply(builder, turn=1)
+    order = [
+        "You are: ",
+        "ongoing discussion about",
+        "You hold the view that",          # the lean, round 1 only
+        "Earlier in this discussion:",
+        "Posts in your feed:",
+        LANGUAGE_DIRECTIVES["english"],
+        "Reply to these posts",
+    ]
+    positions = [prompt.index(marker) for marker in order]
+    assert positions == sorted(positions), prompt
+
+
+def test_the_feed_renders_each_delivered_post_as_a_user_post():
+    prompt = _reply(_bank_builder())
+    for text in FEED:
+        assert f"A user posted: {text}" in prompt
+    assert prompt.count("A user posted:") == len(FEED)
+
+
+def test_the_feed_preserves_delivery_order():
+    """Delivery order is part of the stimulus, and the orchestrator derives it
+    from a seeded draw, so the builder must not reorder it."""
+    posts = ["first argument", "second argument", "third argument"]
+    prompt = _reply(_bank_builder(), posts=posts)
+    assert [line.split("A user posted: ")[1] for line in prompt.split("\n")
+            if "A user posted:" in line] == posts
+
+
+def test_an_empty_feed_omits_the_section_entirely():
+    """A heading with nothing under it is itself a stimulus, and a different
+    one from no feed at all. This is the `delivery: off` case."""
+    prompt = _reply(_bank_builder(), posts=[])
+    assert "Posts in your feed" not in prompt
+    assert "Reply to these posts" in prompt  # the instruction still stands
+
+
+# --- the lean sentence ---------------------------------------------------
+
+
+def test_the_lean_sentence_appears_only_in_round_one():
+    """After round 1 the agent's own replies are its history; repeating the
+    lean would keep re-anchoring it to a starting point it may have moved
+    away from."""
+    builder = _bank_builder()
+    assert "You hold the view that" in _reply(builder, turn=1)
+    for turn in (2, 3, 10):
+        assert "hold the view that" not in _reply(builder, turn=turn)
+        assert "undecided" not in _reply(builder, turn=turn)
+
+
+@pytest.mark.parametrize("stance", [1, 2, 3, 4, 5, 6, 7])
+def test_every_scale_point_has_a_lean_sentence_in_words_only(stance):
+    builder = _bank_builder()
+    prompt = _reply(builder, turn=1, agent=_bank_agent(initial_stance=float(stance)))
+    rendered = LEAN_SENTENCES[stance].format(
+        low="the subsidy should end", high="the subsidy should continue"
+    )
+    assert rendered in prompt
+    assert not any(ch.isdigit() for ch in rendered)
+
+
+def test_the_lean_sentence_uses_the_runs_anchor_labels():
+    """So the sentence says something about the topic rather than about the
+    scale."""
+    builder = _bank_builder(
+        stance_low_label="fares should rise", stance_high_label="fares should stay"
+    )
+    prompt = _reply(builder, turn=1, agent=_bank_agent(initial_stance=7.0))
+    assert "fares should stay" in prompt
+
+
+def test_the_two_ends_lean_opposite_ways():
+    builder = _bank_builder()
+    low = _reply(builder, turn=1, agent=_bank_agent(initial_stance=1.0))
+    high = _reply(builder, turn=1, agent=_bank_agent(initial_stance=7.0))
+    assert "the subsidy should end" in low.split("discussion about:")[1].split("Posts")[0]
+    assert "the subsidy should continue" in high.split("discussion about:")[1].split("Posts")[0]
+
+
+def test_the_midpoint_reads_as_undecided():
+    prompt = _reply(_bank_builder(), turn=1, agent=_bank_agent(initial_stance=4.0))
+    assert "undecided" in prompt
+
+
+def test_an_off_scale_initial_stance_raises_rather_than_rounding():
+    """The bank regime is defined against the seven points the probe reads. A
+    silent "you are undecided" would start every agent in a misconfigured run
+    from the middle without saying so."""
+    builder = _bank_builder(stance_scale=[0.0, 1.5, 3.0])
+    with pytest.raises(ValueError, match="no lean sentence"):
+        _reply(builder, turn=1, agent=_bank_agent(initial_stance=1.5))
+    with pytest.raises(ValueError, match="no lean sentence"):
+        _reply(builder, turn=1, agent=_bank_agent(initial_stance=0.0))
+
+
+# --- memory --------------------------------------------------------------
+
+
+def test_memory_renders_reads_and_replies_oldest_first():
+    prompt = _reply(_bank_builder())
+    assert prompt.index("An earlier cost argument.") < prompt.index("A later access argument.")
+    assert "You read: An earlier cost argument." in prompt
+    assert "You replied: That matches what I see." in prompt
+
+
+def test_memory_is_capped_at_memory_rounds():
+    """Fix A's window, in rounds. This is the cap that reaches the model, so
+    it is the one that determines results."""
+    history = [
+        RoundMemory(posts_read=[f"post from round {w}"], reply_text=f"reply {w}")
+        for w in ("alpha", "beta", "gamma", "delta", "epsilon")
+    ]
+    prompt = _reply(_bank_builder(memory_rounds=2), history=history)
+
+    assert "post from round delta" in prompt and "post from round epsilon" in prompt
+    assert "post from round alpha" not in prompt
+    assert "post from round beta" not in prompt
+    assert prompt.count("You replied:") == 2
+
+
+def test_memory_rounds_is_read_from_the_run():
+    for rounds in (1, 3, 5):
+        history = [
+            RoundMemory(posts_read=[f"p{i}"], reply_text=f"r{i}") for i in range(8)
+        ]
+        prompt = _reply(_bank_builder(memory_rounds=rounds), history=history)
+        assert prompt.count("You replied:") == rounds
+
+
+def test_memory_is_omitted_when_there_is_none():
+    prompt = _reply(_bank_builder(), history=[])
+    assert "Earlier in this discussion" not in prompt
+
+
+def test_memory_carries_no_round_numbers_and_no_agent_ids():
+    """Rounds are separated by a rule rather than numbered: "Round 2" would
+    put a digit in front of the model for no benefit."""
+    prompt = _reply(_bank_builder())
+    memory = prompt.split("Earlier in this discussion:")[1].split("Posts in your feed")[0]
+    assert "Round" not in memory
+    assert "agent_" not in memory
+    assert not any(ch.isdigit() for ch in memory)
+
+
+def test_a_delivery_off_round_renders_a_reply_with_no_reads():
+    """Under `delivery: off` an agent replies to nothing, so its memory has
+    replies and no reads."""
+    history = [RoundMemory(posts_read=[], reply_text="still thinking about it")]
+    prompt = _reply(_bank_builder(), history=history)
+    assert "You replied: still thinking about it" in prompt
+    assert "You read:" not in prompt
+
+
+def test_a_failed_round_leaves_no_memory_block():
+    """Fix I: a failed turn is never applied, so it spends no memory slot."""
+    history = [RoundMemory(posts_read=[], reply_text="")]
+    prompt = _reply(_bank_builder(), history=history)
+    assert "Earlier in this discussion" not in prompt
+
+
+# --- the probe prompt ----------------------------------------------------
+
+
+def test_the_probe_prompt_holds_persona_topic_question_anchors_and_instruction():
+    builder = _bank_builder()
+    probe = builder.build_probe_prompt(_bank_agent(), HISTORY)
+
+    assert f"You are: {PERSONA}" in probe
+    assert "whether the fare subsidy should continue" in probe
+    assert "Should the fare subsidy continue?" in probe
+    assert "1 means the subsidy should end" in probe
+    assert "7 means the subsidy should continue" in probe
+    assert probe.endswith("Answer with a single digit from 1 to 7 and nothing else.")
+
+
+def test_the_probe_prompt_is_plain_text_not_a_built_prompt():
+    probe = _bank_builder().build_probe_prompt(_bank_agent(), HISTORY)
+    assert isinstance(probe, str)
+
+
+def test_the_probe_shows_the_same_memory_the_reply_prompt_did():
+    builder = _bank_builder()
+    probe = builder.build_probe_prompt(_bank_agent(), HISTORY)
+    reply = _reply(builder)
+
+    memory = "Earlier in this discussion:" + reply.split("Earlier in this discussion:")[1].split(
+        "Posts in your feed"
+    )[0].rstrip("\n")
+    assert memory.strip() in probe
+
+
+def test_the_probe_never_asks_for_a_reply_or_a_stance_line():
+    probe = _bank_builder().build_probe_prompt(_bank_agent(), HISTORY)
+    assert "Reply to these posts" not in probe
+    assert "STANCE" not in probe
+    assert "sentences" not in probe
+
+
+def test_the_probe_shows_no_feed():
+    """The probe measures; it does not deliver. A feed in the probe context
+    would make the measurement part of the stimulus."""
+    probe = _bank_builder().build_probe_prompt(_bank_agent(), HISTORY)
+    assert "Posts in your feed" not in probe
+    assert "A user posted" not in probe
+
+
+def test_the_probe_carries_no_position_number_before_the_question():
+    """The digits in the anchor and instruction lines are the scale's own
+    definition -- the model cannot answer "a single digit from 1 to 7" without
+    being told that range. Everything ahead of the question must be clean."""
+    builder = _bank_builder()
+    probe = builder.build_probe_prompt(_bank_agent(), HISTORY)
+    stimulus = probe.split("Should the fare subsidy continue?")[0]
+
+    assert not any(ch.isdigit() for ch in stimulus), stimulus
+    assert "position" not in probe.lower()
+    assert "agent_" not in probe
+
+
+def test_the_round_zero_probe_is_persona_topic_and_lean_only():
+    builder = _bank_builder()
+    probe = builder.build_probe_prompt(_bank_agent(initial_stance=2.0), [], include_lean=True)
+
+    assert f"You are: {PERSONA}" in probe
+    assert "You hold the view that the subsidy should end." in probe
+    assert "Earlier in this discussion" not in probe
+    assert "Posts in your feed" not in probe
+
+
+def test_the_lean_is_absent_from_every_probe_after_round_zero():
+    """Including a delivery: off arm, whose history is empty on every round.
+
+    This is why include_lean is a keyword rather than inferred from an empty
+    history: inferring would re-anchor that whole arm to its starting lean at
+    every probe, reintroducing in the control exactly the confound the probe
+    exists to avoid.
+    """
+    builder = _bank_builder()
+    with_history = builder.build_probe_prompt(_bank_agent(), HISTORY)
+    delivery_off = builder.build_probe_prompt(_bank_agent(), [])
+
+    for probe in (with_history, delivery_off):
+        assert "hold the view that" not in probe
+        assert "undecided" not in probe
+
+
+def test_the_probe_question_is_required_and_never_defaulted():
+    """A generic English fallback would silently probe all four arms in
+    English, which is the single most destructive thing that could happen to
+    this experiment and would leave no trace in the output."""
+    run = make_run(**{**BANK_RUN})
+    object.__setattr__(run, "__dict__", {**run.__dict__, "probe_question": None})
+    builder = PromptBuilder(run, supports_vision=True, meme_lookup=lambda m: None)
+
+    with pytest.raises(ValueError, match="requires probe_question"):
+        builder.build_probe_prompt(_bank_agent(), HISTORY)
+
+
+def test_history_rounds_defaults_to_empty():
+    probe = _bank_builder().build_probe_prompt(_bank_agent())
+    assert "Earlier in this discussion" not in probe
+
+
+# --- the RQ1 parity guard, for the bank regime ---------------------------
+
+
+def test_english_and_hindi_prompts_differ_only_in_the_post_texts_and_directive():
+    """The bank-regime restatement of the RQ1 validity guard.
+
+    The orchestrator renders each bank item in the arm's language and hands the
+    strings in, so the two prompts differ in exactly the lines carrying bank
+    text (feed and memory) plus the one directive line. Everything else --
+    persona, topic, lean, headings, the reply instruction -- must be
+    byte-identical, or the arms differ in more than the factor under study.
+    """
+    english_feed = ["The English rendering of the cost argument."]
+    hindi_feed = ["लागत तर्क का हिन्दी रूपांतरण।"]
+    english_history = [RoundMemory(posts_read=["An English earlier post."], reply_text="Agreed.")]
+    hindi_history = [RoundMemory(posts_read=["एक पुरानी हिन्दी पोस्ट।"], reply_text="सहमत।")]
+
+    def render(condition, feed, history):
+        builder = _bank_builder(language_condition=condition)
+        return builder.build_discussion_prompt(
+            _bank_agent(), [], 2, delivered_posts=feed, history_rounds=history
+        ).text.split("\n")
+
+    english = render("english", english_feed, english_history)
+    hindi = render("hindi", hindi_feed, hindi_history)
+
+    variable = set(english_feed + hindi_feed) | {
+        "Agreed.", "सहमत।", "An English earlier post.", "एक पुरानी हिन्दी पोस्ट।",
+        LANGUAGE_DIRECTIVES["english"], LANGUAGE_DIRECTIVES["hindi"],
+    }
+
+    def skeleton(lines):
+        return [
+            line for line in lines
+            if not any(text and text in line for text in variable)
+        ]
+
+    assert skeleton(english) == skeleton(hindi)
+    # And the lines that do differ are exactly the ones carrying bank text or
+    # the directive -- not, say, a reordered heading.
+    assert len(skeleton(english)) < len(english)
+
+
+def test_the_four_arms_share_every_structural_line():
+    builder_lines = {
+        condition: _reply(_bank_builder(language_condition=condition)).split("\n")
+        for condition in LANGUAGE_DIRECTIVES
+    }
+    structural = {
+        condition: [
+            line for line in lines if line != LANGUAGE_DIRECTIVES[condition]
+        ]
+        for condition, lines in builder_lines.items()
+    }
+    baseline = structural["english"]
+    for condition, lines in structural.items():
+        assert lines == baseline, f"{condition} differs beyond its directive"
+
+
+# --- the generated regime is untouched -----------------------------------
+
+
+def test_the_generated_regime_still_takes_the_old_path(meme_lookup):
+    """Same builder, same method, different regime. The old prompt must be
+    byte-for-byte what it was: the generated-regime tests above assert its
+    content, and this asserts the regime switch is what selects it."""
+    builder = _builder(meme_lookup)  # regime defaults to "generated"
+    built = builder.build_discussion_prompt(
+        make_agent(stance_history=_history(2)), [_text_post("agent_0011")], turn=2
+    )
+    assert "Your current position is" in built.text
+    assert "STANCE:" in built.text
+    assert "A user posted" not in built.text
+
+
+def test_the_bank_regime_ignores_neighbor_posts_and_emphasize_format(meme_lookup):
+    """The bank path has no stance to parse, so there is nothing to re-ask
+    for. Passing either must change nothing rather than raise."""
+    builder = _bank_builder()
+    plain = builder.build_discussion_prompt(
+        _bank_agent(), [], 2, delivered_posts=FEED, history_rounds=HISTORY
+    ).text
+    with_extras = builder.build_discussion_prompt(
+        _bank_agent(),
+        [_text_post("agent_0011"), _meme_post("agent_0077")],
+        2,
+        emphasize_format=True,
+        delivered_posts=FEED,
+        history_rounds=HISTORY,
+    ).text
+    assert plain == with_extras
+
+
+def test_a_bank_prompt_never_carries_an_image():
+    built = _bank_builder().build_discussion_prompt(
+        _bank_agent(), [_meme_post("agent_0077")], 2, delivered_posts=FEED
+    )
+    assert built.image is None
+    assert built.used_vision_fallback is False
+
+
+def test_the_bank_builder_does_not_mutate_its_arguments():
+    builder = _bank_builder()
+    agent = _bank_agent()
+    feed, history = list(FEED), list(HISTORY)
+
+    builder.build_discussion_prompt(agent, [], 2, delivered_posts=feed, history_rounds=history)
+    builder.build_probe_prompt(agent, history)
+
+    assert feed == FEED
+    assert history == HISTORY
+    assert agent.stance_history == []

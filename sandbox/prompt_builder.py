@@ -21,6 +21,26 @@ Two constraints dominate everything below:
    stance mid-sentence therefore has that fragment silently deleted from the
    field RQ2's coherence and code-mix analyses consume, so the format
    instruction insists on exactly one STANCE line, first.
+
+**The bank regime (RQ1) adds a third constraint, and drops the second.**
+
+No number reaches an agent. Not its own position, not a neighbour's, not an
+agent id. The generated regime tells each agent "Your current position is 5"
+and shows its feed as "agent_0012 (position 6): ...", which gives an agent
+two things RQ1 cannot afford: an anchor to stay near, and a cheap way to
+answer by arithmetic on the numbers it was shown rather than by reading the
+arguments. Stance is instead read by a separate probe call (probe_scorer),
+which never writes into the agent's history, so measuring an agent cannot
+change what the next round shows it.
+
+The STANCE line goes with it. A bank-regime reply is asked only to be a
+reply; nothing parses it for a number, so there is no output contract to
+emphasise and no retry-on-parse-failure path. Constraint 1 survives
+unchanged and matters more than ever: the four language arms differ in the
+rendering of the bank text and in one directive line, and in nothing else.
+
+Both regimes share `build_discussion_prompt`, which branches on run.regime.
+The generated path below is untouched.
 """
 
 from __future__ import annotations
@@ -44,7 +64,37 @@ MEMORY_WINDOW_TURNS = 5
 LANGUAGE_DIRECTIVES = {
     "english": "Write your reply in English.",
     "hinglish": "Write your reply in Hinglish (Hindi-English code-mixed, Roman script).",
+    "romanized_hindi": "Write your reply in Hindi in Roman script (not Devanagari).",
     "hindi": "Write your reply in Hindi (Devanagari script).",
+}
+
+# Fix A's window for the bank regime, in rounds. Kept as a module constant
+# alongside MEMORY_WINDOW_TURNS so the two regimes' caps are visible in one
+# place, but the bank path reads run.memory_rounds and uses this only as the
+# fallback when a run predates the field.
+DEFAULT_MEMORY_ROUNDS = 3
+
+# The lean sentence, keyed by the agent's initial_stance as an integer.
+#
+# This is the one place an agent is told where it starts, and it is told in
+# words. A number here would defeat the entire point: the probe exists so that
+# an agent is never shown a position as a digit, and seeding round 1 with "you
+# are at 6" would hand it the anchor back on the first turn.
+#
+# Rendered against the run's own anchor labels rather than a generic
+# agree/disagree, so the sentence says something about the topic instead of
+# about the scale. Appears in round 1's reply prompt and in the round-0 probe,
+# and nowhere else -- after round 1 the agent's own replies are its history,
+# and repeating the lean would keep re-anchoring it to a starting point it may
+# have moved away from.
+LEAN_SENTENCES = {
+    1: "You strongly hold the view that {low}.",
+    2: "You hold the view that {low}.",
+    3: "You somewhat lean towards the view that {low}.",
+    4: "You are undecided between the view that {low} and the view that {high}.",
+    5: "You somewhat lean towards the view that {high}.",
+    6: "You hold the view that {high}.",
+    7: "You strongly hold the view that {high}.",
 }
 
 
@@ -64,6 +114,24 @@ class BuiltPrompt:
     text: str
     image: bytes | None
     used_vision_fallback: bool
+
+
+@dataclass
+class RoundMemory:
+    """One past round, as the agent experienced it.
+
+    posts_read is the bank text of what it was shown, already rendered in the
+    language it was shown in -- the builder never looks anything up, so the
+    orchestrator decides which language each post arrives in and this module
+    cannot accidentally render a matched set's four arms the same.
+
+    Empty posts_read with a reply means a round under `delivery: off`, where
+    an agent replies to nothing; empty both means a round whose reply failed
+    and was therefore never applied (Fix I), which leaves no memory slot.
+    """
+
+    posts_read: list[str]
+    reply_text: str
 
 
 class PromptBuilder:
@@ -91,8 +159,38 @@ class PromptBuilder:
         turn: int,
         *,
         emphasize_format: bool = False,
+        delivered_posts: list[str] | None = None,
+        history_rounds: list[RoundMemory] | None = None,
     ) -> BuiltPrompt:
         """Builds one speaker's prompt for one turn.
+
+        Branches on run.regime. The bank path ignores neighbor_posts and
+        emphasize_format entirely -- it has no stance to parse, so there is
+        nothing to re-ask for -- and reads delivered_posts and history_rounds
+        instead. Both are passed by the orchestrator rather than derived here,
+        because only the orchestrator knows which bank item each neighbour
+        posted this round and in which language to render it.
+        """
+        if self._run.regime == "bank":
+            return self._build_bank_reply_prompt(
+                agent,
+                turn,
+                delivered_posts=delivered_posts or [],
+                history_rounds=history_rounds or [],
+            )
+        return self._build_generated_prompt(
+            agent, neighbor_posts, turn, emphasize_format=emphasize_format
+        )
+
+    def _build_generated_prompt(
+        self,
+        agent: Agent,
+        neighbor_posts: list[Interaction],
+        turn: int,
+        *,
+        emphasize_format: bool = False,
+    ) -> BuiltPrompt:
+        """The original path, unchanged.
 
         neighbor_posts is list[Interaction], not list[Agent]: only Interaction
         carries content_type and meme_id, without which the meme path cannot
@@ -124,6 +222,187 @@ class PromptBuilder:
             image=image,
             used_vision_fallback=fallback_used,
         )
+
+    # --- bank regime (RQ1) -----------------------------------------------
+
+    def _build_bank_reply_prompt(
+        self,
+        agent: Agent,
+        turn: int,
+        *,
+        delivered_posts: list[str],
+        history_rounds: list[RoundMemory],
+    ) -> BuiltPrompt:
+        """The reply prompt. Seven sections, in this order:
+
+            1. persona
+            2. topic
+            3. the lean sentence, round 1 only
+            4. memory: what it read and what it replied, oldest first
+            5. the feed: each delivered post's bank text
+            6. the language directive
+            7. "Reply to these posts in 1 to 2 sentences."
+
+        Sections 1-5 carry no digit and no agent id. That is checked by a test
+        rather than only asserted here, because it is the property the whole
+        design turns on: an agent that can see a position number does not have
+        to read the arguments to answer.
+
+        No image, ever: the bank is text in four languages, and
+        used_vision_fallback is False by definition. The BuiltPrompt wrapper is
+        kept so the orchestrator's two regimes return the same type.
+        """
+        sections = [
+            f"You are: {agent.persona}",
+            f"You are taking part in an ongoing discussion about: {self._run.topic}",
+        ]
+        if turn == 1:
+            sections.append(self._lean_section(agent))
+        memory = self._bank_memory_section(history_rounds)
+        if memory:
+            sections.append(memory)
+        feed = self._feed_section(delivered_posts)
+        if feed:
+            sections.append(feed)
+        sections.append(LANGUAGE_DIRECTIVES[self._run.language_condition])
+        sections.append("Reply to these posts in 1 to 2 sentences.")
+
+        return BuiltPrompt(
+            text="\n\n".join(sections), image=None, used_vision_fallback=False
+        )
+
+    def build_probe_prompt(
+        self,
+        agent: Agent,
+        history_rounds: list[RoundMemory] | None = None,
+        *,
+        include_lean: bool = False,
+    ) -> str:
+        """The probe prompt. Text only -- no image, no BuiltPrompt wrapper.
+
+        A fresh context, not a continuation: persona, topic, the same memory
+        the reply prompt showed, the run's survey question, the two anchors in
+        words, and an instruction to answer with one digit. It is never
+        written into the agent's history and never shown to another agent, so
+        the act of measuring an agent cannot change what it or anyone else
+        sees next round.
+
+        include_lean is True for the round-0 probe only, where there is no
+        history yet and the lean sentence is the entire stimulus. It is a
+        keyword rather than inferred from an empty history_rounds, because an
+        empty history is also what a `delivery: off` arm has on every round,
+        and inferring would re-anchor that whole arm to its starting lean at
+        every probe -- which is precisely the confound the probe exists to
+        avoid, reintroduced in the control.
+
+        The digits in the anchor and instruction lines are the scale's own
+        definition, not anybody's position: the model cannot answer "a single
+        digit from 1 to 7" without being told that range. No position number
+        appears anywhere.
+        """
+        sections = [
+            f"You are: {agent.persona}",
+            f"You are taking part in an ongoing discussion about: {self._run.topic}",
+        ]
+        if include_lean:
+            sections.append(self._lean_section(agent))
+        memory = self._bank_memory_section(history_rounds or [])
+        if memory:
+            sections.append(memory)
+
+        sections.append(self._probe_question())
+        sections.append(
+            f"On this scale, 1 means {self._run.stance_low_label}, "
+            f"and 7 means {self._run.stance_high_label}."
+        )
+        sections.append("Answer with a single digit from 1 to 7 and nothing else.")
+        return "\n\n".join(sections)
+
+    def _probe_question(self) -> str:
+        """The run's own question, in the run's own language.
+
+        Required by ExperimentRun when regime == "bank", so this is
+        unreachable through the loader -- kept because a generic English
+        fallback would silently probe all four arms in English, which is the
+        single most destructive thing that could happen to this experiment and
+        would leave no trace in the output.
+        """
+        if not self._run.probe_question:
+            raise ValueError(
+                "regime='bank' requires probe_question: refusing to substitute "
+                "a default, which would probe every language arm in English"
+            )
+        return self._run.probe_question
+
+    def _lean_section(self, agent: Agent) -> str:
+        """Where the agent starts, in words.
+
+        Keyed by initial_stance as an integer. Raises for a stance with no
+        entry rather than rounding to the nearest or defaulting to undecided:
+        the bank regime is defined against a 7-point scale (the probe reads
+        exactly those seven digits), so a run configured with some other
+        stance_scale is misconfigured, and a silent "you are undecided" would
+        make every agent in it start from the middle without saying so.
+        """
+        stance = agent.initial_stance
+        key = int(stance)
+        if key != stance or key not in LEAN_SENTENCES:
+            raise ValueError(
+                f"no lean sentence for initial_stance {stance!r}: the bank regime "
+                f"expects a whole number in {sorted(LEAN_SENTENCES)} "
+                "(the probe reads exactly those seven scale points)"
+            )
+        return LEAN_SENTENCES[key].format(
+            low=self._run.stance_low_label, high=self._run.stance_high_label
+        )
+
+    def _bank_memory_section(self, history_rounds: list[RoundMemory]) -> str:
+        """What this agent read and said in the last `memory_rounds` rounds.
+
+        Oldest first, so the block reads forwards in time. No round numbers,
+        no agent ids, no positions: a round is a block, and blocks are
+        separated by a rule rather than numbered, because "Round 2" would put
+        a digit in front of the model for no benefit.
+
+        Sliced here as well as by the caller, for the reason Fix A's window is
+        sliced at the point of use: this is the cap that reaches the model, so
+        it is the one that determines results.
+        """
+        rounds = self._bank_memory_rounds()
+        recent = history_rounds[-rounds:] if rounds else []
+        if not recent:
+            return ""
+
+        blocks = []
+        for record in recent:
+            lines = [f"  You read: {text}" for text in record.posts_read]
+            if record.reply_text:
+                lines.append(f"  You replied: {record.reply_text}")
+            if lines:
+                blocks.append("\n".join(lines))
+        if not blocks:
+            return ""
+        return "Earlier in this discussion:\n" + "\n  --\n".join(blocks)
+
+    def _bank_memory_rounds(self) -> int:
+        return getattr(self._run, "memory_rounds", DEFAULT_MEMORY_ROUNDS)
+
+    def _feed_section(self, delivered_posts: list[str]) -> str:
+        """The posts this agent was shown.
+
+        "A user posted:" rather than an agent id: an id is a stable handle an
+        agent could track across rounds ("agent_0012 always says this"), which
+        would turn a feed of arguments into a feed of sources. RQ1 asks about
+        the text.
+
+        Empty under `delivery: off`, where the section is omitted entirely
+        rather than rendered as an empty heading -- a heading with nothing
+        under it is itself a stimulus, and a different one from no feed at all.
+        """
+        if not delivered_posts:
+            return ""
+        lines = [f"  A user posted: {text}" for text in delivered_posts]
+        return "Posts in your feed:\n" + "\n".join(lines)
 
     # --- sections --------------------------------------------------------
 
