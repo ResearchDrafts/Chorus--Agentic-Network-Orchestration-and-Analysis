@@ -80,17 +80,64 @@ class AgentManager:
         """Appends a StanceRecord derived from `interaction` to the agent's
         stance_history, then recomputes memory_window as the agent's own
         most recent up-to-5 interaction_ids (schema-capped at 5, per
-        Agent.memory_window's Field(max_length=5))."""
+        Agent.memory_window's Field(max_length=5)).
+
+        In the bank regime the record's stance_value is the probe mean and its
+        reason_text is the reply the agent wrote. Both come from the same two
+        columns the generated regime uses, so everything downstream that reads
+        stance_history -- checkpointing, agents_final.jsonl, the engine's
+        current-stance lookup -- keeps working without knowing which regime
+        produced the run.
+
+        What `items_read` is NOT stored here. The bank regime's memory section
+        needs the text of the posts an agent read, and StanceRecord has no
+        field for it; adding one would put the same strings in the checkpoint,
+        in agents_final.jsonl and in every snapshot deep-copy, for data the
+        orchestrator already holds in its own per-round history. The
+        orchestrator keeps it (see _history_for), and the Interaction row
+        carries the item IDs so the log remains the authority after the fact.
+        """
         agent = self._agents[agent_id]
         agent.stance_history.append(
             StanceRecord(
                 turn=interaction.turn,
-                stance_value=interaction.stance_after,
-                reason_text=interaction.reason_text,
+                stance_value=self._stance_value_for(interaction),
+                reason_text=self._reason_text_for(interaction),
                 interaction_id=interaction.interaction_id,
             )
         )
         agent.memory_window = [r.interaction_id for r in agent.stance_history[-5:]]
+
+    def _stance_value_for(self, interaction: Interaction) -> float:
+        """The bank regime's stance is the probe mean, not a self-report.
+
+        Raises when a bank row reaches here with no probe_mean, rather than
+        falling back to stance_after. A row without a probe is a row whose
+        probe failed, and Fix I's rule is that such a row is logged and never
+        applied -- so arriving here with one is an orchestrator bug, and a
+        fallback would hide it by writing the agent's previous stance into
+        history as though it had been measured again.
+        """
+        if self._run.regime != "bank":
+            return interaction.stance_after
+        if interaction.probe_mean is None:
+            raise ValueError(
+                f"bank-regime interaction {interaction.interaction_id} has no "
+                "probe_mean: a failed probe must be logged, never applied"
+            )
+        return interaction.probe_mean
+
+    def _reason_text_for(self, interaction: Interaction) -> str:
+        """reply_text in the bank regime, reason_text otherwise.
+
+        The orchestrator writes the reply into both columns, so these agree
+        today; reading reply_text here keeps the dependency pointing at the
+        field that actually holds a bank reply, rather than at the one that
+        happens to mirror it.
+        """
+        if self._run.regime == "bank":
+            return interaction.reply_text
+        return interaction.reason_text
 
     def snapshot(self) -> list[Agent]:
         """For Checkpointing (Feature 13). Deep copy so later mutation of
