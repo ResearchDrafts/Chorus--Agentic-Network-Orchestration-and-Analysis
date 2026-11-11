@@ -107,3 +107,101 @@ def test_turn_rng_rejects_unknown_purpose_and_invalid_turn():
         seeds.turn_rng("persona", 1)
     with pytest.raises(ValueError, match="turn must be"):
         seeds.turn_rng("neighbor", 0)
+
+
+# --- RQ1: the argument and probe purposes --------------------------------
+
+
+def test_the_new_purposes_are_accepted_and_distinct_from_the_old_ones():
+    seeds = SeedManager(42)
+    draws = {
+        (purpose, turn): seeds.turn_rng(purpose, turn).random()
+        for purpose in ("neighbor", "meme", "argument", "probe")
+        for turn in (1, 2, 3)
+    }
+    assert len(set(draws.values())) == len(draws)
+
+
+def test_graph_seed_is_deterministic_and_distinct_from_every_other_stream():
+    """A graph built from the same integer a neighbour draw consumes would
+    correlate structure with sampling, invisibly."""
+    assert SeedManager(42).graph_seed == SeedManager(42).graph_seed
+    assert SeedManager(42).graph_seed != SeedManager(43).graph_seed
+
+    seeds = SeedManager(42)
+    collisions = {seeds.graph_seed} & {
+        42, 43, 44,  # the three long-lived stream offsets
+        *(42 + off * turn for off in (1_000_003, 2_000_003, 3_000_003, 4_000_003)
+          for turn in range(1, 50)),
+    }
+    assert not collisions
+
+
+def test_sender_rng_is_a_pure_function_of_seed_purpose_and_sender():
+    """No turn in the derivation: the bank's no-repeat guarantee depends on
+    the draw being a function of how many items a sender has used on a side,
+    not of which round it is posting in."""
+    a = SeedManager(7).sender_rng("argument", "agent_0003")
+    b = SeedManager(7).sender_rng("argument", "agent_0003")
+    assert [a.random() for _ in range(10)] == [b.random() for _ in range(10)]
+
+
+def test_sender_rng_differs_across_senders_purposes_and_seeds():
+    draws = {
+        key: SeedManager(seed).sender_rng(purpose, sender).random()
+        for key, (seed, purpose, sender) in {
+            "a": (7, "argument", "agent_0000"),
+            "b": (7, "argument", "agent_0001"),
+            "c": (7, "probe", "agent_0000"),
+            "d": (8, "argument", "agent_0000"),
+        }.items()
+    }
+    assert len(set(draws.values())) == 4
+
+
+def test_sender_rng_rejects_an_unknown_purpose_and_an_empty_sender():
+    seeds = SeedManager(1)
+    with pytest.raises(ValueError, match="unknown rng purpose"):
+        seeds.sender_rng("persona", "agent_0000")
+    with pytest.raises(ValueError, match="non-empty"):
+        seeds.sender_rng("argument", "")
+
+
+# --- RQ1: variety must never enter a seed --------------------------------
+
+
+def test_no_condition_can_reach_a_seed_through_the_constructor():
+    """SeedManager takes the base seed and nothing else.
+
+    Stated as a test because it is the structural reason the properties below
+    hold: there is no language, topic or trial parameter for a derivation to
+    accidentally mix in. If someone adds one, this fails first.
+    """
+    import inspect
+
+    params = list(inspect.signature(SeedManager.__init__).parameters)
+    assert params == ["self", "seed"]
+
+
+def test_two_runs_differing_only_in_language_draw_identically():
+    """RQ1's matched sets rest on this.
+
+    The four language arms of one trial share a seed, so they must share a
+    graph and an argument-draw sequence; only the rendering of the text may
+    differ. A derivation that mixed language in would give each arm a
+    different graph and a different item order, and the four arms would stop
+    being the same experiment with one factor changed.
+    """
+    english, hindi = SeedManager(2026), SeedManager(2026)
+
+    assert english.graph_seed == hindi.graph_seed
+
+    for turn in (1, 2, 3):
+        a = english.turn_rng("argument", turn)
+        b = hindi.turn_rng("argument", turn)
+        assert [a.random() for _ in range(5)] == [b.random() for _ in range(5)]
+
+    for sender in ("agent_0000", "agent_0007"):
+        a = english.sender_rng("argument", sender)
+        b = hindi.sender_rng("argument", sender)
+        assert [a.random() for _ in range(5)] == [b.random() for _ in range(5)]
