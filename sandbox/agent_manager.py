@@ -1,11 +1,7 @@
-"""Feature 5: Persona & Population Initialization.
+"""
+Creates and holds the Agent population for a run.
 
-Creates and holds the Agent population for a run. Per
-full_design_doc.md Sec 3.2, initialize_population()/get_agent()/all_agents()
-are a direct port of the spec's sample implementation.
-
-apply_interaction()/snapshot()/restore_from_snapshot() resolve Question C1
-(plan.md's Phase 2 design decision, never fully specified in the source
+never fully specified in the source
 docs): memory_window is read as the agent's own most recent up-to-5
 interaction_ids -- a bounded pointer to its own last 5 stance_history
 entries, recomputed on every apply_interaction() call, not a record of
@@ -13,11 +9,9 @@ which neighbor posts it saw this turn.
 """
 
 from __future__ import annotations
-
 import copy
 import random
 from pathlib import Path
-
 from sandbox.models import Agent, ExperimentRun, Interaction, StanceRecord
 
 
