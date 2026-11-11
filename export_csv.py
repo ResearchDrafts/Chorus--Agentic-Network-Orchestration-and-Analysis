@@ -7,7 +7,12 @@
 Produces three files:
 
   interactions.csv  one row per agent-turn, with run-level config joined on.
-                    The main dataset.
+                    The main dataset. Bank-regime runs additionally carry
+                    probe_mean, x (the stance rescaled to [-1, 1] about the
+                    midpoint), probe_mass, side_conf, items_read,
+                    n_items_read and posted_item_id; these are present but
+                    empty for generated-regime rows, so a campaign mixing
+                    both regimes still exports as one table.
   agents.csv        one row per agent per run: final stance, total movement,
                     and how far it drifted from where it started.
   runs.csv          one row per run: the config, plus summary statistics you
@@ -41,6 +46,13 @@ RUN_FIELDS = (
     "run_id", "topic", "language_condition", "trial_number", "seed", "alpha",
     "M", "N", "K", "rq_target", "model_backend_id", "stance_low_label",
     "stance_high_label", "status", "git_commit_hash",
+    # RQ1's design dimensions. Every one of these is something an analysis
+    # groups or filters by, and joining them on here is what lets a whole
+    # campaign be read from interactions.csv alone: without `delivery`,
+    # the E4 control rows are indistinguishable from treatment rows that
+    # happened to read nothing.
+    "regime", "delivery", "neighbor_strategy", "graph_degree", "graph_rewire_p",
+    "bank_path", "probe_mass_floor", "memory_rounds",
 )
 
 
@@ -88,7 +100,68 @@ def derive(df: pd.DataFrame) -> pd.DataFrame:
     df["neighbor_agent_ids"] = df.neighbor_agent_ids.map(lambda v: "|".join(v))
     df["reason_char_count"] = df.reason_text.fillna("").str.len()
     df["reason_word_count"] = df.reason_text.fillna("").str.split().map(len)
+    return _derive_bank_columns(df)
+
+
+def _derive_bank_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """The RQ1 bank-regime columns.
+
+    Added for every run, not only bank ones, so one campaign directory mixing
+    both regimes still produces a single rectangular CSV -- a generated run
+    simply has them empty. The columns are read with df.get() because runs
+    produced before the bank regime existed have no such keys in their JSONL
+    at all, and those datasets (outputs/chorus_run1) must keep exporting.
+    """
+    probe_mean = _column(df, "probe_mean", float)
+
+    # x is the stance on a signed [-1, 1] scale centred on the 7-point
+    # midpoint: -1 is the con pole, 0 undecided, +1 the pro pole. Every RQ1
+    # model is specified in these units, and computing it in each analysis
+    # instead would mean four chances to get the sign or the divisor wrong.
+    df["x"] = (probe_mean - 4) / 3
+
+    # Read once, before the column is overwritten below: counting from the
+    # joined string would count zero for every row, since the strings are no
+    # longer lists by then.
+    items = _column(df, "items_read", object)
+    df["n_items_read"] = items.map(lambda v: len(v) if isinstance(v, list) else 0)
+    # Semicolon-joined, not pipe-joined like neighbor_agent_ids: that column
+    # is already pipe-joined and a reader splitting the wrong column on the
+    # wrong separator gets a silently wrong answer rather than an error.
+    df["items_read"] = items.map(_join_items)
+    df["posted_item_id"] = _column(df, "posted_item_id", object)
+    # How much of the next-token distribution actually landed on the scale.
+    # A quality measure, not a stance: a mean of 5.0 read off 0.95 mass and
+    # the same mean off 0.51 are not equally trustworthy, and filtering on
+    # this is how an analysis excludes the latter.
+    df["probe_mass"] = _column(df, "probe_mass", float)
+    # How decided the agent is, as distinct from where it stands.
+    df["side_conf"] = _column(df, "side_conf", float)
+    df["probe_mean"] = probe_mean
     return df
+
+
+def _column(df: pd.DataFrame, name: str, dtype) -> pd.Series:
+    """The column, or an all-null one of the right dtype if it is absent."""
+    if name in df.columns:
+        return df[name]
+    if dtype is object:
+        return pd.Series([None] * len(df), index=df.index, dtype=object)
+    return pd.Series([float("nan")] * len(df), index=df.index, dtype=float)
+
+
+def _join_items(value) -> str:
+    """Semicolon-joined item IDs, empty for a row that read nothing.
+
+    An empty string is the round-0 probe and every row of a `delivery: off`
+    control arm, both of which genuinely read nothing -- as distinct from a
+    missing column, which is a pre-bank dataset and also lands here as empty.
+    n_items_read carries the count so an analysis does not have to split the
+    string to know.
+    """
+    if isinstance(value, list):
+        return ";".join(str(item) for item in value)
+    return ""
 
 
 def agents_table(df: pd.DataFrame) -> pd.DataFrame:
