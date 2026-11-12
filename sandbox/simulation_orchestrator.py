@@ -168,12 +168,18 @@ class SimulationOrchestrator:
         if resume_state is not None:
             start_turn = resume_state.last_completed_turn + 1
             self._agent_manager.restore_from_snapshot(resume_state.agent_snapshot)
-            self._last_posts = self._rebuild_last_posts()
+            # Everything rebuilt from the log is rebuilt as of the
+            # checkpoint, never as of the end of the file: a run that died
+            # mid-round left rows on disk that no checkpoint covers, and
+            # counting them would put this pass one step ahead of the
+            # uninterrupted run it is meant to reproduce.
+            last_logged_turn = resume_state.last_completed_turn
+            self._last_posts = self._rebuild_last_posts(last_logged_turn)
             # Round 0 is checkpointed as last_completed_turn=0, so any
             # checkpoint at all means it has already happened and start_turn
             # is at least 1. There is no path that re-probes it.
             needs_round_zero = False
-            self._restore_bank_state()
+            self._restore_bank_state(last_logged_turn)
         else:
             self._agent_manager.initialize_population()
             self._run.status = "running"
@@ -905,8 +911,8 @@ class SimulationOrchestrator:
 
     # --- resume and lifecycle -------------------------------------------
 
-    def _rebuild_last_posts(self) -> dict[str, Interaction]:
-        """Reconstructs each agent's most recent post after a resume.
+    def _rebuild_last_posts(self, last_completed_turn: int) -> dict[str, Interaction]:
+        """Reconstructs each agent's most recent post as of the checkpoint.
 
         CheckpointState carries only agent_snapshot, and StanceRecord has no
         content_type or meme_id, so agent state alone cannot say whether a
@@ -915,6 +921,14 @@ class SimulationOrchestrator:
         the stimulus mid-run. interactions.jsonl is append-only and complete
         through last_completed_turn, so it is the right source. Not a schema
         change; phase4.md Section 2 did not anticipate this.
+
+        Rows past last_completed_turn are ignored. The log can run ahead of
+        the checkpoint -- rows are written one at a time and the checkpoint
+        comes after the whole round -- and those rows describe a round whose
+        effect on agent state was lost with the un-checkpointed memory. The
+        resumed pass is about to re-run that round, so reading them would
+        show its agents a stimulus that includes the round they are
+        currently taking.
         """
         path = self._run_dir / "interactions.jsonl"
         if not path.exists():
@@ -924,6 +938,8 @@ class SimulationOrchestrator:
             if not line.strip():
                 continue
             interaction = Interaction.model_validate_json(line)
+            if interaction.turn > last_completed_turn:
+                continue
             if not interaction.is_valid_for_analysis:
                 # Same exclusion as step 6: a failed turn never becomes an
                 # agent's most recent post, so a resumed run shows neighbours
@@ -934,16 +950,27 @@ class SimulationOrchestrator:
                 last[interaction.speaker_agent_id] = interaction
         return last
 
-    def _logged_rows(self) -> list[Interaction]:
-        """Every logged row, with re-logged duplicates resolved.
+    def _logged_rows(self, last_completed_turn: int) -> list[Interaction]:
+        """Every row through last_completed_turn, duplicates resolved.
 
-        A run interrupted mid-turn can leave rows on disk with no checkpoint,
-        and the resumed pass re-runs that turn and appends again. The later
-        write is authoritative (agents_final.jsonl's stance_history references
-        it), so rows are keyed on (turn, speaker) with the last write kept --
-        the same rule export_csv.py applies on read. Without it, a rebuilt
-        bank cycle count would double-count that turn and the resumed run
-        would post different items from an uninterrupted one.
+        Two different interruptions leave two different kinds of extra rows,
+        and both are handled here:
+
+        * A round that was re-logged by an earlier resume appears twice. The
+          later write is authoritative (agents_final.jsonl's stance_history
+          references it), so rows are keyed on (turn, speaker) with the last
+          write kept -- the same rule export_csv.py applies on read.
+        * A round that was interrupted part-way through appears once, for
+          some agents only, with no checkpoint covering it. Those rows are
+          dropped entirely by the turn filter: the round is about to be
+          re-run, and counting the half that got written would advance those
+          agents' bank cycles one step past everyone else's and leave the
+          resumed round different from the uninterrupted one it must
+          reproduce.
+
+        Without the filter, whether a resumed run posted the right arguments
+        depended on exactly where the crash landed, which is the one thing a
+        reproducibility guarantee cannot be allowed to depend on.
         """
         path = self._run_dir / "interactions.jsonl"
         if not path.exists():
@@ -953,10 +980,12 @@ class SimulationOrchestrator:
             if not line.strip():
                 continue
             interaction = Interaction.model_validate_json(line)
+            if interaction.turn > last_completed_turn:
+                continue
             latest[(interaction.turn, interaction.speaker_agent_id)] = interaction
         return [latest[key] for key in sorted(latest)]
 
-    def _restore_bank_state(self) -> None:
+    def _restore_bank_state(self, last_completed_turn: int) -> None:
         """Rebuilds the bank cycle counts and remembered rounds from the log.
 
         Neither is in the checkpoint. The counts could have been, but the log
@@ -964,10 +993,13 @@ class SimulationOrchestrator:
         to rebuild last posts; deriving both from one source means they cannot
         disagree with each other. The remembered rounds genuinely cannot be
         checkpointed without putting every post's text into agent state.
+
+        Both are rebuilt as of last_completed_turn, so rows from a round the
+        checkpoint does not cover are ignored -- see _logged_rows.
         """
         if not self._is_bank:
             return
-        rows = self._logged_rows()
+        rows = self._logged_rows(last_completed_turn)
 
         counts: dict[tuple[str, str], int] = {}
         for row in rows:

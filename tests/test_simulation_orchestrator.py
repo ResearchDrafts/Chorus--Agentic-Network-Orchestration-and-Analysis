@@ -349,7 +349,7 @@ async def test_resume_rebuilds_neighbour_posts_including_meme_content(
     resumed = build_orchestrator(
         _run(K=2, meme_injection=memes), mock_gateway, runs_dir=tmp_path
     )
-    rebuilt = resumed._rebuild_last_posts()
+    rebuilt = resumed._rebuild_last_posts(1)  # the checkpoint is at turn 1
     assert rebuilt
     assert all(post.content_type == "meme" for post in rebuilt.values())
     assert all(post.meme_id is not None for post in rebuilt.values())
@@ -1432,6 +1432,19 @@ def _crash_in_round(bank_gateway, round_number: int, agents: int = 8):
     ] + [RuntimeError("boom")] * (agents * 10)
 
 
+def _crash_in_round_replying(bank_gateway, round_number: int, text: str, agents: int = 8):
+    """_crash_in_round, but every pre-crash reply is the same text.
+
+    The row-for-row comparisons below include reply_text, so a crashed run
+    whose early rounds said "reply in round 2" cannot be compared against a
+    clean run that said something else. Holding the text constant makes the
+    comparison about the state the resume rebuilt rather than about the mock.
+    """
+    bank_gateway.generate.side_effect = [
+        make_backend_response(text=text) for _ in range((round_number - 1) * agents)
+    ] + [RuntimeError("boom")] * (agents * 10)
+
+
 async def test_resume_continues_a_bank_run_from_the_checkpoint(tmp_path, bank_gateway):
     _crash_in_round(bank_gateway, 3)
     with pytest.raises(RuntimeError):
@@ -1498,7 +1511,7 @@ async def test_restored_bank_counts_match_an_uninterrupted_runs(tmp_path, bank_g
 
     resumed = build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path / "a")
     resumed._agent_manager.initialize_population()
-    resumed._restore_bank_state()
+    resumed._restore_bank_state(2)  # the completed run checkpointed turn 2
 
     assert resumed._bank.post_counts() == uninterrupted._bank.post_counts()
     assert sum(resumed._bank.post_counts().values()) == 8 * 2
@@ -1521,7 +1534,7 @@ async def test_a_resumed_run_remembers_the_rounds_it_already_ran(tmp_path, bank_
         .load("bank_run")
         .agent_snapshot
     )
-    resumed._restore_bank_state()
+    resumed._restore_bank_state(2)  # the crash left a checkpoint at round 2
 
     assert len(resumed._history) == 8
     for remembered in resumed._history.values():
@@ -1587,7 +1600,7 @@ async def test_rebuilt_memory_is_capped_at_the_window(tmp_path, bank_gateway):
     ).run()
 
     resumed = build_orchestrator(_bank_run(K=5, memory_rounds=2), bank_gateway, runs_dir=tmp_path)
-    resumed._restore_bank_state()
+    resumed._restore_bank_state(5)
     assert all(len(v) == 2 for v in resumed._history.values())
 
 
@@ -1603,7 +1616,7 @@ async def test_a_failed_round_is_not_rebuilt_into_memory(tmp_path, bank_gateway)
     await build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path).run()
 
     resumed = build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path)
-    resumed._restore_bank_state()
+    resumed._restore_bank_state(2)
     for remembered in resumed._history.values():
         assert len(remembered) == 1  # round 2 only
 
@@ -1621,7 +1634,7 @@ async def test_re_logged_rows_do_not_double_count_the_bank_cycle(tmp_path, bank_
     path.write_text(original + original)  # every row logged twice
 
     resumed = build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path)
-    resumed._restore_bank_state()
+    resumed._restore_bank_state(2)
     assert sum(resumed._bank.post_counts().values()) == 8 * 2  # not 32
 
 
@@ -1669,11 +1682,124 @@ async def test_a_resumed_delivery_off_run_remembers_the_neutral_message(
     await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
 
     resumed = build_orchestrator(run, bank_gateway, runs_dir=tmp_path)
-    resumed._restore_bank_state()
+    resumed._restore_bank_state(run.K)
 
     assert len(resumed._history) == run.M
     for remembered in resumed._history.values():
         assert [r.posts_read for r in remembered] == [[run.neutral_message]] * 2
+
+
+# --- resume: rows from uncommitted rounds are ignored --------------------
+
+from sandbox.checkpoint_manager import CheckpointManager  # noqa: E402
+
+
+def _deduped_signature(rows: list[Interaction]) -> list[tuple]:
+    """Every row's reproducible content, keeping the last write of each
+    (turn, speaker) -- the rule export_csv.py applies on read.
+
+    Excludes interaction_id, timestamp_utc and latency_ms: wall-clock facts
+    about one execution rather than properties of the run.
+    """
+    latest: dict[tuple[int, str], Interaction] = {}
+    for row in rows:  # file order, so "last" means the post-resume copy
+        latest[(row.turn, row.speaker_agent_id)] = row
+    return [
+        (
+            r.turn, r.speaker_agent_id, tuple(r.neighbor_agent_ids),
+            r.stance_before, r.stance_after, r.reply_text, r.reason_text,
+            tuple(r.items_read), r.posted_item_id, r.probe_mean,
+            tuple(r.probe_dist or ()), r.probe_mass, r.side_conf,
+            r.prompt_token_count, r.completion_token_count, r.api_call_status,
+        )
+        for _, r in sorted(latest.items())
+    ]
+
+
+async def test_a_resume_ignores_a_partially_written_round(tmp_path, bank_gateway):
+    """Half a round on disk with no checkpoint must leave no trace.
+
+    The orchestrator writes rows one at a time and checkpoints only after the
+    whole round, so a crash part-way through leaves rows that no checkpoint
+    covers. Counting them put those agents' bank cycles and histories one
+    step ahead of everyone else's, and the rerun of that round then differed
+    from an uninterrupted one -- so whether a resumed run posted the right
+    arguments depended on exactly where the crash landed.
+    """
+    bank_gateway.generate.return_value = make_backend_response(text="a steady reply")
+    clean = tmp_path / "clean"
+    await build_orchestrator(_bank_run(K=4), bank_gateway, runs_dir=clean).run()
+
+    # Rounds 1 and 2 complete, round 3 fails for everyone, so the checkpoint
+    # is at 2 and no round-3 row was written.
+    crashed = tmp_path / "crashed"
+    _crash_in_round_replying(bank_gateway, 3, "a steady reply")
+    with pytest.raises(RuntimeError):
+        await build_orchestrator(_bank_run(K=4), bank_gateway, runs_dir=crashed).run()
+    assert CheckpointManager(crashed).load("bank_run").last_completed_turn == 2
+
+    # Now stage the partial round: half of round 3's rows, as a crash
+    # between two write_interaction calls would have left them.
+    log = crashed / "bank_run" / "interactions.jsonl"
+    partial = [
+        row.model_dump_json()
+        for row in sorted(_bank_rows(clean), key=lambda r: (r.turn, r.speaker_agent_id))
+        if row.turn == 3
+    ][:4]
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(partial) + "\n")
+    assert len([r for r in _bank_rows(crashed) if r.turn == 3]) == 4
+
+    bank_gateway.generate.side_effect = None
+    bank_gateway.generate.return_value = make_backend_response(text="a steady reply")
+    resumed = build_orchestrator(_bank_run(K=4), bank_gateway, runs_dir=crashed)
+    await resumed.run()
+
+    assert _deduped_signature(_bank_rows(crashed)) == _deduped_signature(_bank_rows(clean))
+
+
+async def test_a_resume_ignores_a_full_round_the_checkpoint_does_not_cover(
+    tmp_path, bank_gateway
+):
+    """checkpoint_every_n_turns=2: round 3 completes, round 4 dies, and the
+    last checkpoint is at round 2. The whole of round 3 is on disk and must
+    be ignored, because the resumed pass is about to run it again."""
+    every_two = dict(K=4, checkpoint_every_n_turns=2)
+    bank_gateway.generate.return_value = make_backend_response(text="a steady reply")
+    clean = tmp_path / "clean"
+    await build_orchestrator(_bank_run(**every_two), bank_gateway, runs_dir=clean).run()
+
+    crashed = tmp_path / "crashed"
+    _crash_in_round_replying(bank_gateway, 4, "a steady reply")
+    with pytest.raises(RuntimeError):
+        await build_orchestrator(
+            _bank_run(**every_two), bank_gateway, runs_dir=crashed
+        ).run()
+    assert CheckpointManager(crashed).load("bank_run").last_completed_turn == 2
+    assert {r.turn for r in _bank_rows(crashed)} == {0, 1, 2, 3}
+
+    bank_gateway.generate.side_effect = None
+    bank_gateway.generate.return_value = make_backend_response(text="a steady reply")
+    resumed = build_orchestrator(_bank_run(**every_two), bank_gateway, runs_dir=crashed)
+    await resumed.run()
+
+    assert _deduped_signature(_bank_rows(crashed)) == _deduped_signature(_bank_rows(clean))
+
+
+async def test_rebuilt_state_stops_at_the_checkpoint(tmp_path, bank_gateway):
+    """The mechanism, asserted directly: an uncommitted round advances
+    neither the bank cycle nor the remembered history."""
+    bank_gateway.generate.return_value = make_backend_response(text="a steady reply")
+    await build_orchestrator(_bank_run(K=3), bank_gateway, runs_dir=tmp_path).run()
+
+    resumed = build_orchestrator(_bank_run(K=3), bank_gateway, runs_dir=tmp_path)
+    # As of round 1, two of the three logged rounds are ahead of us.
+    resumed._restore_bank_state(1)
+
+    assert sum(resumed._bank.post_counts().values()) == 8  # round 1 only
+    assert all(len(v) == 1 for v in resumed._history.values())
+    assert len(resumed._rebuild_last_posts(1)) == 8
+    assert all(post.turn == 1 for post in resumed._rebuild_last_posts(1).values())
 
 
 async def test_rerunning_a_completed_bank_run_is_a_no_op(tmp_path, bank_gateway):
