@@ -183,6 +183,7 @@ class GraphSampling:
         self._graph = nx.connected_watts_strogatz_graph(
             len(agent_ids), degree, rewire_p, seed=graph_seed
         )
+        self._verify_every_node_has_k_neighbours(graph_seed)
         # agent_id -> that agent's graph neighbours, sorted. Sorted because
         # rng.sample's output depends on the order of the sequence it is given
         # and networkx's adjacency order is an implementation detail; sorting
@@ -193,6 +194,46 @@ class GraphSampling:
             )
             for node in self._graph.nodes
         }
+
+    def _verify_every_node_has_k_neighbours(self, graph_seed: int) -> None:
+        """Rejects a graph in which any node has fewer than k neighbours.
+
+        `k <= degree` is necessary but not sufficient. Every node starts the
+        ring lattice with exactly `degree` neighbours, and rewiring moves
+        edges rather than adding them, so individual nodes can end up below
+        `degree` -- WS(8, 4, 0.1) leaves a node with 2 for some seeds.
+
+        Without this, select_neighbors raises for that one agent on round 1,
+        after the population is built, the run directory and config are
+        written, and the round-0 probe has already been paid for -- M calls
+        for a graph that was never going to work. Worse, the failure is a
+        function of the seed, so a matched set either fails in all four arms
+        or in none, and discovering it after the first arm has run means
+        discarding that arm too.
+
+        Raised rather than patched up: adding an edge to satisfy k would make
+        this node structurally unlike every other, and dropping to k-1 for it
+        would give one agent a shorter feed, which is a confound nothing in
+        the output records. The fix is a different seed, a higher degree or a
+        lower N, and all three are the caller's to choose.
+        """
+        short = sorted(
+            (self._agent_ids[node], degree)
+            for node, degree in self._graph.degree
+            if degree < self.k
+        )
+        if not short:
+            return
+        detail = ", ".join(
+            f"{agent_id} has {degree}" for agent_id, degree in short
+        )
+        raise ValueError(
+            f"graph_seed={graph_seed} produced a graph in which "
+            f"{len(short)} node(s) have fewer than k={self.k} neighbours "
+            f"({detail}). Watts-Strogatz rewiring moves edges rather than "
+            "adding them, so k <= degree does not guarantee it per node: "
+            "raise graph_degree, lower N, or change the run's seed."
+        )
 
     def select_neighbors(
         self,

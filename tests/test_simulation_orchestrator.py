@@ -1405,8 +1405,14 @@ def test_a_bank_orchestrator_without_a_bank_raises():
 def test_the_graph_nodes_match_the_population_ids():
     """agent_id_for is shared by the wiring and by initialize_population, so a
     drift between them would build a graph whose nodes are not the run's
-    agents."""
-    orchestrator = build_orchestrator(_bank_run(M=12, graph_degree=4), mock_gateway_stub())
+    agents.
+
+    graph_degree=6 rather than 4: at degree 4 this seed's graph leaves a node
+    with 2 neighbours, which GraphSampling now rejects at construction rather
+    than on round 1 (see test_interaction_engine). The node ids are what this
+    test is about.
+    """
+    orchestrator = build_orchestrator(_bank_run(M=12, graph_degree=6), mock_gateway_stub())
     nodes = {a for edge in orchestrator._interaction_engine.edges() for a in edge}
     orchestrator._agent_manager.initialize_population()
     population = {a.agent_id for a in orchestrator._agent_manager.all_agents()}

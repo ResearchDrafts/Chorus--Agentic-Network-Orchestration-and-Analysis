@@ -308,11 +308,74 @@ def test_the_graph_is_connected():
     file, which is why the connected WS variant is used."""
     import networkx as nx
 
-    strategy = _graph(n=30, degree=4, rewire_p=0.3, graph_seed=99)
+    # graph_seed=2 rather than 99: at this rewiring rate seed 99 leaves a
+    # node with 2 neighbours, which construction now rejects outright (see
+    # the degree tests below). Connectivity is what this test is about.
+    strategy = _graph(n=30, degree=4, rewire_p=0.3, graph_seed=2)
     graph = nx.Graph()
     graph.add_nodes_from(_ids(30))
     graph.add_edges_from(strategy.edges())
     assert nx.is_connected(graph)
+
+
+# --- every node must have k neighbours, checked at construction ----------
+
+
+def test_a_node_short_of_k_neighbours_is_rejected_at_construction():
+    """WS(8, 4, 0.1) with this seed leaves one node with 2 neighbours.
+
+    `k <= degree` is necessary but not sufficient: every node starts the ring
+    with exactly `degree` neighbours and rewiring moves edges rather than
+    adding them. Caught here rather than in select_neighbors on round 1,
+    which is after the population is built, the config is written and the
+    round-0 probe has been paid for -- M calls for a graph that was never
+    going to work.
+    """
+    import networkx as nx
+
+    # The seed is pinned, so this states a fact about this graph rather than
+    # hoping: node degrees are [2, 3, 4, 4, 4, 4, 5, 6].
+    degrees = sorted(dict(nx.connected_watts_strogatz_graph(8, 4, 0.1, seed=30).degree()).values())
+    assert degrees[0] == 2
+
+    with pytest.raises(ValueError) as caught:
+        _graph(n=8, degree=4, rewire_p=0.1, k=3, graph_seed=30)
+
+    message = str(caught.value)
+    assert "graph_seed=30" in message
+    assert "k=3" in message
+    assert "has 2" in message       # the offending node's degree
+    assert "agent_" in message      # named, so it can be looked up
+
+
+def test_the_error_names_every_short_node():
+    """All of them at once, like every other validation in this codebase: a
+    graph with two bad nodes should take one run to diagnose, not two."""
+    with pytest.raises(ValueError) as caught:
+        _graph(n=8, degree=4, rewire_p=0.1, k=4, graph_seed=45)
+
+    # Seed 45 gives degrees [2, 2, 4, 4, 5, 5, 5, 5], so k=4 leaves two short.
+    message = str(caught.value)
+    assert "2 node(s)" in message
+    assert message.count("has 2") == 2
+
+
+def test_a_graph_whose_every_node_meets_k_is_accepted():
+    """Seed 0 gives every node at least 3 neighbours at this degree."""
+    strategy = _graph(n=8, degree=4, rewire_p=0.1, k=3, graph_seed=0)
+    assert all(len(strategy._neighbors[a]) >= 3 for a in _ids(8))
+
+
+def test_the_check_is_per_node_not_on_the_average():
+    """A graph can average well above k and still starve one node, which is
+    the whole reason the schema's k <= degree check is not enough."""
+    import networkx as nx
+
+    graph = nx.connected_watts_strogatz_graph(8, 4, 0.1, seed=30)
+    degrees = list(dict(graph.degree()).values())
+    assert sum(degrees) / len(degrees) > 3      # the average is fine
+    with pytest.raises(ValueError):             # one node is not
+        _graph(n=8, degree=4, rewire_p=0.1, k=3, graph_seed=30)
 
 
 def test_sampling_consumes_the_rng_exactly_once_per_agent():
