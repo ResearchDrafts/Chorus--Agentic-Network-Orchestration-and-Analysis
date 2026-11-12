@@ -485,6 +485,22 @@ async def test_export_csv_consumes_a_bank_run(tmp_path, rq1_config, bank_gateway
     assert frame[frame.turn > 0]["n_items_read"].eq(run.N).all()
     assert frame[frame.turn > 0]["items_read"].str.count(";").eq(run.N - 1).all()
 
+    # Round 0 is a measurement, not a turn: its stance_before is the
+    # configured initial_stance rather than a reading, so it carries no
+    # shift. Left in, every aggregate over the column absorbed M rows of
+    # movement that happened before any agent read a word.
+    round_zero = frame[frame.turn == 0]
+    later = frame[frame.turn > 0]
+    assert len(round_zero) == run.M
+    assert round_zero["is_round_zero"].all()
+    assert not later["is_round_zero"].any()
+    for column in ("stance_before", "stance_shift", "abs_stance_shift", "stance_moved"):
+        assert round_zero[column].isna().all(), column
+        assert later[column].notna().all(), column
+    # stance_after survives: it IS the starting measurement.
+    assert round_zero["stance_after"].notna().all()
+    assert round_zero["probe_mean"].notna().all()
+
     # The two prompt lengths, separately as well as summed: RQ1 reports
     # prompt length per language, and a reply prompt and a probe prompt grow
     # for different reasons.
@@ -497,6 +513,61 @@ async def test_export_csv_consumes_a_bank_run(tmp_path, rq1_config, bank_gateway
         frame.prompt_token_count
         == frame.reply_prompt_tokens + frame.probe_prompt_tokens
     ).all()
+
+
+async def test_the_agents_table_still_knows_where_a_bank_agent_started(
+    tmp_path, rq1_config, bank_gateway
+):
+    """Nulling round 0's stance_before must not cost the agents table its
+    initial_stance.
+
+    It does not: groupby.first() skips the null and lands on round 1's
+    stance_before, which is round 0's probe reading -- the measurement, not
+    the configured value. That is a better answer than the one it gave
+    before, and the column must not quietly become empty.
+    """
+    pytest.importorskip("pandas")
+
+    import export_csv
+
+    from tests.factories import make_logprob_response
+
+    bank_gateway.score_next_token.side_effect = (
+        [make_logprob_response(mean=3.0)] * 8    # round 0
+        + [make_logprob_response(mean=6.0)] * 80
+    )
+    run = load_run_config(rq1_config(K=2))
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    frame = export_csv.derive(
+        export_csv.mark_duplicates(export_csv.load_run(tmp_path / run.run_id))
+    )
+    agents = export_csv.agents_table(frame)
+
+    assert len(agents) == run.M
+    assert agents.initial_stance.notna().all()
+    assert set(agents.initial_stance) == {3.0}   # the round-0 reading
+    assert set(agents.final_stance) == {6.0}
+    assert set(agents.net_drift) == {3.0}
+
+
+async def test_a_generated_run_has_no_round_zero_rows_to_null(
+    tmp_path, config_path, mock_gateway
+):
+    """The generated regime never writes turn 0, so nothing there changes."""
+    pytest.importorskip("pandas")
+
+    import export_csv
+
+    run = load_run_config(config_path())
+    await build_orchestrator(run, mock_gateway, runs_dir=tmp_path).run()
+
+    frame = export_csv.derive(
+        export_csv.mark_duplicates(export_csv.load_run(tmp_path / run.run_id))
+    )
+    assert not frame["is_round_zero"].any()
+    assert frame["stance_before"].notna().all()
+    assert frame["stance_shift"].notna().all()
 
 
 # --- 12.2: the matched set -----------------------------------------------

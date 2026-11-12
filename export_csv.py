@@ -15,9 +15,21 @@ Produces three files:
                     empty for generated-regime rows, so a campaign mixing
                     both regimes still exports as one table.
   agents.csv        one row per agent per run: final stance, total movement,
-                    and how far it drifted from where it started.
+                    and how far it drifted from where it started. For a bank
+                    run, initial_stance is the round-0 probe reading: the
+                    round-0 row's own stance_before is null (see
+                    is_round_zero below) and pandas' groupby.first() skips
+                    it, landing on round 1's stance_before, which IS that
+                    reading.
   runs.csv          one row per run: the config, plus summary statistics you
                     would otherwise recompute every time.
+
+**Round 0.** A bank run probes every agent once before anything is read. That
+row's stance_after is a measurement, but its stance_before is the configured
+initial_stance rather than a reading, so stance_before and every shift column
+derived from it are null there and `is_round_zero` marks the row. Without it,
+a population seeded at 4 that reads 5 at round 0 contributes M rows of "+1
+movement" before any agent has read a word.
 
 **Deduplication.** A run interrupted mid-turn can log the same
 (turn, speaker_agent_id) twice: the orchestrator writes interactions one at a
@@ -94,6 +106,7 @@ def derive(df: pd.DataFrame) -> pd.DataFrame:
     df["stance_shift"] = df.stance_after - df.stance_before
     df["abs_stance_shift"] = df.stance_shift.abs()
     df["stance_moved"] = df.stance_shift != 0
+    df = _null_out_round_zero_shifts(df)
     df["is_valid_for_analysis"] = df.api_call_status != "failed_logged_null"
     df["n_neighbors"] = df.neighbor_agent_ids.map(len)
     # Lists do not survive CSV round-trips as lists; make it explicit and
@@ -102,6 +115,41 @@ def derive(df: pd.DataFrame) -> pd.DataFrame:
     df["reason_char_count"] = df.reason_text.fillna("").str.len()
     df["reason_word_count"] = df.reason_text.fillna("").str.split().map(len)
     return _derive_bank_columns(df)
+
+
+def _null_out_round_zero_shifts(df: pd.DataFrame) -> pd.DataFrame:
+    """Round 0 has no "before", so it gets no shift.
+
+    A bank run's round-0 row is the starting measurement: the probe is asked
+    before the agent has read anything. Its stance_after is that reading, but
+    its stance_before is the agent's configured initial_stance, which is a
+    value the config chose and not something the model reported -- the whole
+    premise of the probe being that what an agent answers is not what it was
+    told it believes. stance_shift on that row is therefore the gap between a
+    configuration and a measurement, in the same column where every other row
+    carries the movement between two measurements.
+
+    Left in, it biased every aggregate that touches the column: a population
+    seeded at 4 and reading 5 at round 0 shows M rows of +1 "movement" before
+    anybody has read a word, and mean_abs_shift, turns_moved and
+    polarization_change all absorb it. So stance_before and the three columns
+    derived from it are null on those rows, and is_round_zero marks them --
+    explicitly, because a null is also what a pre-bank dataset's missing
+    column looks like, and an analysis filtering round 0 out should be able to
+    say so rather than infer it from a turn number.
+
+    Generated-regime runs never write turn 0, so nothing there is touched.
+    """
+    is_round_zero = (_column(df, "regime", object) == "bank") & (df.turn == 0)
+    df["is_round_zero"] = is_round_zero
+    if not is_round_zero.any():
+        return df
+    for column in ("stance_before", "stance_shift", "abs_stance_shift"):
+        df[column] = df[column].mask(is_round_zero)
+    # astype("boolean") first: masking a numpy bool column would upcast it to
+    # object and put a float NaN in a column of True/False.
+    df["stance_moved"] = df.stance_moved.astype("boolean").mask(is_round_zero)
+    return df
 
 
 def _derive_bank_columns(df: pd.DataFrame) -> pd.DataFrame:
