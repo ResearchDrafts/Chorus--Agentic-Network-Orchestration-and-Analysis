@@ -295,6 +295,48 @@ def test_bank_regime_with_both_fields_is_accepted():
     assert run.bank_path == "data/bank/test_bank.csv"
 
 
+BANK_KWARGS = dict(
+    regime="bank", bank_path="data/bank/test_bank.csv", probe_question="q?"
+)
+
+
+@pytest.mark.parametrize("neutral", [None, "", "   "])
+def test_the_delivery_off_control_requires_a_neutral_message(neutral):
+    """The control reads one on-topic, side-free message every round. An
+    empty one would deliver a blank post to every agent in the arm, which is
+    indistinguishable in the output from a message that moved nobody."""
+    from sandbox.models import ExperimentRun
+
+    overrides = dict(BANK_KWARGS, delivery="off")
+    if neutral is not None:
+        overrides["neutral_message"] = neutral
+    with pytest.raises(ValidationError, match="neutral_message"):
+        ExperimentRun(**_run_kwargs(**overrides))
+
+
+def test_the_delivery_off_control_with_a_neutral_message_is_accepted():
+    from sandbox.models import ExperimentRun
+
+    run = ExperimentRun(
+        **_run_kwargs(**BANK_KWARGS, delivery="off", neutral_message="Fares come up a lot.")
+    )
+    assert run.neutral_message == "Fares come up a lot."
+
+
+def test_a_delivery_on_bank_run_needs_no_neutral_message():
+    """The requirement is conditional: the treatment arm never delivers it."""
+    from sandbox.models import ExperimentRun
+
+    assert ExperimentRun(**_run_kwargs(**BANK_KWARGS)).neutral_message is None
+
+
+def test_the_generated_regime_needs_no_neutral_message():
+    """delivery is a bank-regime switch; a generated run ignores it."""
+    from sandbox.models import ExperimentRun
+
+    assert ExperimentRun(**_run_kwargs(delivery="off")).neutral_message is None
+
+
 def test_generated_regime_ignores_the_bank_fields():
     """Guards against over-correcting: the requirement is conditional on the
     regime, so a generated run with neither field must stay valid."""

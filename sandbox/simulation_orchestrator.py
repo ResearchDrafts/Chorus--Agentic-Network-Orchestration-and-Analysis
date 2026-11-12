@@ -13,7 +13,8 @@ agent per turn, which both writes a post and states a stance. The bank regime
 (RQ1) splits those apart into two phases per round, because they were never
 the same thing:
 
-    Phase A   every reader is shown three bank posts and writes a reply
+    Phase A   every reader is shown its neighbours' bank posts -- or, in the
+              delivery: off control, one side-free message -- and writes a reply
     Phase B   every agent is privately probed for its stance
 
 Both phases are computed against the same frozen snapshot, and no agent state
@@ -46,7 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from sandbox.agent_manager import AgentManager, agent_id_for
-from sandbox.bank_manager import BankManager
+from sandbox.bank_manager import NEUTRAL_ITEM_ID, BankManager
 from sandbox.checkpoint_manager import CheckpointManager
 from sandbox.cost_tracker import CostTracker
 from sandbox.interaction_engine import AlphaSampling, GraphSampling, RecommendationStrategy
@@ -423,7 +424,8 @@ class SimulationOrchestrator:
             1. each agent's side, from its last probe reading
             2. the bank item each agent posts, for that side
             3. each agent's neighbours
-            4. what each agent is delivered (nothing, under delivery: off)
+            4. what each agent is delivered (the neutral message, under
+               delivery: off)
             5. Phase A: every reply, concurrently
             6. Phase B: every probe, concurrently
             7. one Interaction per agent, written, then applied
@@ -463,19 +465,21 @@ class SimulationOrchestrator:
             for agent in all_agents
         }
 
-        # 4. Delivery. Under `delivery: off` nobody is shown anything, but
-        # sides, items and neighbours are still resolved above and the
-        # neighbour ids are still logged. That is deliberate: it keeps every
-        # seeded stream consuming identically to a delivery-on arm, so the
-        # control differs from the treatment in what agents SAW and in
+        # 4. Delivery. Under `delivery: off` every agent is shown exactly one
+        # post -- the run's neutral message, which is on topic and takes no
+        # side -- instead of its neighbours' bank items. Sides, items and
+        # neighbours are still resolved above and the neighbour ids are still
+        # logged. That is deliberate: it keeps every seeded stream consuming
+        # identically to a delivery-on arm, so the control differs from the
+        # treatment in the persuasive content of what agents READ and in
         # nothing else -- which is the only way its drift measurement is a
         # baseline for the treatment rather than for a different run.
         delivered_items: dict[str, list[str]] = {}
         delivered_texts: dict[str, list[str]] = {}
         for agent in all_agents:
             if self._run.delivery == "off":
-                delivered_items[agent.agent_id] = []
-                delivered_texts[agent.agent_id] = []
+                delivered_items[agent.agent_id] = [NEUTRAL_ITEM_ID]
+                delivered_texts[agent.agent_id] = [self._neutral_text()]
                 continue
             senders = neighbor_map[agent.agent_id]
             delivered_items[agent.agent_id] = [post_map[n.agent_id] for n in senders]
@@ -490,31 +494,31 @@ class SimulationOrchestrator:
                 for n in senders
             ]
 
-        # 5. Phase A. Skipped entirely under delivery: off -- an agent shown
-        # nothing has nothing to reply to, and inventing a reply for it would
-        # make the control arm a treatment arm with an empty feed.
-        if self._run.delivery == "off":
-            replies: list[BackendResponse | None] = [None] * len(all_agents)
-        else:
-            raw_replies = await asyncio.gather(
-                *(
-                    self._dispatch_reply(
-                        agent,
-                        turn,
-                        delivered_texts[agent.agent_id],
-                        self._history.get(agent.agent_id, []),
-                    )
-                    for agent in all_agents
-                ),
-                return_exceptions=True,
-            )
-            replies = self._unwrap(raw_replies)
+        # 5. Phase A. Run in both delivery modes: the control replies to the
+        # neutral message. It used to be skipped under delivery: off, which
+        # made the control a different activity from the treatment rather
+        # than the same activity minus the manipulated factor -- an agent
+        # that reads nothing and writes nothing has a history that never
+        # changes, so the arm could not show drift even in principle.
+        raw_replies = await asyncio.gather(
+            *(
+                self._dispatch_reply(
+                    agent,
+                    turn,
+                    delivered_texts[agent.agent_id],
+                    self._history.get(agent.agent_id, []),
+                )
+                for agent in all_agents
+            ),
+            return_exceptions=True,
+        )
+        replies: list[BackendResponse | None] = self._unwrap(raw_replies)
 
         # 6. Phase B. Each probe sees this round's reply, built in memory:
         # _history is not touched until step 7.
         probe_tasks = []
         for agent, reply in zip(all_agents, replies, strict=True):
-            if self._run.delivery == "on" and reply is None:
+            if reply is None:
                 # The reply failed, so this agent will not be applied this
                 # round whatever the probe says. Probing it anyway would spend
                 # a call on a reading nothing can consume.
@@ -629,6 +633,33 @@ class SimulationOrchestrator:
             return SIDE_CON
         return tie_break
 
+    def _neutral_text(self) -> str:
+        """The delivery-off control's one post.
+
+        Required by ExperimentRun when regime="bank" and delivery="off", so
+        this is unreachable through the loader -- kept for the same reason
+        _probe_question's guard is: delivering an empty string to every agent
+        in the control arm, every round, would be indistinguishable in the
+        output from a message that moved nobody.
+        """
+        if not self._run.neutral_message or not self._run.neutral_message.strip():
+            raise ValueError(
+                "delivery='off' requires neutral_message: refusing to deliver "
+                "an empty post, which would look like a message nobody moved for"
+            )
+        return self._run.neutral_message
+
+    def _remembered_text(self, item_id: str) -> str:
+        """The text of one logged item, for the resume path.
+
+        The reserved neutral ID renders from the run rather than the bank,
+        which is also why it must never name a bank item: the two sources
+        would disagree and only one of them would be what the agent read.
+        """
+        if item_id == NEUTRAL_ITEM_ID:
+            return self._neutral_text()
+        return self._bank.text(item_id, self._run.language_condition)
+
     async def _dispatch_reply(
         self,
         agent: Agent,
@@ -699,7 +730,9 @@ class SimulationOrchestrator:
         """
         stance_before = agent.current_stance()
         reply_text = _reply_text(reply)
-        failed = probe is None or (reply is None and self._run.delivery == "on" and turn != ROUND_ZERO)
+        # Round 0 has no reply by construction; every other round has one in
+        # both delivery modes, so a missing one is a failure.
+        failed = probe is None or (reply is None and turn != ROUND_ZERO)
 
         prompt_tokens = (reply.prompt_tokens if reply else 0) + (probe[0].prompt_tokens if probe else 0)
         completion_tokens = (
@@ -785,10 +818,10 @@ class SimulationOrchestrator:
     def _remember_round(self, agent_id: str, posts_read: list[str], reply_text: str) -> None:
         """Commits one round to memory, trimmed to the window.
 
-        A round with neither reads nor a reply is not remembered at all, which
-        is every round of a `delivery: off` arm. Recording them would spend
-        memory slots on empty blocks; the slice then counts rounds that had
-        something in them, which is what the window is for.
+        A round with neither reads nor a reply is not remembered at all. That
+        is now only a failed round, which Fix I excludes anyway: a
+        `delivery: off` round reads the neutral message and writes a reply,
+        so it is remembered like any other.
 
         Trimmed here as well as in prompt_builder because this dict lives for
         the whole run: without it a K=200 run would carry 200 rounds per agent
@@ -886,10 +919,7 @@ class SimulationOrchestrator:
                 # an uninterrupted run would be carrying.
                 continue
             remembered = RoundMemory(
-                posts_read=[
-                    self._bank.text(item_id, self._run.language_condition)
-                    for item_id in row.items_read
-                ],
+                posts_read=[self._remembered_text(item_id) for item_id in row.items_read],
                 reply_text=row.reply_text,
             )
             if not remembered.posts_read and not remembered.reply_text:
@@ -1081,11 +1111,11 @@ async def _no_probe() -> None:
 def _reply_text(reply: BackendResponse | None) -> str:
     """The reply body, or an empty string when there was no reply.
 
-    Empty covers two distinct cases on purpose -- a `delivery: off` agent that
-    was never asked, and an agent whose call failed -- because the prompt
-    treats them identically (nothing to show) while the log distinguishes
-    them: the first is api_call_status="success" with no items_read, the
-    second is failed_logged_null.
+    Two rows carry an empty reply: the round-0 probe, where no reply was ever
+    asked for, and a round whose reply call failed. The log distinguishes
+    them -- the first is api_call_status="success" at turn 0, the second is
+    failed_logged_null -- while the prompt treats them identically, since
+    there is nothing to show either way.
     """
     if reply is None or reply.text is None:
         return ""

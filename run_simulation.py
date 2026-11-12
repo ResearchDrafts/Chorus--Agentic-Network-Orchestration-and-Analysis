@@ -54,6 +54,8 @@ def describe(run: ExperimentRun, runs_dir: Path) -> None:
         print(f"  anchors       1 = {run.stance_low_label}")
         print(f"                7 = {run.stance_high_label}")
         print(f"  memory        {run.memory_rounds} rounds of reading and replies")
+        if run.delivery == "off":
+            print(f"  neutral       {run.neutral_message!r}")
         for problem in _probe_language_warnings(run):
             print()
             print(f"  WARNING: {problem}")
@@ -72,7 +74,9 @@ def _describe_regime(run: ExperimentRun) -> str:
     if run.regime != "bank":
         return "generated  agents write their own posts, stance self-reported"
     delivery = (
-        "delivery ON" if run.delivery == "on" else "delivery OFF (E4 control: reads nothing)"
+        "delivery ON"
+        if run.delivery == "on"
+        else "delivery OFF (E4 control: reads one side-free message)"
     )
     return f"bank  posts from {run.bank_path}, stance by probe  [{delivery}]"
 
@@ -83,14 +87,20 @@ def _describe_calls(run: ExperimentRun) -> list[str]:
     A bank round is two calls per agent, not one, plus one probe each for
     round 0 -- so a bank run of the same M and K is about twice the traffic of
     a generated one, which is worth seeing before starting rather than after.
+
+    The delivery-off control costs the same as a treatment arm: it reads the
+    neutral message and replies to it, so it makes M x K reply calls too.
+    That is the point of it -- the two arms differ in the persuasive content
+    of what agents read, not in how much work they do.
     """
     if run.regime != "bank":
         return [f"at most {run.M * run.K} LLM calls (M x K), fewer if memes replace turns"]
 
-    replies = 0 if run.delivery == "off" else run.M * run.K
+    replies = run.M * run.K
     probes = run.M * (run.K + 1)  # +1 for the round-0 probe
     return [
-        f"{replies} reply calls  ({'none: delivery is off' if not replies else 'M x K'})",
+        f"{replies} reply calls  (M x K"
+        + ("; the control replies to the neutral message)" if run.delivery == "off" else ")"),
         f"{probes} probe calls  (M x (K+1), including the round-0 probe)",
         f"{replies + probes} LLM calls in total",
     ]

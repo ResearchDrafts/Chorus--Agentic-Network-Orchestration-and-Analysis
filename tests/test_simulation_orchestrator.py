@@ -577,6 +577,9 @@ def _bank_run(**overrides) -> ExperimentRun:
         stance_low_label="the subsidy should end",
         stance_high_label="the subsidy should continue",
         memory_rounds=3,
+        # Required only when delivery="off", harmless otherwise, and set
+        # unconditionally so a test can flip delivery with one override.
+        neutral_message="Fares come up a lot in conversations about the city.",
     )
     base.update(overrides)
     return make_run(**base)
@@ -816,35 +819,99 @@ async def test_no_graph_edges_file_under_alpha_sampling(tmp_path, bank_gateway):
 # --- delivery: off, the E4 control ---------------------------------------
 
 
-async def test_delivery_off_makes_no_reply_calls_but_probes_every_round(
+async def test_delivery_off_makes_the_same_calls_as_a_treatment_arm(
     tmp_path, bank_gateway
 ):
-    """The control measures how far stance drifts from the probing alone, so
-    the probes must all happen and the replies must all not."""
+    """The control does the same amount of work; only what it reads differs.
+
+    It used to make no reply calls at all, which made it a different activity
+    from the treatment rather than the same activity without the manipulated
+    factor.
+    """
     run = _bank_run(delivery="off")
     await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
 
-    assert bank_gateway.generate.await_count == 0
+    assert bank_gateway.generate.await_count == run.M * run.K
     assert bank_gateway.score_next_token.await_count == run.M * (run.K + 1)
 
 
-async def test_delivery_off_rows_read_nothing_and_still_succeed(tmp_path, bank_gateway):
+async def test_delivery_off_rows_read_the_reserved_neutral_id(tmp_path, bank_gateway):
+    """So a control row says "read the side-free message" rather than "read
+    nothing", which is what round 0 says and a different fact."""
+    from sandbox.bank_manager import NEUTRAL_ITEM_ID
+
     run = _bank_run(delivery="off")
     await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
 
     rows = _bank_rows(tmp_path)
     assert len(rows) == run.M * (run.K + 1)
     for row in rows:
-        assert row.items_read == []
-        assert row.reply_text == ""
         assert row.api_call_status == "success"
         assert row.probe_mean is not None
+        if row.turn == 0:
+            assert row.items_read == []
+            assert row.reply_text == ""
+        else:
+            assert row.items_read == [NEUTRAL_ITEM_ID]
+            # posted_item_id is still the bank item this agent WOULD have
+            # posted, so the control's draws stay comparable to the
+            # treatment's row by row.
+            assert row.posted_item_id is not None
+            assert row.reply_text
+
+
+async def test_delivery_off_delivers_the_neutral_message_and_no_bank_text(
+    tmp_path, bank_gateway
+):
+    """Every post the control reads is the neutral message, and no argument
+    from the bank reaches any prompt in either phase."""
+    from sandbox.bank_manager import BankManager
+
+    run = _bank_run(delivery="off", K=2)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    replies = [c.args[0] for c in bank_gateway.generate.await_args_list]
+    probes = [c.args[0] for c in bank_gateway.score_next_token.await_args_list]
+    assert replies
+
+    for prompt in replies:
+        assert prompt.count(f"A user posted: {run.neutral_message}") == 1
+        assert prompt.count("A user posted:") == 1
+
+    bank = BankManager(FIXTURE_BANK)
+    bank_texts = [
+        bank.text(item_id, run.language_condition)
+        for side in ("pro", "con")
+        for item_id in bank.items_for_side(side)
+    ]
+    for prompt in replies + probes:
+        for text in bank_texts:
+            assert text not in prompt
+
+
+async def test_delivery_off_remembers_its_rounds(tmp_path, bank_gateway):
+    """The control's history has to change round over round, or the arm
+    cannot show drift even in principle."""
+    run = _bank_run(delivery="off", K=3)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    replies = [c.args[0] for c in bank_gateway.generate.await_args_list]
+    round_one, round_three = replies[: run.M], replies[2 * run.M : 3 * run.M]
+    assert all("Earlier in this discussion" not in p for p in round_one)
+    assert all(p.count("You replied:") == 2 for p in round_three)
+    assert all(p.count("You read:") == 2 for p in round_three)
 
 
 async def test_delivery_off_still_resolves_neighbours_and_posts(tmp_path, bank_gateway):
     """Sides, items and neighbours are still resolved, so every seeded stream
     consumes identically to a delivery-on arm. The control then differs from
-    the treatment in what agents SAW and in nothing else."""
+    the treatment in the persuasive content of what agents READ and in
+    nothing else.
+
+    The probe is driven to a constant reading in both arms (bank_gateway's
+    default), which is what makes the sides match: in a real run the readings
+    diverge as soon as the arms do, and that divergence is the result.
+    """
     on, off = tmp_path / "on", tmp_path / "off"
     await build_orchestrator(_bank_run(seed=3), bank_gateway, runs_dir=on).run()
     await build_orchestrator(
@@ -860,14 +927,18 @@ async def test_delivery_off_still_resolves_neighbours_and_posts(tmp_path, bank_g
     assert signature(on) == signature(off)
 
 
-async def test_delivery_off_prompts_show_no_feed_and_no_memory(tmp_path, bank_gateway):
+async def test_delivery_off_probes_still_show_no_feed(tmp_path, bank_gateway):
+    """The probe measures; it never delivers, in either mode. Its memory
+    block does grow, because the control now has rounds to remember."""
     await build_orchestrator(
         _bank_run(delivery="off"), bank_gateway, runs_dir=tmp_path
     ).run()
 
-    for call in bank_gateway.score_next_token.await_args_list:
-        assert "Posts in your feed" not in call.args[0]
-        assert "Earlier in this discussion" not in call.args[0]
+    probes = [c.args[0] for c in bank_gateway.score_next_token.await_args_list]
+    for prompt in probes:
+        assert "Posts in your feed" not in prompt
+        assert "A user posted" not in prompt
+    assert any("Earlier in this discussion" in p for p in probes)
 
 
 async def test_delivery_off_probes_all_carry_the_lean(tmp_path, bank_gateway):
@@ -1352,6 +1423,57 @@ async def test_re_logged_rows_do_not_double_count_the_bank_cycle(tmp_path, bank_
     resumed = build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path)
     resumed._restore_bank_state()
     assert sum(resumed._bank.post_counts().values()) == 8 * 2  # not 32
+
+
+async def test_a_resumed_delivery_off_run_matches_an_uninterrupted_one(
+    tmp_path, bank_gateway
+):
+    """The control resumes like any other arm.
+
+    It has history to rebuild now -- every round reads the neutral message
+    and writes a reply -- and the reserved id in items_read has to render
+    from run.neutral_message rather than through the bank, which would raise
+    a KeyError on it.
+    """
+    run = dict(delivery="off", K=4)
+    bank_gateway.generate.return_value = make_backend_response(text="a reply")
+    clean = tmp_path / "clean"
+    await build_orchestrator(_bank_run(**run), bank_gateway, runs_dir=clean).run()
+
+    crashed = tmp_path / "crashed"
+    _crash_in_round(bank_gateway, 3)
+    with pytest.raises(RuntimeError):
+        await build_orchestrator(_bank_run(**run), bank_gateway, runs_dir=crashed).run()
+    assert {r.turn for r in _bank_rows(crashed)} == {0, 1, 2}
+
+    bank_gateway.generate.side_effect = None
+    bank_gateway.generate.return_value = make_backend_response(text="reply in round 3")
+    await build_orchestrator(_bank_run(**run), bank_gateway, runs_dir=crashed).run()
+
+    def signature(where):
+        return [
+            (r.turn, r.speaker_agent_id, tuple(r.neighbor_agent_ids), r.posted_item_id,
+             tuple(r.items_read), r.stance_before, r.stance_after, r.api_call_status)
+            for r in sorted(_bank_rows(where), key=lambda r: (r.turn, r.speaker_agent_id))
+        ]
+
+    assert signature(crashed) == signature(clean)
+
+
+async def test_a_resumed_delivery_off_run_remembers_the_neutral_message(
+    tmp_path, bank_gateway
+):
+    """Rebuilt from the log, where the round is recorded as the reserved id."""
+    run = _bank_run(delivery="off", K=2)
+    bank_gateway.generate.return_value = make_backend_response(text="a reply")
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    resumed = build_orchestrator(run, bank_gateway, runs_dir=tmp_path)
+    resumed._restore_bank_state()
+
+    assert len(resumed._history) == run.M
+    for remembered in resumed._history.values():
+        assert [r.posts_read for r in remembered] == [[run.neutral_message]] * 2
 
 
 async def test_rerunning_a_completed_bank_run_is_a_no_op(tmp_path, bank_gateway):

@@ -38,6 +38,14 @@ SIDES = ("pro", "con")
 STRENGTHS = ("strong", "weak")
 REQUIRED_COLUMNS = ("item_id", "arg_id", "strength", "side", *LANGUAGE_CONDITIONS)
 
+# The item ID a `delivery: off` round logs for the side-free message it
+# delivers. Reserved, not a bank item: it has no side and no strength, it is
+# rendered from ExperimentRun.neutral_message rather than from any CSV, and a
+# bank that used it would make a control row indistinguishable from a
+# treatment row that happened to read that argument. Validated against the
+# bank at load, so the collision is a config error rather than a silent one.
+NEUTRAL_ITEM_ID = "__neutral__"
+
 
 class BankValidationError(Exception):
     """Raised for any problem with a bank file, listing every problem found.
@@ -255,6 +263,16 @@ def _load_and_validate(path: Path) -> dict[str, dict[str, str]]:
             continue
         if item_id in items:
             errors.append(f"line {line_no}: duplicate item_id {item_id!r}")
+            continue
+        if item_id == NEUTRAL_ITEM_ID:
+            # Reserved for the delivery-off control's side-free message. A
+            # bank item under this ID would be rendered from
+            # neutral_message rather than from its own row, so the argument
+            # in the CSV would silently never be read.
+            errors.append(
+                f"line {line_no}: item_id {NEUTRAL_ITEM_ID!r} is reserved for the "
+                "delivery-off control's neutral message and cannot name a bank item"
+            )
             continue
 
         side = (row.get("side") or "").strip()

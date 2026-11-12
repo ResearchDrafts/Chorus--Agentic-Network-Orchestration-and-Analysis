@@ -1,13 +1,16 @@
 # RQ1 bank-regime smoke test: the E4 control arm (delivery: off).
 #
-# Agents read nothing and write no reply, but are still probed every round.
-# It measures how far stance drifts from the probing alone, which is the
-# baseline every delivery-on arm is compared against.
+# Agents read one on-topic message that takes no side, reply to it, and are
+# probed every round, exactly like a treatment arm. It measures how far
+# stance drifts from taking part at all -- reading something, writing
+# something, being asked -- which is the baseline every delivery-on arm is
+# compared against.
 #
 # Sides, posted items and neighbours are still resolved and still logged, so
 # every seeded stream consumes identically to the delivery-on arm and the two
-# differ in what agents SAW and in nothing else. items_read is empty on every
-# row, and there are no reply calls at all: 0 replies, 8 x 4 = 32 probes.
+# differ in the persuasive content of what agents READ and in nothing else.
+# items_read is the reserved id "__neutral__" on every round, and the call
+# count matches the treatment arm: 8 x 3 = 24 replies, 8 x 4 = 32 probes.
 #
 # Note the quotes on delivery: YAML 1.1 reads bare `off` as the boolean False.
 #
@@ -29,6 +32,12 @@ meme_injection:
 memory_rounds: 3
 model_backend_id: hosted_vllm/Qwen/Qwen2.5-7B-Instruct
 neighbor_strategy: graph
+# The one post every agent reads, every round. On topic, and deliberately
+# takes neither side: it holds the activity constant against the treatment
+# arm while holding the persuasive content at zero. Written in this run's
+# language -- there is no default, for the same reason probe_question has
+# none.
+neutral_message: Bus fares come up a lot in conversations about the city.
 persona_pool_id: pool_20
 probe_mass_floor: 0.5
 probe_question: Should city bus fares stay subsidised?

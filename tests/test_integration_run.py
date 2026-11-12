@@ -633,20 +633,57 @@ async def test_a_resumed_run_keeps_its_graph_edges_file(tmp_path, rq1_config, ba
 # --- 12.4: delivery: off, the E4 control ---------------------------------
 
 
-async def test_the_delivery_off_control_makes_no_reply_calls(
+NEUTRAL = "Bus fares come up a lot in conversations about the city."
+
+
+async def test_the_shipped_delivery_off_config_loads(tmp_path):
+    """configs/rq1/smoke_off.yaml is the worked example of the E4 control."""
+    run = load_run_config(Path("configs/rq1/smoke_off.yaml"))
+    assert run.delivery == "off"
+    assert run.neutral_message and run.neutral_message.strip()
+
+
+async def test_the_delivery_off_control_reads_one_neutral_message(
     tmp_path, rq1_config, bank_gateway
 ):
-    run = load_run_config(rq1_config(delivery="off"))
+    """It makes the same calls a treatment arm does, reads one side-free
+    message every round, and never sees a bank argument.
+
+    The control used to deliver nothing and reply to nothing, which made it a
+    different activity from the treatment rather than the same activity
+    without the manipulated factor.
+    """
+    from sandbox.bank_manager import NEUTRAL_ITEM_ID, BankManager
+
+    run = load_run_config(rq1_config(delivery="off", neutral_message=NEUTRAL))
     await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
 
-    assert bank_gateway.generate.await_count == 0
+    assert bank_gateway.generate.await_count == run.M * run.K == 24
     assert bank_gateway.score_next_token.await_count == run.M * (run.K + 1) == 32
 
     rows = _rows(tmp_path, "rq1_run")
     assert len(rows) == 32
-    assert all(r.items_read == [] for r in rows)
-    assert all(r.reply_text == "" for r in rows)
     assert all(r.probe_mean is not None for r in rows)
+    for row in rows:
+        if row.turn == 0:
+            assert row.items_read == [] and row.reply_text == ""
+        else:
+            assert row.items_read == [NEUTRAL_ITEM_ID]
+            assert row.reply_text
+
+    bank = BankManager(run.bank_path)
+    arguments = [
+        bank.text(item_id, run.language_condition)
+        for side in ("pro", "con")
+        for item_id in bank.items_for_side(side)
+    ]
+    prompts = [c.args[0] for c in bank_gateway.generate.await_args_list] + [
+        c.args[0] for c in bank_gateway.score_next_token.await_args_list
+    ]
+    for prompt in prompts:
+        assert all(argument not in prompt for argument in arguments)
+    for prompt in (c.args[0] for c in bank_gateway.generate.await_args_list):
+        assert prompt.count(f"A user posted: {NEUTRAL}") == 1
 
 
 async def test_the_control_and_the_treatment_share_their_draws(
@@ -661,7 +698,9 @@ async def test_the_control_and_the_treatment_share_their_draws(
         load_run_config(rq1_config("on.yaml")), bank_gateway, runs_dir=on
     ).run()
     await build_orchestrator(
-        load_run_config(rq1_config("off.yaml", delivery="off")), bank_gateway, runs_dir=off
+        load_run_config(rq1_config("off.yaml", delivery="off", neutral_message=NEUTRAL)),
+        bank_gateway,
+        runs_dir=off,
     ).run()
 
     def draws(where):

@@ -341,14 +341,17 @@ def test_the_rq1_configs_are_a_matched_set():
 
 
 def test_the_delivery_off_config_differs_only_in_delivery():
-    """And in run_id, so the two arms do not write into the same directory."""
+    """And in run_id, so the two arms do not write into the same directory,
+    and in neutral_message, which only the control delivers."""
     from pathlib import Path
 
     on = load_run_config(Path("configs/rq1/smoke.yaml")).model_dump()
     off = load_run_config(Path("configs/rq1/smoke_off.yaml")).model_dump()
 
     differing = {k for k in on if on[k] != off[k]}
-    assert differing == {"delivery", "run_id"}
+    assert differing == {"delivery", "run_id", "neutral_message"}
+    assert on["neutral_message"] is None
+    assert off["neutral_message"].strip()
 
 
 def test_delivery_is_quoted_in_every_shipped_config():

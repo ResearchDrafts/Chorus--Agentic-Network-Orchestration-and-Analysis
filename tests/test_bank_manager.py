@@ -102,6 +102,35 @@ def test_duplicate_item_ids_are_rejected(tmp_path):
         BankManager(path)
 
 
+def test_the_reserved_neutral_item_id_is_rejected(tmp_path):
+    """"__neutral__" names the delivery-off control's side-free message,
+    which is rendered from ExperimentRun.neutral_message. A bank item under
+    that ID would never be read -- the orchestrator resolves the ID from the
+    run, not from the CSV -- and a control row would be indistinguishable
+    from a treatment row that read that argument."""
+    from sandbox.bank_manager import NEUTRAL_ITEM_ID
+
+    path = _write_bank(
+        tmp_path, [_row(NEUTRAL_ITEM_ID), _row("b2", side="con")]
+    )
+    with pytest.raises(BankValidationError, match="reserved"):
+        BankManager(path)
+
+
+def test_the_reserved_id_is_reported_with_every_other_problem(tmp_path):
+    """Accumulated, like every other bank error: one run to fix, not three."""
+    from sandbox.bank_manager import NEUTRAL_ITEM_ID
+
+    path = _write_bank(
+        tmp_path,
+        [_row(NEUTRAL_ITEM_ID), _row("b2", side="con", strength="medium")],
+    )
+    with pytest.raises(BankValidationError) as caught:
+        BankManager(path)
+    assert any("reserved" in problem for problem in caught.value.errors)
+    assert any("strength" in problem for problem in caught.value.errors)
+
+
 def test_a_missing_side_is_rejected(tmp_path):
     """Both sides must be representable: an agent on the con side with no con
     items has nothing to post, and there is no safe thing to do about it at

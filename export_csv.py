@@ -49,8 +49,8 @@ RUN_FIELDS = (
     # RQ1's design dimensions. Every one of these is something an analysis
     # groups or filters by, and joining them on here is what lets a whole
     # campaign be read from interactions.csv alone: without `delivery`,
-    # the E4 control rows are indistinguishable from treatment rows that
-    # happened to read nothing.
+    # an E4 control row reads like a treatment row whose single post
+    # happened not to move anybody.
     "regime", "delivery", "neighbor_strategy", "graph_degree", "graph_rewire_p",
     "bank_path", "probe_mass_floor", "memory_rounds",
 )
@@ -153,11 +153,12 @@ def _column(df: pd.DataFrame, name: str, dtype) -> pd.Series:
 def _join_items(value) -> str:
     """Semicolon-joined item IDs, empty for a row that read nothing.
 
-    An empty string is the round-0 probe and every row of a `delivery: off`
-    control arm, both of which genuinely read nothing -- as distinct from a
-    missing column, which is a pre-bank dataset and also lands here as empty.
-    n_items_read carries the count so an analysis does not have to split the
-    string to know.
+    An empty string is the round-0 probe, the only row where an agent
+    genuinely read nothing -- as distinct from a missing column, which is a
+    pre-bank dataset and also lands here as empty. A `delivery: off` row
+    carries the reserved id "__neutral__", since the control reads one
+    side-free message rather than nothing. n_items_read carries the count so
+    an analysis does not have to split the string to know.
     """
     if isinstance(value, list):
         return ";".join(str(item) for item in value)

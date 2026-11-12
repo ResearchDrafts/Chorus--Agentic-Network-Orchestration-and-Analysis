@@ -107,9 +107,11 @@ class Interaction(BaseModel):
     # a reply the agent writes, and a private probe that reads its stance.
 
     # The bank item IDs this agent was shown this round, in delivery order.
-    # Empty for the round-0 probe and for every round of a `delivery: off`
-    # control arm, which is what distinguishes "read nothing" from "read
-    # something" in the dataset without a second column.
+    # Empty for the round-0 probe, which is the only row in the dataset where
+    # an agent genuinely read nothing. A `delivery: off` round carries the one
+    # reserved ID "__neutral__" (bank_manager.NEUTRAL_ITEM_ID), so a control
+    # row says "read the side-free message" rather than "read nothing", and a
+    # bank is rejected at load if it uses that ID itself.
     items_read: list[str] = Field(default_factory=list)
     # The bank item THIS agent posted this round, for its current side. None
     # at round 0, when nobody has posted yet.
@@ -264,11 +266,27 @@ class ExperimentRun(BaseModel):
     # different arguments in each condition.
     regime: str = Field(default="generated", pattern="^(generated|bank)$")
     bank_path: str | None = None
-    # "off" is the E4 control: agents read nothing and write no reply, but are
-    # still probed every round. It measures how much stance drifts from the
-    # probing itself, which is the baseline every delivery-on arm is compared
-    # against.
+    # "off" is the E4 control: agents read one message that takes no side,
+    # reply to it, and are probed exactly like a treatment arm. It measures
+    # how much stance drifts from taking part at all -- reading something,
+    # writing something, being asked -- which is the baseline every
+    # delivery-on arm is compared against.
+    #
+    # It used to deliver nothing and ask for no reply. That made the control
+    # a different activity from the treatment rather than the same activity
+    # without the manipulated factor: an agent with nothing to read and
+    # nothing to say has a history that never changes, so the arm could not
+    # show drift even in principle.
     delivery: str = Field(default="on", pattern="^(on|off)$")
+    # The one post a delivery-off agent reads, every round, in the run's own
+    # language. On-topic and taking no side: it holds the activity constant
+    # against the treatment while holding the persuasive content at zero.
+    #
+    # Required when regime="bank" and delivery="off", never defaulted, for
+    # the same reason probe_question is not: a generic English fallback would
+    # silently make every arm's control read English, and the control is what
+    # every treatment effect is measured against.
+    neutral_message: str | None = None
 
     # The 7-point survey question, written in this run's language. Asked in a
     # fresh context that never enters the agent's history, so the agent is
@@ -355,6 +373,25 @@ class ExperimentRun(BaseModel):
         if missing:
             raise ValueError(
                 f"regime='bank' requires {' and '.join(missing)} to be set"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_neutral_message_for_the_off_control(self) -> "ExperimentRun":
+        """The E4 control cannot run without the message it delivers.
+
+        Required rather than defaulted, and non-empty rather than merely
+        present: an empty string would deliver a blank post to every agent in
+        the control arm every round, which is indistinguishable in the output
+        from a message that failed to move anyone.
+        """
+        if self.regime != "bank" or self.delivery != "off":
+            return self
+        if self.neutral_message is None or not self.neutral_message.strip():
+            raise ValueError(
+                "regime='bank' with delivery='off' requires a non-empty "
+                "neutral_message: the control reads one on-topic message that "
+                "takes no side, written in this run's language"
             )
         return self
 

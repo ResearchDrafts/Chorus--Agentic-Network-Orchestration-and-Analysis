@@ -138,9 +138,10 @@ class RoundMemory:
     orchestrator decides which language each post arrives in and this module
     cannot accidentally render a matched set's four arms the same.
 
-    Empty posts_read with a reply means a round under `delivery: off`, where
-    an agent replies to nothing; empty both means a round whose reply failed
-    and was therefore never applied (Fix I), which leaves no memory slot.
+    Empty both means a round whose reply failed and was therefore never
+    applied (Fix I), which leaves no memory slot. Every round that was
+    applied has something in posts_read, the `delivery: off` control
+    included -- its agents read one side-free message rather than nothing.
     """
 
     posts_read: list[str]
@@ -409,9 +410,12 @@ class PromptBuilder:
         would turn a feed of arguments into a feed of sources. RQ1 asks about
         the text.
 
-        Empty under `delivery: off`, where the section is omitted entirely
-        rather than rendered as an empty heading -- a heading with nothing
-        under it is itself a stimulus, and a different one from no feed at all.
+        Omitted entirely when there is nothing to show, rather than rendered
+        as an empty heading -- a heading with nothing under it is itself a
+        stimulus, and a different one from no feed at all. No bank-regime
+        round reaches here empty any more (the `delivery: off` control
+        delivers one side-free message), so this guards the probe path and
+        any future caller rather than a live case.
         """
         if not delivered_posts:
             return ""

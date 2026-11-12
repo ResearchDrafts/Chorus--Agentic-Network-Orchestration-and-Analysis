@@ -531,7 +531,10 @@ def test_the_feed_preserves_delivery_order():
 
 def test_an_empty_feed_omits_the_section_entirely():
     """A heading with nothing under it is itself a stimulus, and a different
-    one from no feed at all. This is the `delivery: off` case."""
+    one from no feed at all. No bank-regime round delivers an empty feed any
+    more -- the `delivery: off` control reads one side-free message -- so
+    this pins the builder's behaviour for the probe path and any future
+    caller rather than a live case."""
     prompt = _reply(_bank_builder(), posts=[])
     assert "Posts in your feed" not in prompt
     assert "Reply to these posts" in prompt  # the instruction still stands
@@ -672,9 +675,10 @@ def test_memory_carries_no_round_numbers_and_no_agent_ids():
     assert not any(ch.isdigit() for ch in memory)
 
 
-def test_a_delivery_off_round_renders_a_reply_with_no_reads():
-    """Under `delivery: off` an agent replies to nothing, so its memory has
-    replies and no reads."""
+def test_a_round_with_a_reply_and_no_reads_renders():
+    """A memory block is rendered from whatever it holds. Nothing in the
+    orchestrator produces this shape today (a delivery-off round reads the
+    neutral message), so it pins the builder rather than a live case."""
     history = [RoundMemory(posts_read=[], reply_text="still thinking about it")]
     prompt = _reply(_bank_builder(), history=history)
     assert "You replied: still thinking about it" in prompt
