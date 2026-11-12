@@ -351,6 +351,17 @@ class ExperimentRun(BaseModel):
     temperature: float = Field(ge=0.0, le=2.0)
     max_cost_usd: float | None = Field(default=None, gt=0.0)
     rate_limits: dict[str, int] = Field(default_factory=dict)
+    # How many requests may be in flight at once. None is unbounded, which is
+    # right for a hosted provider that pools connections itself.
+    #
+    # Set it to a self-hosted server's batch size (vLLM's --max-num-seqs).
+    # The bank regime dispatches M calls at once, twice per round, so M=100 is
+    # 200 connections per round; everything past the server's batch size sits
+    # open waiting, accumulates across rounds, and the run eventually dies
+    # with "Server disconnected" while the server is perfectly healthy. This
+    # lives on the run rather than at the call site so the value that produced
+    # a dataset is recorded in run_config.json.
+    max_concurrency: int | None = Field(default=None, ge=1)
     checkpoint_every_n_turns: int = Field(default=1, ge=1)
     git_commit_hash: str = ""
     started_at_utc: str | None = None

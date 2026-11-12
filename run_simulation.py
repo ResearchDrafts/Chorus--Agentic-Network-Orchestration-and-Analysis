@@ -207,6 +207,14 @@ async def launch(run: ExperimentRun, runs_dir: Path) -> None:
         RateLimiter(run.rate_limits),
         tracker,
         api_base=run.api_base,
+        # Both were settable on the gateway and configurable on the run, and
+        # neither was passed: a config that asked for 5 top logprobs got the
+        # gateway's default of 20, and max_concurrency was unreachable
+        # outside the notebook. A setting the schema accepts and the launcher
+        # drops is worse than one that does not exist, because
+        # run_config.json records the value the run did not use.
+        max_concurrency=run.max_concurrency,
+        top_logprobs=run.probe_top_logprobs,
     )
     await build_orchestrator(
         run, gateway, cost_tracker=tracker, runs_dir=runs_dir

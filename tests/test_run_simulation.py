@@ -9,6 +9,9 @@ through is a setting that silently does nothing.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
 import run_simulation
@@ -82,3 +85,110 @@ def test_the_roman_script_arms_are_never_warned_about(condition):
     nobody reads."""
     run = make_run(**BANK_KWARGS, language_condition=condition)
     assert run_simulation._probe_language_warnings(run) == []
+
+
+# --- launch wires the gateway settings -----------------------------------
+
+
+class _RawBoth:
+    """One provider response that satisfies both call paths.
+
+    generate() reads choices[0].message.content; score_next_token() reads
+    choices[0].logprobs.content[0].top_logprobs. A single object answering
+    both lets one patched litellm.acompletion serve a whole run.
+    """
+
+    def __init__(self):
+        self.choices = [
+            SimpleNamespace(
+                message=SimpleNamespace(content="5"),
+                logprobs=SimpleNamespace(
+                    content=[
+                        SimpleNamespace(
+                            top_logprobs=[SimpleNamespace(token="5", logprob=-0.01)]
+                        )
+                    ]
+                ),
+            )
+        ]
+        self.usage = SimpleNamespace(prompt_tokens=10, completion_tokens=1)
+
+    def model_dump(self) -> dict:
+        return {"fake": True}
+
+
+LAUNCH_RUN = dict(
+    regime="bank",
+    bank_path="data/bank/test_bank.csv",
+    probe_question="Should the fare subsidy continue?",
+    M=4,
+    N=1,
+    K=1,
+)
+
+
+async def test_launch_sends_the_runs_probe_top_logprobs_to_the_provider(tmp_path):
+    """End to end: a non-default probe_top_logprobs reaches
+    litellm.acompletion.
+
+    It did not before. The field was validated, recorded in run_config.json
+    and never passed, so a run configured to ask for 7 asked for 20 -- and a
+    recorded setting the run did not use is worse than no setting at all.
+    """
+    run = make_run(**LAUNCH_RUN, probe_top_logprobs=7, run_id="launch_probe")
+    completion = AsyncMock(side_effect=lambda *a, **kw: _RawBoth())
+
+    with patch("litellm.acompletion", completion):
+        await run_simulation.launch(run, tmp_path)
+
+    probe_calls = [
+        c for c in completion.await_args_list if "top_logprobs" in c.kwargs
+    ]
+    assert probe_calls, "no probe call reached the provider"
+    assert all(c.kwargs["top_logprobs"] == 7 for c in probe_calls)
+    assert all(c.kwargs["logprobs"] is True for c in probe_calls)
+    # M x (K + 1) probes, and the reply calls ask for no logprobs at all.
+    assert len(probe_calls) == run.M * (run.K + 1)
+    assert len(completion.await_args_list) == len(probe_calls) + run.M * run.K
+
+
+async def test_launch_passes_max_concurrency_to_the_gateway(tmp_path):
+    """The bank regime dispatches M calls at once, twice per round, so the
+    cap is what keeps a self-hosted server's connection count bounded. It was
+    reachable only from the notebook before."""
+    captured = {}
+    real_gateway = run_simulation.ModelGateway
+
+    def recording(*args, **kwargs):
+        captured.update(kwargs)
+        return real_gateway(*args, **kwargs)
+
+    run = make_run(
+        **LAUNCH_RUN, max_concurrency=3, probe_top_logprobs=11, run_id="launch_cap"
+    )
+    with patch("litellm.acompletion", AsyncMock(side_effect=lambda *a, **kw: _RawBoth())):
+        with patch.object(run_simulation, "ModelGateway", recording):
+            await run_simulation.launch(run, tmp_path)
+
+    assert captured["max_concurrency"] == 3
+    assert captured["top_logprobs"] == 11
+
+
+async def test_launch_leaves_both_settings_unbounded_by_default(tmp_path):
+    """None means unbounded, which is the right default for a hosted
+    provider that pools connections itself."""
+    captured = {}
+    real_gateway = run_simulation.ModelGateway
+
+    def recording(*args, **kwargs):
+        captured.update(kwargs)
+        return real_gateway(*args, **kwargs)
+
+    run = make_run(**LAUNCH_RUN, run_id="launch_default")
+    assert run.max_concurrency is None
+    with patch("litellm.acompletion", AsyncMock(side_effect=lambda *a, **kw: _RawBoth())):
+        with patch.object(run_simulation, "ModelGateway", recording):
+            await run_simulation.launch(run, tmp_path)
+
+    assert captured["max_concurrency"] is None
+    assert captured["top_logprobs"] == 20  # the schema default
