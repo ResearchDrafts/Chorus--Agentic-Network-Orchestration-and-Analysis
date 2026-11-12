@@ -69,6 +69,25 @@ class FatalGatewayError(Exception):
     invalid model id, content policy rejection) -- never retried."""
 
 
+class ContextLengthExceeded(Exception):
+    """The prompt did not fit in the model's context window.
+
+    Deliberately NOT a FatalGatewayError. The orchestrator absorbs that one
+    per agent, which is right for an auth failure or a content rejection --
+    one agent's round is lost and the run continues. It is wrong here. A
+    prompt that overflows does so because the agent's history has grown, so
+    the same agent overflows again every round from then on, and the agents
+    that overflow first are the ones whose language tokenizes least
+    efficiently. A run that absorbed this would quietly drop the Hinglish
+    arm's most talkative agents and keep the English arm's, which is a
+    language-correlated loss in exactly the comparison RQ1 reports.
+
+    So it ends the run. The remedy is a smaller K, a window
+    (memory_rounds), or a model with a longer context -- all decisions for
+    the person running it, not for the loop.
+    """
+
+
 @dataclass
 class BackendResponse:
     text: str
@@ -231,6 +250,10 @@ class ModelGateway:
             raise TransientGatewayError(str(e)) from e
         except litellm.exceptions.AuthenticationError as e:
             raise FatalGatewayError(str(e)) from e
+        except litellm.exceptions.ContextWindowExceededError as e:
+            # Before BadRequestError, which it subclasses: see
+            # ContextLengthExceeded. Fatal for the RUN, not for this agent.
+            raise ContextLengthExceeded(str(e)) from e
         except litellm.exceptions.BadRequestError as e:
             # Includes the case where the server does not support logprobs at
             # all. Fatal rather than transient: retrying cannot make a server
@@ -273,6 +296,10 @@ class ModelGateway:
             raise TransientGatewayError(str(e)) from e
         except litellm.exceptions.AuthenticationError as e:
             raise FatalGatewayError(str(e)) from e
+        except litellm.exceptions.ContextWindowExceededError as e:
+            # Before BadRequestError, which it subclasses: see
+            # ContextLengthExceeded. Fatal for the RUN, not for this agent.
+            raise ContextLengthExceeded(str(e)) from e
         except litellm.exceptions.BadRequestError as e:
             raise FatalGatewayError(str(e)) from e
 

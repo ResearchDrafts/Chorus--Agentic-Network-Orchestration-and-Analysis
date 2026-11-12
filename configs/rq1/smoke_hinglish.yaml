@@ -22,7 +22,8 @@ graph_rewire_p: 0.1
 language_condition: hinglish
 meme_injection:
   enabled: false
-memory_rounds: 3
+memory_rounds: null
+max_prompt_tokens: null
 model_backend_id: hosted_vllm/Qwen/Qwen2.5-7B-Instruct
 neighbor_strategy: graph
 persona_pool_id: pool_20

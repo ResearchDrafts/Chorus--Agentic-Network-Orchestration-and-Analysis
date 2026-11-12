@@ -61,9 +61,18 @@ stance_scale: [1, 2, 3, 4, 5, 6, 7]
 stance_low_label: fares should not be subsidised
 stance_high_label: fares should stay subsidised
 
-# How many past rounds of reading and replies appear in a prompt. Counted in
-# rounds rather than tokens, per Fix A.
-memory_rounds: 3
+# How many past rounds of reading and replies appear in a prompt. null means
+# the full history, with nothing ever dropped, and that is the default: a
+# window bounds the effect the experiment can measure, because an agent
+# cannot be moved by an argument that has fallen out of its prompt. Set an
+# integer >= 1 only for a run that deliberately wants a window.
+memory_rounds: null
+# A hard ceiling on the prompt length the provider reports. Exceeding it ends
+# the run, naming the agent and the round -- nothing is ever truncated
+# silently, because a run whose Hinglish arm lost the front of its history
+# and whose English arm did not is confounded where RQ1 measures. null is no
+# ceiling; set it a little under the served model's context window.
+max_prompt_tokens: null
 
 # --- backend -------------------------------------------------------------
 # Must match what the server is serving. The bare last segment

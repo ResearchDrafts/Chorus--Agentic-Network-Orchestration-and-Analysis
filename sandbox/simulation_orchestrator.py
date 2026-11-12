@@ -68,6 +68,31 @@ from sandbox.stance_parser import (
 # Fix I: one initial attempt plus two retries with an emphasised format block.
 MAX_STANCE_ATTEMPTS = 3
 
+
+class PromptBudgetExceeded(Exception):
+    """A prompt was longer than ExperimentRun.max_prompt_tokens.
+
+    Fatal for the run, like ContextLengthExceeded and for the same reason: the
+    agents that overflow first are the ones whose language tokenizes least
+    efficiently, so absorbing this per agent would drop one arm's agents and
+    keep another's. It is raised AFTER the call, because the count it checks
+    is the provider's own report of what it received -- the only number that
+    is not an estimate -- which means the overflowing call is paid for once
+    and then the run stops.
+    """
+
+    def __init__(self, agent_id: str, turn: int, call: str, tokens: int, ceiling: int):
+        self.agent_id = agent_id
+        self.turn = turn
+        self.call = call
+        self.tokens = tokens
+        self.ceiling = ceiling
+        super().__init__(
+            f"{agent_id}'s {call} prompt in round {turn} was {tokens} tokens, "
+            f"over max_prompt_tokens={ceiling}. Nothing was truncated: lower K, "
+            "set memory_rounds to a window, or use a longer-context model."
+        )
+
 # The round-0 probe's turn number. Not a turn: nothing is read, nothing is
 # posted, and no reply is written. It exists so every agent's starting stance
 # is a measurement in the dataset rather than something inferred afterwards
@@ -526,6 +551,8 @@ class SimulationOrchestrator:
                 continue
             probe_tasks.append(
                 self._dispatch_probe(
+                    agent,
+                    turn,
                     self._prompt_builder.build_probe_prompt(
                         agent,
                         self._history_with_this_round(
@@ -533,7 +560,7 @@ class SimulationOrchestrator:
                             delivered_texts[agent.agent_id],
                             _reply_text(reply),
                         ),
-                    )
+                    ),
                 )
             )
         probes = self._unwrap(await asyncio.gather(*probe_tasks, return_exceptions=True))
@@ -592,7 +619,9 @@ class SimulationOrchestrator:
             await asyncio.gather(
                 *(
                     self._dispatch_probe(
-                        self._prompt_builder.build_probe_prompt(agent, [])
+                        agent,
+                        ROUND_ZERO,
+                        self._prompt_builder.build_probe_prompt(agent, []),
                     )
                     for agent in all_agents
                 ),
@@ -682,13 +711,17 @@ class SimulationOrchestrator:
             history_rounds=history,
         )
         try:
-            return await self._gateway.generate(
+            response = await self._gateway.generate(
                 built.text, image=None, temperature=self._run.temperature
             )
         except FatalGatewayError:
             return None
+        self._check_prompt_budget(agent.agent_id, turn, "reply", response.prompt_tokens)
+        return response
 
-    async def _dispatch_probe(self, prompt_text: str) -> tuple[BackendResponse, ProbeScore] | None:
+    async def _dispatch_probe(
+        self, agent: Agent, turn: int, prompt_text: str
+    ) -> tuple[BackendResponse, ProbeScore] | None:
         """Phase B for one agent. None means a logged failure.
 
         ProbeMassTooLow is absorbed here exactly like FatalGatewayError: the
@@ -696,14 +729,37 @@ class SimulationOrchestrator:
         per-agent event and not a reason to end the run. It is never
         retried -- the probe is deterministic at temperature 0, so a second
         identical call would return the same off-scale answer.
+
+        The prompt budget is not absorbed: see PromptBudgetExceeded.
         """
         try:
             response = await self._gateway.score_next_token(prompt_text)
-            return response, score_probe(
+            reading = score_probe(
                 response.top_logprobs or [], self._run.probe_mass_floor
             )
         except (FatalGatewayError, ProbeMassTooLow):
             return None
+        self._check_prompt_budget(agent.agent_id, turn, "probe", response.prompt_tokens)
+        return response, reading
+
+    def _check_prompt_budget(
+        self, agent_id: str, turn: int, call: str, prompt_tokens: int
+    ) -> None:
+        """Enforces max_prompt_tokens against what the provider reported.
+
+        Checked on the reported count rather than on a local estimate: a
+        tokenizer guess would be wrong by a different margin in each language
+        arm, which is the one place this must not be approximate.
+
+        Bank regime only. The generated regime's memory is a fixed five-turn
+        window, so its prompts do not grow without bound and there is nothing
+        here for the ceiling to catch -- while adding a new fatal path to that
+        loop would change behaviour the brief holds fixed.
+        """
+        ceiling = self._run.max_prompt_tokens
+        if ceiling is None or prompt_tokens <= ceiling:
+            return
+        raise PromptBudgetExceeded(agent_id, turn, call, prompt_tokens, ceiling)
 
     def _build_bank_interaction(
         self,
@@ -718,11 +774,12 @@ class SimulationOrchestrator:
     ) -> Interaction:
         """One row. Token counts and latency are summed over both calls.
 
-        Summed rather than kept in separate columns: the fields already exist,
-        every analysis reads them as "what this agent-round cost", and a round
-        is two calls. The split is recoverable from the raw responses if it is
-        ever needed; the total is what budgeting and the Fix A prompt-length
-        diagnostic actually use.
+        prompt_token_count and completion_token_count stay summed: the fields
+        already exist and every analysis reads them as "what this agent-round
+        cost", and a round is two calls. The two prompt lengths are ALSO
+        recorded separately, in reply_prompt_tokens and probe_prompt_tokens,
+        because RQ1 has to report prompt length per language and the sum of
+        two differently-shaped prompts cannot be split back apart afterwards.
 
         A failed row repeats stance_before as stance_after and leaves every
         probe column null, per Fix I: no fabricated stance, and nothing that
@@ -734,7 +791,9 @@ class SimulationOrchestrator:
         # both delivery modes, so a missing one is a failure.
         failed = probe is None or (reply is None and turn != ROUND_ZERO)
 
-        prompt_tokens = (reply.prompt_tokens if reply else 0) + (probe[0].prompt_tokens if probe else 0)
+        reply_prompt_tokens = reply.prompt_tokens if reply else 0
+        probe_prompt_tokens = probe[0].prompt_tokens if probe else 0
+        prompt_tokens = reply_prompt_tokens + probe_prompt_tokens
         completion_tokens = (
             (reply.completion_tokens if reply else 0) + (probe[0].completion_tokens if probe else 0)
         )
@@ -760,6 +819,8 @@ class SimulationOrchestrator:
                 probe_dist=None,
                 probe_mass=None,
                 side_conf=None,
+                reply_prompt_tokens=reply_prompt_tokens,
+                probe_prompt_tokens=probe_prompt_tokens,
                 prompt_token_count=prompt_tokens,
                 completion_token_count=completion_tokens,
                 model_backend_id=self._run.model_backend_id,
@@ -790,6 +851,8 @@ class SimulationOrchestrator:
             probe_dist=list(reading.dist),
             probe_mass=reading.mass,
             side_conf=reading.side_conf,
+            reply_prompt_tokens=reply_prompt_tokens,
+            probe_prompt_tokens=probe_prompt_tokens,
             prompt_token_count=prompt_tokens,
             completion_token_count=completion_tokens,
             model_backend_id=self._run.model_backend_id,
@@ -823,18 +886,22 @@ class SimulationOrchestrator:
         `delivery: off` round reads the neutral message and writes a reply,
         so it is remembered like any other.
 
-        Trimmed here as well as in prompt_builder because this dict lives for
-        the whole run: without it a K=200 run would carry 200 rounds per agent
-        in memory to render three.
+        Trimmed here as well as in prompt_builder when a window is
+        configured, because this dict lives for the whole run: without it a
+        K=200 run with a three-round window would carry 200 rounds per agent
+        in memory to render three. With memory_rounds=None every round is
+        kept, which is the point -- the agent's full history is the stimulus.
         """
         if not posts_read and not reply_text:
             return
-        rounds = max(self._run.memory_rounds, 1)
+        rounds = self._run.memory_rounds
         remembered = [
             *self._history.get(agent_id, []),
             RoundMemory(posts_read=list(posts_read), reply_text=reply_text),
         ]
-        self._history[agent_id] = remembered[-rounds:]
+        self._history[agent_id] = (
+            remembered if rounds is None else remembered[-rounds:]
+        )
 
     # --- resume and lifecycle -------------------------------------------
 
@@ -910,7 +977,7 @@ class SimulationOrchestrator:
             counts[key] = counts.get(key, 0) + 1
         self._bank.restore_post_counts(counts)
 
-        rounds = max(self._run.memory_rounds, 1)
+        rounds = self._run.memory_rounds
         history: dict[str, list[RoundMemory]] = {}
         for row in rows:
             if row.turn == ROUND_ZERO or not row.is_valid_for_analysis:
@@ -926,7 +993,8 @@ class SimulationOrchestrator:
                 continue
             history.setdefault(row.speaker_agent_id, []).append(remembered)
         self._history = {
-            agent_id: entries[-rounds:] for agent_id, entries in history.items()
+            agent_id: (entries if rounds is None else entries[-rounds:])
+            for agent_id, entries in history.items()
         }
 
     def _verify_strategy_covers_the_population(self) -> None:

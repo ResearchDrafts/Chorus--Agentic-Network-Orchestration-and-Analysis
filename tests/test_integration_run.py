@@ -470,6 +470,19 @@ async def test_export_csv_consumes_a_bank_run(tmp_path, rq1_config, bank_gateway
     assert frame[frame.turn > 0]["n_items_read"].eq(run.N).all()
     assert frame[frame.turn > 0]["items_read"].str.count(";").eq(run.N - 1).all()
 
+    # The two prompt lengths, separately as well as summed: RQ1 reports
+    # prompt length per language, and a reply prompt and a probe prompt grow
+    # for different reasons.
+    for column in ("reply_prompt_tokens", "probe_prompt_tokens"):
+        assert pd.api.types.is_numeric_dtype(frame[column]), column
+    assert frame[frame.turn == 0]["reply_prompt_tokens"].eq(0).all()
+    assert frame[frame.turn > 0]["reply_prompt_tokens"].gt(0).all()
+    assert frame["probe_prompt_tokens"].gt(0).all()
+    assert (
+        frame.prompt_token_count
+        == frame.reply_prompt_tokens + frame.probe_prompt_tokens
+    ).all()
+
 
 # --- 12.2: the matched set -----------------------------------------------
 

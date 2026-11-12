@@ -184,7 +184,14 @@ def test_agent_and_run_share_one_language_pattern():
 
 def test_bank_regime_fields_default_to_the_previous_behaviour():
     """Every existing config must keep meaning what it meant, so each new
-    field defaults to the pre-bank behaviour rather than to the new one."""
+    field defaults to the pre-bank behaviour rather than to the new one.
+
+    memory_rounds is the exception, and deliberately: it defaults to None,
+    meaning full history. A window silently bounds the effect the experiment
+    can measure, so the default is "keep everything" and a window is
+    something a run has to ask for. No pre-bank config reads the field at
+    all, so nothing's meaning changes.
+    """
     from sandbox.models import ExperimentRun
 
     run = ExperimentRun(**_run_kwargs())
@@ -195,7 +202,9 @@ def test_bank_regime_fields_default_to_the_previous_behaviour():
     assert run.probe_question is None
     assert (run.graph_degree, run.graph_rewire_p) == (6, 0.1)
     assert (run.probe_top_logprobs, run.probe_mass_floor) == (20, 0.5)
-    assert run.memory_rounds == 3
+    assert run.memory_rounds is None
+    assert run.max_prompt_tokens is None
+    assert run.neutral_message is None
 
 
 @pytest.mark.parametrize(

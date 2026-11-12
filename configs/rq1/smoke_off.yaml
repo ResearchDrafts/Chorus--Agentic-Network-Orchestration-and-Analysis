@@ -29,7 +29,8 @@ graph_rewire_p: 0.1
 language_condition: english
 meme_injection:
   enabled: false
-memory_rounds: 3
+memory_rounds: null
+max_prompt_tokens: null
 model_backend_id: hosted_vllm/Qwen/Qwen2.5-7B-Instruct
 neighbor_strategy: graph
 # The one post every agent reads, every round. On topic, and deliberately

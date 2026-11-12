@@ -10,7 +10,8 @@ Produces three files:
                     The main dataset. Bank-regime runs additionally carry
                     probe_mean, x (the stance rescaled to [-1, 1] about the
                     midpoint), probe_mass, side_conf, items_read,
-                    n_items_read and posted_item_id; these are present but
+                    n_items_read, posted_item_id, is_round_zero and the two
+                    per-call prompt lengths; these are present but
                     empty for generated-regime rows, so a campaign mixing
                     both regimes still exports as one table.
   agents.csv        one row per agent per run: final stance, total movement,
@@ -138,6 +139,14 @@ def _derive_bank_columns(df: pd.DataFrame) -> pd.DataFrame:
     # How decided the agent is, as distinct from where it stands.
     df["side_conf"] = _column(df, "side_conf", float)
     df["probe_mean"] = probe_mean
+    # The two calls' prompt lengths, as well as their sum in
+    # prompt_token_count. RQ1 reports prompt length per language, and a reply
+    # prompt and a probe prompt grow for different reasons, so the sum alone
+    # cannot answer the question. Read as float rather than int because a
+    # pre-bank dataset has no such column and lands here as NaN, which an
+    # int column cannot hold.
+    df["reply_prompt_tokens"] = _column(df, "reply_prompt_tokens", float)
+    df["probe_prompt_tokens"] = _column(df, "probe_prompt_tokens", float)
     return df
 
 

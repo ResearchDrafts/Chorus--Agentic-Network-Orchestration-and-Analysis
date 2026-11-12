@@ -68,12 +68,6 @@ LANGUAGE_DIRECTIVES = {
     "hindi": "Write your reply in Hindi (Devanagari script).",
 }
 
-# Fix A's window for the bank regime, in rounds. Kept as a module constant
-# alongside MEMORY_WINDOW_TURNS so the two regimes' caps are visible in one
-# place, but the bank path reads run.memory_rounds and uses this only as the
-# fallback when a run predates the field.
-DEFAULT_MEMORY_ROUNDS = 3
-
 # The lean sentence, keyed by the agent's initial_stance as an integer.
 #
 # This is the one place an agent is told where it starts, and it is told in
@@ -372,19 +366,24 @@ class PromptBuilder:
         )
 
     def _bank_memory_section(self, history_rounds: list[RoundMemory]) -> str:
-        """What this agent read and said in the last `memory_rounds` rounds.
+        """What this agent read and said, oldest first.
+
+        Everything it read and said, by default: run.memory_rounds is None
+        unless a run asks for a window, and None applies no slice at all.
+        Nothing here silently drops the front of a history -- a prompt that
+        has grown too long is max_prompt_tokens' business, and it raises.
 
         Oldest first, so the block reads forwards in time. No round numbers,
         no agent ids, no positions: a round is a block, and blocks are
         separated by a rule rather than numbered, because "Round 2" would put
         a digit in front of the model for no benefit.
 
-        Sliced here as well as by the caller, for the reason Fix A's window is
-        sliced at the point of use: this is the cap that reaches the model, so
-        it is the one that determines results.
+        Sliced here as well as by the caller when a window IS configured, for
+        the reason Fix A's window is sliced at the point of use: this is the
+        cap that reaches the model, so it is the one that determines results.
         """
         rounds = self._bank_memory_rounds()
-        recent = history_rounds[-rounds:] if rounds else []
+        recent = list(history_rounds) if rounds is None else history_rounds[-rounds:]
         if not recent:
             return ""
 
@@ -399,8 +398,14 @@ class PromptBuilder:
             return ""
         return "Earlier in this discussion:\n" + "\n  --\n".join(blocks)
 
-    def _bank_memory_rounds(self) -> int:
-        return getattr(self._run, "memory_rounds", DEFAULT_MEMORY_ROUNDS)
+    def _bank_memory_rounds(self) -> int | None:
+        """The configured window, or None for full history.
+
+        Read straight off the run, with no fallback: a default here would
+        turn "keep everything" into a window nobody asked for, which is the
+        one thing this must not do silently.
+        """
+        return self._run.memory_rounds
 
     def _feed_section(self, delivered_posts: list[str]) -> str:
         """The posts this agent was shown.

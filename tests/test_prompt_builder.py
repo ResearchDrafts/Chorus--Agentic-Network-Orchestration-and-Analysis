@@ -636,6 +636,45 @@ def test_memory_renders_reads_and_replies_oldest_first():
     assert "You replied: That matches what I see." in prompt
 
 
+def test_full_history_keeps_every_round_oldest_first():
+    """memory_rounds=None is the default: nothing is ever dropped.
+
+    A window bounds the effect the experiment can measure -- an agent cannot
+    be moved by an argument that has fallen out of its prompt -- so the
+    default keeps everything and prompt length is bounded loudly instead, by
+    max_prompt_tokens.
+    """
+    history = [
+        RoundMemory(posts_read=[f"post from round {w}"], reply_text=f"reply {w}")
+        for w in ("alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta")
+    ]
+    prompt = _reply(_bank_builder(memory_rounds=None), history=history)
+
+    for round_name in ("alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta"):
+        assert f"post from round {round_name}" in prompt
+    assert prompt.count("You replied:") == len(history)
+    positions = [prompt.index(f"post from round {w}") for w in
+                 ("alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta")]
+    assert positions == sorted(positions)
+
+
+def test_full_history_is_the_default_for_a_run_that_says_nothing():
+    history = [RoundMemory(posts_read=[f"p{i}"], reply_text=f"r{i}") for i in range(9)]
+    builder = _bank_builder()  # memory_rounds not passed at all
+    assert builder._run.memory_rounds is None
+    assert _reply(builder, history=history).count("You replied:") == 9
+
+
+def test_the_probe_also_keeps_the_full_history():
+    """Both calls of a round must show the same history, or the measurement
+    is of a different agent than the one that replied."""
+    history = [RoundMemory(posts_read=[f"p{i}"], reply_text=f"r{i}") for i in range(6)]
+    probe = _bank_builder().build_probe_prompt(_bank_agent(), history)
+    assert probe.count("You replied:") == 6
+    for i in range(6):
+        assert f"You read: p{i}" in probe
+
+
 def test_memory_is_capped_at_memory_rounds():
     """Fix A's window, in rounds. This is the cap that reaches the model, so
     it is the one that determines results."""
@@ -649,6 +688,21 @@ def test_memory_is_capped_at_memory_rounds():
     assert "post from round alpha" not in prompt
     assert "post from round beta" not in prompt
     assert prompt.count("You replied:") == 2
+
+
+def test_a_window_remains_available_when_a_run_asks_for_one():
+    """The option is kept, not removed: a run that deliberately wants a
+    bounded stimulus can still have one, it is just no longer the default."""
+    history = [
+        RoundMemory(posts_read=[f"post from round {w}"], reply_text=f"reply {w}")
+        for w in ("alpha", "beta", "gamma", "delta", "epsilon")
+    ]
+    prompt = _reply(_bank_builder(memory_rounds=2), history=history)
+    assert prompt.count("You replied:") == 2
+    assert "post from round delta" in prompt and "post from round epsilon" in prompt
+    assert all(
+        f"post from round {w}" not in prompt for w in ("alpha", "beta", "gamma")
+    )
 
 
 def test_memory_rounds_is_read_from_the_run():

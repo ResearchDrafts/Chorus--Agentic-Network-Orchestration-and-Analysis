@@ -6,6 +6,8 @@ superseding the HLD's original dataclass sketches.
 
 from __future__ import annotations
 
+from typing import Annotated
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # The four RQ1 conditions. romanized_hindi is Hindi written in Roman script,
@@ -119,6 +121,18 @@ class Interaction(BaseModel):
     # What the agent wrote in reply. Duplicated into reason_text, which stays
     # the column every existing analysis reads; this one says what it is.
     reply_text: str = ""
+    # The two calls' prompt lengths, kept separately as well as summed into
+    # prompt_token_count. Both are needed because RQ1 has to report prompt
+    # length per language -- Hinglish tokenizes less efficiently than English,
+    # measured at a 17% gap -- and the reply and the probe are different
+    # prompts whose lengths grow for different reasons: the reply carries the
+    # feed, the probe carries the question, and both carry the history. The
+    # sum cannot be split back apart after the fact.
+    #
+    # 0 on a call that never happened: the round-0 probe has no reply, and a
+    # failed call has no reported count.
+    reply_prompt_tokens: int = Field(default=0, ge=0)
+    probe_prompt_tokens: int = Field(default=0, ge=0)
     # The probe result. probe_mean is s-bar, the expected value on 1..7 under
     # the next-token distribution over the digits -- a continuous stance read
     # out of the model rather than a number it was asked to state. None on a
@@ -300,11 +314,38 @@ class ExperimentRun(BaseModel):
     # question (prose, a refusal, a different scale), and renormalizing the
     # remainder would manufacture a stance out of noise.
     probe_mass_floor: float = Field(default=0.5, gt=0.0, le=1.0)
-    # Fix A's window, for the bank regime: how many past rounds of reading and
-    # replies appear in a prompt. Counted in rounds, not tokens, for exactly
-    # the reason Fix A gives -- a token budget would hand the language whose
-    # text tokenizes less efficiently systematically less context.
-    memory_rounds: int = Field(default=3, ge=1)
+    # How many past rounds of reading and replies appear in a prompt, for the
+    # bank regime. None -- the default -- means the agent keeps its FULL
+    # history and nothing is ever dropped.
+    #
+    # Full history is the default because a window silently changes what the
+    # experiment measures: with a three-round window, round 10's stimulus is
+    # rounds 7-9, so an agent cannot be moved by an argument it read early and
+    # the measured effect is bounded by the window rather than by persuasion.
+    # An int >= 1 still means a window, so the option remains available for a
+    # run that deliberately wants one; 0 is rejected rather than read as
+    # "none", since a zero-round window and no window at all are opposite
+    # instructions.
+    #
+    # When a window IS used it is counted in rounds, not tokens, for exactly
+    # the reason Fix A gives: a token budget would hand the language whose
+    # text tokenizes less efficiently systematically less context. Full
+    # history keeps that guarantee trivially -- every arm keeps everything --
+    # and shifts the risk to prompt length, which max_prompt_tokens bounds
+    # loudly rather than by truncating.
+    memory_rounds: Annotated[int, Field(ge=1)] | None = None
+    # A hard ceiling on the prompt length the provider reports, in tokens.
+    # None means no ceiling.
+    #
+    # The point is that nothing is EVER truncated silently. With full history
+    # a prompt grows without bound, and the two ways that can end are a
+    # provider context-length error (fatal, see model_gateway) or a quiet
+    # server-side truncation that nothing in the output records. This bounds
+    # it in the one place a run can still be stopped and restarted smaller:
+    # exceeding it aborts the run, naming the agent, the round and the count.
+    # A run where one language arm's agents lose the front of their history is
+    # confounded exactly where RQ1 is measuring.
+    max_prompt_tokens: int | None = Field(default=None, ge=1)
 
     seed: int
     temperature: float = Field(ge=0.0, le=2.0)

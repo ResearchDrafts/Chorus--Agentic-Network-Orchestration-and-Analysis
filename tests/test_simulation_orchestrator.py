@@ -576,7 +576,9 @@ def _bank_run(**overrides) -> ExperimentRun:
         probe_question="Should the fare subsidy continue?",
         stance_low_label="the subsidy should end",
         stance_high_label="the subsidy should continue",
-        memory_rounds=3,
+        # memory_rounds is left at its default of None -- full history --
+        # so the tests exercise the production default. Tests that want a
+        # window pass memory_rounds=n explicitly.
         # Required only when delivery="off", harmless otherwise, and set
         # unconditionally so a test can flip delivery with one override.
         neutral_message="Fares come up a lot in conversations about the city.",
@@ -973,6 +975,162 @@ async def test_memory_accumulates_reads_and_replies_across_rounds(tmp_path, bank
     assert all("Earlier in this discussion" not in p for p in round_one)
     assert all("Earlier in this discussion" in p for p in round_three)
     assert all(p.count("You replied:") == 2 for p in round_three)
+
+
+async def test_full_history_reaches_round_k_oldest_first(tmp_path, bank_gateway):
+    """The default: every earlier round's posts and replies are in round K's
+    reply prompt AND in its probe prompt, in the order they happened."""
+    # Zero-padded and terminated, so no reply text is a substring of
+    # another: "reply 1" would also match "reply 17" and the ordering
+    # assertions below would pass on the wrong line.
+    bank_gateway.generate.side_effect = [
+        make_backend_response(text=f"reply number {i:04d} ends here") for i in range(1000)
+    ]
+    run = _bank_run(K=5)
+    assert run.memory_rounds is None
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    rows = {(r.turn, r.speaker_agent_id): r for r in _bank_rows(tmp_path)}
+    replies = [c.args[0] for c in bank_gateway.generate.await_args_list]
+    probes = [c.args[0] for c in bank_gateway.score_next_token.await_args_list]
+    agents = sorted({a for _, a in rows})
+
+    # Round 5's prompts, one per agent, in the order the orchestrator
+    # dispatched them (sorted agent id).
+    last_replies = replies[(run.K - 1) * run.M : run.K * run.M]
+    last_probes = probes[run.K * run.M :]
+
+    for agent_id, reply_prompt, probe_prompt in zip(
+        agents, last_replies, last_probes, strict=True
+    ):
+        earlier = [rows[(t, agent_id)].reply_text for t in range(1, run.K)]
+        assert len(earlier) == 4
+        for prompt in (reply_prompt, probe_prompt):
+            assert prompt.count("You replied:") == len(earlier) + (
+                1 if prompt is probe_prompt else 0
+            )
+            positions = [prompt.index(text) for text in earlier]
+            assert positions == sorted(positions), prompt
+        # The probe additionally carries this round's own reply, last.
+        assert probe_prompt.index(rows[(run.K, agent_id)].reply_text) > max(
+            probe_prompt.index(text) for text in earlier
+        )
+
+
+async def test_a_window_still_drops_everything_older(tmp_path, bank_gateway):
+    """memory_rounds=2 keeps the option available: only the last two rounds
+    reach the prompt."""
+    bank_gateway.generate.side_effect = [
+        make_backend_response(text=f"reply number {i:04d} ends here") for i in range(1000)
+    ]
+    run = _bank_run(K=5, memory_rounds=2)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    rows = {(r.turn, r.speaker_agent_id): r for r in _bank_rows(tmp_path)}
+    replies = [c.args[0] for c in bank_gateway.generate.await_args_list]
+    agents = sorted({a for _, a in rows})
+
+    for agent_id, prompt in zip(agents, replies[(run.K - 1) * run.M :], strict=True):
+        assert prompt.count("You replied:") == 2
+        assert rows[(4, agent_id)].reply_text in prompt
+        assert rows[(3, agent_id)].reply_text in prompt
+        for turn in (1, 2):
+            assert rows[(turn, agent_id)].reply_text not in prompt
+
+
+# --- the prompt-length ceiling -------------------------------------------
+
+
+async def test_a_prompt_over_the_ceiling_ends_the_run(tmp_path, bank_gateway):
+    """Never truncated silently. The agents that overflow first are the ones
+    whose language tokenizes least efficiently, so absorbing this per agent
+    would drop one arm's agents and keep another's."""
+    from sandbox.simulation_orchestrator import PromptBudgetExceeded
+
+    bank_gateway.generate.return_value = make_backend_response(prompt_tokens=900)
+    bank_gateway.score_next_token.return_value = make_logprob_response(
+        mean=5.0, prompt_tokens=100
+    )
+    with pytest.raises(PromptBudgetExceeded) as caught:
+        await build_orchestrator(
+            _bank_run(K=2, max_prompt_tokens=500), bank_gateway, runs_dir=tmp_path
+        ).run()
+
+    error = caught.value
+    assert error.call == "reply"
+    assert error.turn == 1
+    assert error.tokens == 900 and error.ceiling == 500
+    assert error.agent_id in str(error)
+    assert "round 1" in str(error)
+    assert "truncated" in str(error)
+
+
+async def test_the_ceiling_catches_a_long_probe_prompt_too(tmp_path, bank_gateway):
+    from sandbox.simulation_orchestrator import PromptBudgetExceeded
+
+    bank_gateway.score_next_token.return_value = make_logprob_response(
+        mean=5.0, prompt_tokens=700
+    )
+    with pytest.raises(PromptBudgetExceeded) as caught:
+        await build_orchestrator(
+            _bank_run(K=2, max_prompt_tokens=600), bank_gateway, runs_dir=tmp_path
+        ).run()
+
+    # Round 0 is the first probe of the run, so that is where it surfaces.
+    assert caught.value.call == "probe"
+    assert caught.value.turn == 0
+
+
+async def test_a_run_under_the_ceiling_completes(tmp_path, bank_gateway):
+    """The check is on the provider's reported count, and nothing else about
+    the run changes when a ceiling is set."""
+    run = _bank_run(K=2, max_prompt_tokens=10_000)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+    assert len(_bank_rows(tmp_path)) == run.M * (run.K + 1)
+
+
+async def test_no_ceiling_means_no_ceiling(tmp_path, bank_gateway):
+    bank_gateway.generate.return_value = make_backend_response(prompt_tokens=10**6)
+    run = _bank_run(K=1)
+    assert run.max_prompt_tokens is None
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+    assert len(_bank_rows(tmp_path)) == run.M * (run.K + 1)
+
+
+async def test_a_context_window_error_ends_the_run(tmp_path, bank_gateway):
+    """A per-agent failure here would quietly drop the agents with the
+    longest histories, which correlates with the language arm."""
+    from sandbox.model_gateway import ContextLengthExceeded
+
+    bank_gateway.generate.side_effect = ContextLengthExceeded("8192 token limit")
+    with pytest.raises(ContextLengthExceeded):
+        await build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path).run()
+
+
+# --- the two prompt lengths ----------------------------------------------
+
+
+async def test_the_two_prompt_lengths_are_logged_separately(tmp_path, bank_gateway):
+    """RQ1 reports prompt length per language, and a reply prompt and a probe
+    prompt grow for different reasons, so the sum cannot answer the question
+    on its own."""
+    bank_gateway.generate.return_value = make_backend_response(
+        prompt_tokens=100, completion_tokens=20
+    )
+    bank_gateway.score_next_token.return_value = make_logprob_response(
+        mean=5.0, prompt_tokens=70, completion_tokens=1
+    )
+    await build_orchestrator(_bank_run(K=1), bank_gateway, runs_dir=tmp_path).run()
+
+    for row in _bank_rows(tmp_path):
+        if row.turn == 0:
+            assert (row.reply_prompt_tokens, row.probe_prompt_tokens) == (0, 70)
+        else:
+            assert (row.reply_prompt_tokens, row.probe_prompt_tokens) == (100, 70)
+        # The summed column still means what every existing analysis reads.
+        assert row.prompt_token_count == (
+            row.reply_prompt_tokens + row.probe_prompt_tokens
+        )
 
 
 async def test_memory_is_capped_at_memory_rounds(tmp_path, bank_gateway):
@@ -1378,6 +1536,48 @@ async def test_a_resumed_run_remembers_the_rounds_it_already_ran(tmp_path, bank_
     round_three_prompts = [c.args[0] for c in bank_gateway.generate.await_args_list][-16:-8]
     assert all("Earlier in this discussion" in p for p in round_three_prompts)
     assert all(p.count("You replied:") == 2 for p in round_three_prompts)
+
+
+async def test_a_resumed_run_rebuilds_its_full_history(tmp_path, bank_gateway):
+    """Over five rounds, crashing after two, with memory_rounds=None.
+
+    Full history makes the resume path's rebuild load-bearing in a way a
+    three-round window hid: with a window, a resume that rebuilt only the
+    last few rounds was indistinguishable from one that rebuilt everything.
+    """
+    run = _bank_run(K=5)
+    assert run.memory_rounds is None
+    bank_gateway.generate.side_effect = [
+        make_backend_response(text=f"reply number {i:04d} ends here") for i in range(1000)
+    ]
+    clean = tmp_path / "clean"
+    await build_orchestrator(run, bank_gateway, runs_dir=clean).run()
+
+    crashed = tmp_path / "crashed"
+    _crash_in_round(bank_gateway, 3)
+    with pytest.raises(RuntimeError):
+        await build_orchestrator(run, bank_gateway, runs_dir=crashed).run()
+
+    resumed = build_orchestrator(run, bank_gateway, runs_dir=crashed)
+    bank_gateway.generate.side_effect = [
+        make_backend_response(text=f"resumed reply {i:04d} ends here") for i in range(1000)
+    ]
+    bank_gateway.generate.reset_mock()
+    await resumed.run()
+
+    # Both rounds 1 and 2 are remembered, and the memory carries them.
+    assert all(len(v) == 5 for v in resumed._history.values())
+    round_five = [c.args[0] for c in bank_gateway.generate.await_args_list][-run.M :]
+    assert all(p.count("You replied:") == 4 for p in round_five)
+
+    def signature(where):
+        return [
+            (r.turn, r.speaker_agent_id, tuple(r.neighbor_agent_ids), r.posted_item_id,
+             tuple(r.items_read), r.stance_before, r.stance_after)
+            for r in sorted(_bank_rows(where), key=lambda r: (r.turn, r.speaker_agent_id))
+        ]
+
+    assert signature(crashed) == signature(clean)
 
 
 async def test_rebuilt_memory_is_capped_at_the_window(tmp_path, bank_gateway):

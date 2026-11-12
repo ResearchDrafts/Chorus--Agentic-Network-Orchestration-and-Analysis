@@ -597,6 +597,42 @@ async def test_a_server_that_does_not_support_logprobs_is_fatal_not_retried(
     assert mock_completion.call_count == 1
 
 
+# --- a context-length overflow is fatal for the RUN ----------------------
+
+
+@pytest.mark.parametrize("call", ["generate", "score_next_token"])
+async def test_a_context_window_overflow_is_not_a_per_agent_failure(
+    call, rate_limiter, cost_tracker
+):
+    """ContextLengthExceeded, not FatalGatewayError.
+
+    The orchestrator absorbs FatalGatewayError per agent, which is right for
+    an auth failure: one round is lost and the run continues. It is wrong
+    here. A prompt overflows because that agent's history has grown, so the
+    same agent overflows every round from then on, and the agents that
+    overflow first are the ones whose language tokenizes least efficiently --
+    so absorbing it would drop the Hinglish arm's most talkative agents and
+    keep the English arm's.
+    """
+    from sandbox.model_gateway import ContextLengthExceeded
+
+    gateway = ModelGateway("gpt-4o", rate_limiter, cost_tracker)
+    mock_completion = AsyncMock(
+        side_effect=litellm.exceptions.ContextWindowExceededError(
+            message="This model's maximum context length is 8192 tokens",
+            llm_provider="openai",
+            model="gpt-4o",
+        )
+    )
+    with patch("litellm.acompletion", mock_completion):
+        with pytest.raises(ContextLengthExceeded):
+            await getattr(gateway, call)("p")
+
+    # Not retried: the prompt will not get shorter on a second attempt.
+    assert mock_completion.call_count == 1
+    assert not issubclass(ContextLengthExceeded, FatalGatewayError)
+
+
 # --- missing logprobs: raise, never return an empty list -----------------
 
 
