@@ -732,20 +732,34 @@ async def test_the_prompt_audit(tmp_path, rq1_config, bank_gateway):
         assert "On this scale," not in prompt
 
 
-async def test_the_lean_sentence_reaches_round_one_and_round_zero_only(
+async def test_the_lean_sentence_reaches_every_reply_and_every_probe(
     tmp_path, rq1_config, bank_gateway
 ):
-    """It is the one place an agent is told where it starts, and it is told in
-    words. Repeating it later would re-anchor the agent to a starting point it
-    may have moved away from."""
+    """It is the one place an agent is told where it started, and it is told
+    in words -- in every round, so that round 0 and round k are measured by
+    the same instrument. Shown at round 0 and round 1 only, the step between
+    the first two readings was partly the removal of a sentence."""
     run = load_run_config(rq1_config(K=3))
     await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
 
     replies = [c.args[0] for c in bank_gateway.generate.await_args_list]
     probes = [c.args[0] for c in bank_gateway.score_next_token.await_args_list]
+    assert len(replies) == run.M * run.K
+    assert len(probes) == run.M * (run.K + 1)
 
-    # "the view that" is shared by all seven lean sentences.
-    assert sum("the view that" in p for p in replies[: run.M]) == run.M      # round 1
-    assert not any("the view that" in p for p in replies[run.M :])           # rounds 2-3
-    assert sum("the view that" in p for p in probes[: run.M]) == run.M       # round 0
-    assert not any("the view that" in p for p in probes[run.M :])            # rounds 1-3
+    # The lean sits on the line directly after the topic line, in every
+    # prompt. Matched as a whole sentence: the midpoint one ("undecided
+    # between the view that X and the view that Y") contains the shared
+    # fragment twice, so a fragment count cannot tell one lean from two.
+    from sandbox.prompt_builder import LEAN_SENTENCES
+
+    expected = {
+        sentence.format(low=run.stance_low_label, high=run.stance_high_label)
+        for sentence in LEAN_SENTENCES.values()
+    }
+    for prompt in replies + probes:
+        lines = [line for line in prompt.split("\n") if line.strip()]
+        topic = next(
+            i for i, line in enumerate(lines) if line.startswith("You are taking part")
+        )
+        assert lines[topic + 1] in expected, prompt

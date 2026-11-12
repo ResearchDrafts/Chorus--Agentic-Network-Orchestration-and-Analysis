@@ -83,10 +83,23 @@ DEFAULT_MEMORY_ROUNDS = 3
 #
 # Rendered against the run's own anchor labels rather than a generic
 # agree/disagree, so the sentence says something about the topic instead of
-# about the scale. Appears in round 1's reply prompt and in the round-0 probe,
-# and nowhere else -- after round 1 the agent's own replies are its history,
-# and repeating the lean would keep re-anchoring it to a starting point it may
-# have moved away from.
+# about the scale.
+#
+# It appears in EVERY bank reply prompt and EVERY probe prompt, in every
+# round, directly after the topic line. It is a persona trait -- where this
+# agent came into the discussion from -- not a round-1 announcement, and that
+# distinction is the whole reason it is permanent. Showing it only in round 0
+# and round 1 made the round-0 probe and every later probe two different
+# stimuli, so the step between the round-0 reading and the round-1 reading
+# measured the disappearance of a sentence rather than the effect of anything
+# an agent read. Under `delivery: off` it was worse: every probe after round 0
+# was byte-identical, so the control could only ever produce a flat line, and
+# a flat control cannot be the baseline for a treatment.
+#
+# Re-anchoring is the cost, and it is the smaller one: the agent is re-shown
+# where it STARTED, in words, while its own replies accumulate alongside it in
+# memory. A constant stimulus that both arms share is comparable; a stimulus
+# that changes shape between round 0 and round 1 is not.
 LEAN_SENTENCES = {
     1: "You strongly hold the view that {low}.",
     2: "You hold the view that {low}.",
@@ -237,11 +250,16 @@ class PromptBuilder:
 
             1. persona
             2. topic
-            3. the lean sentence, round 1 only
+            3. the lean sentence, in every round
             4. memory: what it read and what it replied, oldest first
             5. the feed: each delivered post's bank text
             6. the language directive
             7. "Reply to these posts in 1 to 2 sentences."
+
+        The lean sits directly after the topic line in every round, not in
+        round 1 alone: it states a permanent trait of this agent, and a
+        sentence that vanishes after round 1 makes round 1 and round 2 two
+        different instruments (see the LEAN_SENTENCES comment).
 
         Sections 1-5 carry no digit and no agent id. That is checked by a test
         rather than only asserted here, because it is the property the whole
@@ -255,9 +273,8 @@ class PromptBuilder:
         sections = [
             f"You are: {agent.persona}",
             f"You are taking part in an ongoing discussion about: {self._run.topic}",
+            self._lean_section(agent),
         ]
-        if turn == 1:
-            sections.append(self._lean_section(agent))
         memory = self._bank_memory_section(history_rounds)
         if memory:
             sections.append(memory)
@@ -275,25 +292,23 @@ class PromptBuilder:
         self,
         agent: Agent,
         history_rounds: list[RoundMemory] | None = None,
-        *,
-        include_lean: bool = False,
     ) -> str:
         """The probe prompt. Text only -- no image, no BuiltPrompt wrapper.
 
-        A fresh context, not a continuation: persona, topic, the same memory
-        the reply prompt showed, the run's survey question, the two anchors in
-        words, and an instruction to answer with one digit. It is never
-        written into the agent's history and never shown to another agent, so
-        the act of measuring an agent cannot change what it or anyone else
-        sees next round.
+        A fresh context, not a continuation: persona, topic, the lean
+        sentence, the same memory the reply prompt showed, the run's survey
+        question, the two anchors in words, and an instruction to answer with
+        one digit. It is never written into the agent's history and never
+        shown to another agent, so the act of measuring an agent cannot
+        change what it or anyone else sees next round.
 
-        include_lean is True for the round-0 probe only, where there is no
-        history yet and the lean sentence is the entire stimulus. It is a
-        keyword rather than inferred from an empty history_rounds, because an
-        empty history is also what a `delivery: off` arm has on every round,
-        and inferring would re-anchor that whole arm to its starting lean at
-        every probe -- which is precisely the confound the probe exists to
-        avoid, reintroduced in the control.
+        The lean is unconditional, directly after the topic line, exactly as
+        in the reply prompt. A probe that showed it at round 0 and withheld it
+        afterwards would not be the same instrument twice: the difference
+        between the round-0 reading and the round-1 reading would partly
+        measure the removal of a sentence, and under `delivery: off` -- where
+        nothing else about the probe changes between rounds -- it would be the
+        only thing that changed at all.
 
         The digits in the anchor and instruction lines are the scale's own
         definition, not anybody's position: the model cannot answer "a single
@@ -303,9 +318,8 @@ class PromptBuilder:
         sections = [
             f"You are: {agent.persona}",
             f"You are taking part in an ongoing discussion about: {self._run.topic}",
+            self._lean_section(agent),
         ]
-        if include_lean:
-            sections.append(self._lean_section(agent))
         memory = self._bank_memory_section(history_rounds or [])
         if memory:
             sections.append(memory)
@@ -335,7 +349,7 @@ class PromptBuilder:
         return self._run.probe_question
 
     def _lean_section(self, agent: Agent) -> str:
-        """Where the agent starts, in words.
+        """Where the agent started, in words. Shown in every prompt it gets.
 
         Keyed by initial_stance as an integer. Raises for a stance with no
         entry rather than rounding to the nearest or defaulting to undecided:

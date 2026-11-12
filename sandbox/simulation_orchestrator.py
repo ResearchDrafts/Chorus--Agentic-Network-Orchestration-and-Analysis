@@ -575,17 +575,20 @@ class SimulationOrchestrator:
         available baseline would be initial_stance, which is a value the
         config chose rather than one the model reports -- and the whole point
         of the probe is that what an agent will answer is not what it was
-        told it believes. Round 0 is also the only probe that shows the lean
-        sentence, since there is no history for it to read instead.
+        told it believes.
+
+        The prompt is the same instrument every later probe uses, minus the
+        history it does not have yet: persona, topic, the lean sentence, the
+        question, the anchors. The lean is not special to round 0 -- it is in
+        every probe -- so the step from this reading to round 1's measures
+        what the agent read, not a change in the question.
         """
         all_agents = self._sorted_agents()
         probes = self._unwrap(
             await asyncio.gather(
                 *(
                     self._dispatch_probe(
-                        self._prompt_builder.build_probe_prompt(
-                            agent, [], include_lean=True
-                        )
+                        self._prompt_builder.build_probe_prompt(agent, [])
                     )
                     for agent in all_agents
                 ),

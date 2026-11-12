@@ -543,6 +543,31 @@ from tests.factories import make_logprob_response  # noqa: E402
 FIXTURE_BANK = "data/bank/test_bank.csv"
 
 
+def _rendered_leans(run) -> set[str]:
+    """The seven lean sentences, rendered against this run's anchor labels.
+
+    Matching the whole sentence rather than a shared fragment: the midpoint
+    sentence ("undecided between the view that X and the view that Y")
+    contains "the view that" twice, so counting that fragment cannot
+    distinguish one lean from two.
+    """
+    from sandbox.prompt_builder import LEAN_SENTENCES
+
+    return {
+        sentence.format(low=run.stance_low_label, high=run.stance_high_label)
+        for sentence in LEAN_SENTENCES.values()
+    }
+
+
+def _lean_line(prompt: str) -> str:
+    """The line directly after the topic line, where the lean always sits."""
+    lines = [line for line in prompt.split("\n") if line.strip()]
+    topic = next(
+        i for i, line in enumerate(lines) if line.startswith("You are taking part")
+    )
+    return lines[topic + 1]
+
+
 def _bank_run(**overrides) -> ExperimentRun:
     base = dict(
         M=8, N=3, K=3, run_id="bank_run", persona_pool_id="pool_20",
@@ -845,22 +870,20 @@ async def test_delivery_off_prompts_show_no_feed_and_no_memory(tmp_path, bank_ga
         assert "Earlier in this discussion" not in call.args[0]
 
 
-async def test_delivery_off_probes_carry_the_lean_only_at_round_zero(
-    tmp_path, bank_gateway
-):
-    """The reason include_lean is explicit rather than inferred from an empty
-    history: a delivery-off arm has an empty history on every round, and
-    inferring would re-anchor it to its starting lean at every probe."""
+async def test_delivery_off_probes_all_carry_the_lean(tmp_path, bank_gateway):
+    """Every probe is the same instrument, round 0 included.
+
+    This arm is where it matters most: nothing else about a delivery-off
+    probe changes between rounds, so a lean shown only at round 0 was the one
+    difference between the starting reading and every later one.
+    """
     run = _bank_run(delivery="off", K=2)
     await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
 
     prompts = [c.args[0] for c in bank_gateway.score_next_token.await_args_list]
-    # "the view that" is the phrase every one of the seven lean sentences
-    # shares; matching on "hold the view that" alone would miss the two that
-    # read "somewhat lean towards".
-    with_lean = [p for p in prompts if "the view that" in p]
-    assert len(with_lean) == run.M  # round 0 only, one per agent
     assert len(prompts) == run.M * (run.K + 1)
+    for prompt in prompts:
+        assert _lean_line(prompt) in _rendered_leans(run), prompt
 
 
 # --- memory ---------------------------------------------------------------

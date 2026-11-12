@@ -503,7 +503,7 @@ def test_the_sections_appear_in_the_specified_order():
     order = [
         "You are: ",
         "ongoing discussion about",
-        "You hold the view that",          # the lean, round 1 only
+        "You hold the view that",          # the lean, in every round
         "Earlier in this discussion:",
         "Posts in your feed:",
         LANGUAGE_DIRECTIVES["english"],
@@ -540,15 +540,42 @@ def test_an_empty_feed_omits_the_section_entirely():
 # --- the lean sentence ---------------------------------------------------
 
 
-def test_the_lean_sentence_appears_only_in_round_one():
-    """After round 1 the agent's own replies are its history; repeating the
-    lean would keep re-anchoring it to a starting point it may have moved
-    away from."""
+@pytest.mark.parametrize("turn", [1, 2, 3, 10])
+def test_the_lean_sentence_appears_exactly_once_in_every_reply_prompt(turn):
+    """It is a permanent trait, not a round-1 announcement.
+
+    Showing it in round 1 only made round 1 and round 2 two different
+    instruments, so a step between them was partly the disappearance of a
+    sentence rather than the effect of anything the agent read.
+    """
     builder = _bank_builder()
-    assert "You hold the view that" in _reply(builder, turn=1)
-    for turn in (2, 3, 10):
-        assert "hold the view that" not in _reply(builder, turn=turn)
-        assert "undecided" not in _reply(builder, turn=turn)
+    prompt = _reply(builder, turn=turn)
+    expected = LEAN_SENTENCES[6].format(
+        low="the subsidy should end", high="the subsidy should continue"
+    )
+    assert prompt.count(expected) == 1
+
+
+@pytest.mark.parametrize("turn", [1, 2, 3, 10])
+def test_the_lean_sentence_follows_the_topic_line_in_every_round(turn):
+    builder = _bank_builder()
+    lines = [line for line in _reply(builder, turn=turn).split("\n") if line.strip()]
+    topic_index = next(
+        i for i, line in enumerate(lines) if line.startswith("You are taking part")
+    )
+    assert lines[topic_index + 1].startswith("You hold the view that")
+
+
+@pytest.mark.parametrize("delivered", [FEED, []])
+@pytest.mark.parametrize("turn", [1, 2, 5])
+def test_the_lean_appears_in_both_delivery_modes(turn, delivered):
+    """`delivery: off` is the case that mattered most: with nothing in the
+    feed and nothing read, the lean was the only thing distinguishing a
+    round-0 probe from every later one, so dropping it made every probe after
+    round 0 byte-identical and the control a flat line by construction."""
+    builder = _bank_builder()
+    prompt = _reply(builder, turn=turn, posts=delivered)
+    assert prompt.count("the view that") == 1
 
 
 @pytest.mark.parametrize("stance", [1, 2, 3, 4, 5, 6, 7])
@@ -722,7 +749,7 @@ def test_the_probe_carries_no_position_number_before_the_question():
 
 def test_the_round_zero_probe_is_persona_topic_and_lean_only():
     builder = _bank_builder()
-    probe = builder.build_probe_prompt(_bank_agent(initial_stance=2.0), [], include_lean=True)
+    probe = builder.build_probe_prompt(_bank_agent(initial_stance=2.0), [])
 
     assert f"You are: {PERSONA}" in probe
     assert "You hold the view that the subsidy should end." in probe
@@ -730,21 +757,44 @@ def test_the_round_zero_probe_is_persona_topic_and_lean_only():
     assert "Posts in your feed" not in probe
 
 
-def test_the_lean_is_absent_from_every_probe_after_round_zero():
-    """Including a delivery: off arm, whose history is empty on every round.
+@pytest.mark.parametrize("history", [[], HISTORY])
+def test_the_lean_appears_exactly_once_in_every_probe_prompt(history):
+    """Round 0 and round k are the same instrument.
 
-    This is why include_lean is a keyword rather than inferred from an empty
-    history: inferring would re-anchor that whole arm to its starting lean at
-    every probe, reintroducing in the control exactly the confound the probe
-    exists to avoid.
+    The empty-history case is both the round-0 probe and every round of a
+    `delivery: off` arm. A probe that showed the lean at round 0 and withheld
+    it afterwards changed the question between the two readings whose
+    difference the experiment reports.
     """
-    builder = _bank_builder()
-    with_history = builder.build_probe_prompt(_bank_agent(), HISTORY)
-    delivery_off = builder.build_probe_prompt(_bank_agent(), [])
+    probe = _bank_builder().build_probe_prompt(_bank_agent(), history)
+    expected = LEAN_SENTENCES[6].format(
+        low="the subsidy should end", high="the subsidy should continue"
+    )
+    assert probe.count(expected) == 1
 
-    for probe in (with_history, delivery_off):
-        assert "hold the view that" not in probe
-        assert "undecided" not in probe
+
+def test_the_probe_lean_follows_the_topic_line():
+    lines = [
+        line
+        for line in _bank_builder().build_probe_prompt(_bank_agent(), HISTORY).split("\n")
+        if line.strip()
+    ]
+    topic_index = next(
+        i for i, line in enumerate(lines) if line.startswith("You are taking part")
+    )
+    assert lines[topic_index + 1].startswith("You hold the view that")
+
+
+def test_the_reply_and_probe_prompts_show_the_same_lean():
+    """The two calls of one round must describe the agent identically, or the
+    measurement is of a different agent than the one that replied."""
+    builder = _bank_builder()
+    agent = _bank_agent(initial_stance=3.0)
+    expected = LEAN_SENTENCES[3].format(
+        low="the subsidy should end", high="the subsidy should continue"
+    )
+    assert expected in _reply(builder, turn=4, agent=agent)
+    assert expected in builder.build_probe_prompt(agent, HISTORY)
 
 
 def test_the_probe_question_is_required_and_never_defaulted():
