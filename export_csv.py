@@ -11,8 +11,10 @@ Produces three files:
                     probe_mean, x (the stance rescaled to [-1, 1] about the
                     midpoint), probe_mass, side_conf, items_read,
                     n_items_read, posted_item_id, shadow_items,
-                    is_round_zero, reply_seed and the two per-call prompt
-                    lengths; these are present but
+                    is_round_zero, reply_seed, the two per-call prompt
+                    lengths and the three exposure counts
+                    (n_repeat_reads, max_prior_exposures,
+                    n_distinct_items_read_so_far); these are present but
                     empty for generated-regime rows, so a campaign mixing
                     both regimes still exports as one table.
   agents.csv        one row per agent per run: final stance, total movement,
@@ -56,6 +58,14 @@ from pathlib import Path
 import pandas as pd
 
 # Joined onto every interaction row so the CSV is groupable without a second file.
+# Set by _derive_exposure_columns, and listed here so the three are
+# declared in one place: a bank-free campaign still exports all three, empty.
+EXPOSURE_COLUMNS = (
+    "n_repeat_reads",
+    "max_prior_exposures",
+    "n_distinct_items_read_so_far",
+)
+
 RUN_FIELDS = (
     "run_id", "topic", "language_condition", "trial_number", "seed", "alpha",
     "M", "N", "K", "rq_target", "model_backend_id", "stance_low_label",
@@ -206,6 +216,83 @@ def _derive_bank_columns(df: pd.DataFrame) -> pd.DataFrame:
     # which an int column cannot hold. Empty at round 0 and on a generated
     # row, neither of which sends a seed.
     df["reply_seed"] = _column(df, "reply_seed", float)
+    return _derive_exposure_columns(df, items)
+
+
+def _derive_exposure_columns(df: pd.DataFrame, items: pd.Series) -> pd.DataFrame:
+    """How often an agent had already seen what it is reading now.
+
+    With full history an agent sees some bank items more than once, and how
+    often is not something an analysis can recover from the exported strings
+    without replaying the whole log per agent. Three columns, per row:
+
+      n_repeat_reads               of this row's items, how many this agent
+                                   had read in an EARLIER round
+      max_prior_exposures          over this row's items, the largest number
+                                   of earlier reads of that item
+      n_distinct_items_read_so_far distinct items this agent has read up to
+                                   and including this round
+
+    Both of the first two are counted against the state before this round, so
+    an item delivered twice within one round is not a repeat of itself. It
+    does count twice toward later rounds' totals: the agent read it twice,
+    and the column says how many times an argument has been in front of it.
+
+    Four rules about which rows participate:
+
+    * Only bank-regime rows. A generated row has no items_read to count, and
+      a 0 there would claim a measurement that was never made, so it is null.
+    * Only rows valid for analysis. A failed round was logged and never
+      applied -- the agent's memory does not hold it -- so counting it would
+      put the exposure history out of step with the prompt the agent actually
+      saw. Failed rows themselves are null for the same reason the stance
+      columns are: nothing about them was measured.
+    * Only the surviving write of a re-logged round, since a resumed run logs
+      that round twice and the second copy is the one the run used. Superseded
+      rows are null; they are dropped from the export by default anyway. This
+      is why derive() has to run after mark_duplicates(), and why a frame
+      without is_duplicate raises here rather than being assumed clean.
+    * Round 0 reads nothing, so it is 0, 0, 0 rather than null. It genuinely
+      read nothing, which is a different fact from not being measured.
+
+    Under `delivery: off` these count neutral messages, since those are what
+    the agent read; shadow_items carries the bank items they stood in for.
+    """
+    is_bank = _column(df, "regime", object) == "bank"
+    if not is_bank.any():
+        for name in EXPOSURE_COLUMNS:
+            df[name] = _column(df, name, float)
+        return df
+
+    if "is_duplicate" not in df:
+        # Raised rather than assumed. Treating a frame with no such column as
+        # duplicate-free would silently double-count a resumed run's re-logged
+        # round, which is the one case these columns most need to get right.
+        raise ValueError(
+            "exposure counts need is_duplicate: call mark_duplicates() before "
+            "derive(), as main() does"
+        )
+    eligible = is_bank & df.is_valid_for_analysis & ~df.is_duplicate.astype(bool)
+
+    counts = {name: pd.Series(float("nan"), index=df.index) for name in EXPOSURE_COLUMNS}
+    ordered = df[eligible].sort_values(["run_id", "speaker_agent_id", "turn"])
+    for _, group in ordered.groupby(["run_id", "speaker_agent_id"], sort=False):
+        seen: dict[str, int] = {}
+        for index in group.index:
+            row_items = items.loc[index]
+            row_items = row_items if isinstance(row_items, list) else []
+            counts["n_repeat_reads"][index] = sum(
+                1 for item in row_items if seen.get(item, 0) > 0
+            )
+            counts["max_prior_exposures"][index] = max(
+                (seen.get(item, 0) for item in row_items), default=0
+            )
+            for item in row_items:
+                seen[item] = seen.get(item, 0) + 1
+            counts["n_distinct_items_read_so_far"][index] = len(seen)
+
+    for name, series in counts.items():
+        df[name] = series
     return df
 
 

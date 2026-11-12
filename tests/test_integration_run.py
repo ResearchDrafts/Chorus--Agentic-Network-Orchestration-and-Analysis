@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from sandbox.bank_manager import BankManager
 from sandbox.checkpoint_manager import CheckpointManager
 from sandbox.config_loader import load_run_config
 from sandbox.models import (
@@ -1112,3 +1113,207 @@ async def test_the_lean_sentence_reaches_every_reply_and_every_probe(
             i for i, line in enumerate(lines) if line.startswith("You are taking part")
         )
         assert lines[topic + 1] in expected, prompt
+
+
+# --- exposure counts ------------------------------------------------------
+
+
+def _exposure_row(turn, items, *, agent="agent_0000", status="success", run_id="r1",
+                  row_index=None):
+    """One interactions.jsonl row, as a dict, for a hand-built log."""
+    return {
+        "run_id": run_id,
+        "turn": turn,
+        "speaker_agent_id": agent,
+        "neighbor_agent_ids": ["agent_0001"],
+        "stance_before": 4.0,
+        "stance_after": 4.0,
+        "reason_text": "",
+        "content_type": "bank_item",
+        "api_call_status": status,
+        "items_read": list(items),
+        "regime": "bank",
+        "row_index": row_index if row_index is not None else turn,
+        "is_duplicate": False,
+    }
+
+
+def _exposure_frame(rows):
+    pd = pytest.importorskip("pandas")
+    import export_csv
+
+    frame = pd.DataFrame(rows)
+    frame["is_valid_for_analysis"] = frame.api_call_status != "failed_logged_null"
+    return export_csv._derive_exposure_columns(frame, frame["items_read"])
+
+
+def test_exposure_counts_over_four_rounds_with_known_repeats():
+    """One agent, hand-built, so the expected numbers are read off the log
+    rather than recomputed by the same code that produced them.
+
+      round 0  reads nothing
+      round 1  a, b        both new
+      round 2  b, c        b is a repeat, seen once before
+      round 3  b, d        b again, seen twice before
+    """
+    frame = _exposure_frame([
+        _exposure_row(0, []),
+        _exposure_row(1, ["a", "b"]),
+        _exposure_row(2, ["b", "c"]),
+        _exposure_row(3, ["b", "d"]),
+    ]).set_index("turn")
+
+    assert list(frame["n_repeat_reads"]) == [0, 0, 1, 1]
+    assert list(frame["max_prior_exposures"]) == [0, 0, 1, 2]
+    assert list(frame["n_distinct_items_read_so_far"]) == [0, 2, 3, 4]
+
+
+def test_a_failed_row_in_the_middle_does_not_count_as_an_exposure():
+    """A failed round was logged and never applied, so the agent's memory
+    does not hold it. Counting it would put the exposure history out of step
+    with the prompt the agent actually saw."""
+    frame = _exposure_frame([
+        _exposure_row(1, ["a"]),
+        _exposure_row(2, ["a"], status="failed_logged_null"),
+        _exposure_row(3, ["a"]),
+    ]).set_index("turn")
+
+    # Round 3 sees "a" as read once, not twice: round 2 did not happen.
+    assert frame.loc[3, "n_repeat_reads"] == 1
+    assert frame.loc[3, "max_prior_exposures"] == 1
+    assert frame.loc[3, "n_distinct_items_read_so_far"] == 1
+    # And the failed row itself is null, like every other measured column.
+    for column in export_csv_exposure_columns():
+        assert pd_isna(frame.loc[2, column]), column
+
+
+def test_an_item_read_twice_in_one_round_is_not_a_repeat_of_itself():
+    """Both counts are taken against the state before the round. Two
+    neighbours posting the same argument is one round's stimulus, not a
+    second exposure within it -- but it does count twice toward later
+    rounds, because the agent read it twice."""
+    frame = _exposure_frame([
+        _exposure_row(1, ["a", "a"]),
+        _exposure_row(2, ["a"]),
+    ]).set_index("turn")
+
+    assert frame.loc[1, "n_repeat_reads"] == 0
+    assert frame.loc[1, "max_prior_exposures"] == 0
+    assert frame.loc[1, "n_distinct_items_read_so_far"] == 1
+    assert frame.loc[2, "max_prior_exposures"] == 2
+
+
+def test_exposure_counts_are_per_agent_and_per_run():
+    """Two agents reading the same item have separate histories, and so do
+    two runs: an exposure is something that happened to one agent."""
+    frame = _exposure_frame([
+        _exposure_row(1, ["a"], agent="agent_0000"),
+        _exposure_row(1, ["a"], agent="agent_0001"),
+        _exposure_row(2, ["a"], agent="agent_0000"),
+        _exposure_row(1, ["a"], agent="agent_0000", run_id="r2"),
+    ])
+
+    by_key = {
+        (r.run_id, r.speaker_agent_id, r.turn): r for r in frame.itertuples()
+    }
+    assert by_key[("r1", "agent_0000", 2)].n_repeat_reads == 1
+    assert by_key[("r1", "agent_0001", 1)].n_repeat_reads == 0
+    assert by_key[("r2", "agent_0000", 1)].n_repeat_reads == 0
+
+
+def test_a_superseded_duplicate_row_is_not_counted():
+    """A resumed run logs the re-run round twice and the later write is the
+    one the run used. Counting both would show an exposure the agent never
+    had."""
+    rows = [
+        _exposure_row(1, ["a"], row_index=0),
+        _exposure_row(2, ["a"], row_index=1),   # superseded below
+        _exposure_row(2, ["a"], row_index=2),   # the resumed write
+    ]
+    rows[1]["is_duplicate"] = True
+    frame = _exposure_frame(rows)
+
+    surviving = frame[~frame.is_duplicate].set_index("turn")
+    assert surviving.loc[2, "n_repeat_reads"] == 1
+    assert surviving.loc[2, "max_prior_exposures"] == 1
+    assert pd_isna(frame[frame.is_duplicate].iloc[0]["n_repeat_reads"])
+
+
+def test_a_generated_run_gets_null_exposure_counts():
+    """It has no items_read to count, and a 0 would claim a measurement that
+    was never made."""
+    pd = pytest.importorskip("pandas")
+    import export_csv
+
+    frame = pd.DataFrame([
+        {**_exposure_row(1, []), "regime": "generated"},
+        {**_exposure_row(2, []), "regime": "generated"},
+    ])
+    frame["is_valid_for_analysis"] = True
+    out = export_csv._derive_exposure_columns(frame, frame["items_read"])
+
+    for column in export_csv_exposure_columns():
+        assert out[column].isna().all(), column
+
+
+def export_csv_exposure_columns():
+    import export_csv
+
+    return export_csv.EXPOSURE_COLUMNS
+
+
+def pd_isna(value) -> bool:
+    import pandas as pd
+
+    return bool(pd.isna(value))
+
+
+async def test_a_real_bank_run_exports_its_exposure_counts(
+    tmp_path, rq1_config, bank_gateway
+):
+    """Through derive(), not the helper directly: the columns have to arrive
+    in the exported frame, not merely be computable."""
+    pytest.importorskip("pandas")
+
+    import export_csv
+
+    run = load_run_config(rq1_config(K=4))
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    frame = export_csv.derive(
+        export_csv.mark_duplicates(export_csv.load_run(tmp_path / run.run_id))
+    )
+
+    round_zero = frame[frame.turn == 0]
+    later = frame[frame.turn > 0]
+    for column in export_csv.EXPOSURE_COLUMNS:
+        assert column in frame
+        assert (round_zero[column] == 0).all(), column
+        assert later[column].notna().all(), column
+
+    # Monotone per agent: a distinct-item count cannot go down, and cannot
+    # exceed the number of items the bank has.
+    bank_size = len(BankManager(run.bank_path).all_item_ids())
+    for _, rows in frame.sort_values("turn").groupby("speaker_agent_id"):
+        seen = list(rows["n_distinct_items_read_so_far"])
+        assert seen == sorted(seen)
+        assert max(seen) <= bank_size
+
+    # Not vacuous: with a 4-item bank over 4 rounds of N=3 reads, somebody
+    # read something twice.
+    assert (later["n_repeat_reads"] > 0).any()
+    assert (later["max_prior_exposures"] > 0).any()
+
+
+def test_exposure_counts_require_mark_duplicates_to_have_run():
+    """Assuming a frame with no is_duplicate column is duplicate-free would
+    silently double-count a resumed run's re-logged round, which is the one
+    case these columns most need to get right."""
+    pd = pytest.importorskip("pandas")
+
+    import export_csv
+
+    frame = pd.DataFrame([_exposure_row(1, ["a"])]).drop(columns=["is_duplicate"])
+    frame["is_valid_for_analysis"] = True
+    with pytest.raises(ValueError, match="is_duplicate"):
+        export_csv._derive_exposure_columns(frame, frame["items_read"])
