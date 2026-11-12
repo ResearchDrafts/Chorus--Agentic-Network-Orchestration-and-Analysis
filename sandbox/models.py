@@ -189,6 +189,34 @@ class Interaction(BaseModel):
         return self.api_call_status != "failed_logged_null"
 
 
+class PromptRecord(BaseModel):
+    """One line of prompts.jsonl: exactly what one call sent and received.
+
+    The dataset says what an agent read as item IDs and what it replied as
+    text; this says what the model was actually handed, character for
+    character. Three things are impossible to reconstruct afterwards without
+    it: whether a number ever leaked into a prompt (the audit that the whole
+    bank regime turns on, currently provable only inside the test suite),
+    how long the prompt in each language arm really was, and why a particular
+    probe answered off-scale.
+
+    top_logprobs is populated for probes only -- [[token, logprob], ...] as
+    the provider returned it, before any scoring -- so a logged probe_mean
+    can be recomputed from the raw distribution it came from. None on a
+    reply, which asks for no logprobs at all.
+    """
+
+    run_id: str
+    turn: int = Field(ge=0)
+    agent_id: str
+    call: str = Field(pattern="^(reply|probe)$")
+    prompt_text: str
+    # Empty when the call failed: the prompt is still a fact about what was
+    # sent, and a failed call is exactly the one worth being able to read.
+    response_text: str = ""
+    top_logprobs: list[tuple[str, float]] | None = None
+
+
 class MemeInjectionConfig(BaseModel):
     # extra="forbid" for the same reason as ExperimentRun below: this block is
     # hand-written YAML, and a typo'd key here silently disables the exact
@@ -347,6 +375,17 @@ class ExperimentRun(BaseModel):
     # confounded exactly where RQ1 is measuring.
     max_prompt_tokens: int | None = Field(default=None, ge=1)
 
+    # Whether to write prompts.jsonl: one line per LLM call, with the exact
+    # prompt text, the response and (for probes) the raw top logprobs.
+    #
+    # None means "decide by regime", and resolves to True for the bank
+    # regime. The bank regime is where it earns its place: its central claim
+    # is that no number ever reaches an agent, and without the prompts that
+    # claim is checkable only inside the test suite, never against the run
+    # that produced a dataset. It also carries the per-language prompt
+    # lengths and the raw probe distributions behind every probe_mean.
+    log_prompts: bool | None = None
+
     seed: int
     temperature: float = Field(ge=0.0, le=2.0)
     max_cost_usd: float | None = Field(default=None, gt=0.0)
@@ -426,6 +465,19 @@ class ExperimentRun(BaseModel):
             raise ValueError(
                 f"regime='bank' requires {' and '.join(missing)} to be set"
             )
+        return self
+
+    @model_validator(mode="after")
+    def resolve_log_prompts(self) -> "ExperimentRun":
+        """Fills in the regime-dependent default, so readers see a bool.
+
+        Resolved here rather than at the point of use so run_config.json
+        records what the run actually did: a null in that file would leave a
+        reader working out the default from the regime, which is how a
+        recorded config stops being a record.
+        """
+        if self.log_prompts is None:
+            self.log_prompts = self.regime == "bank"
         return self
 
     @model_validator(mode="after")

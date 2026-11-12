@@ -1167,6 +1167,224 @@ async def test_the_probe_is_never_written_into_memory(tmp_path, bank_gateway):
         assert "Should the fare subsidy continue?" not in call.args[0]
 
 
+# --- prompts.jsonl: every call, verbatim ---------------------------------
+
+
+def _prompt_rows(tmp_path, run_id="bank_run"):
+    from sandbox.models import PromptRecord
+
+    path = tmp_path / run_id / "prompts.jsonl"
+    return [
+        PromptRecord.model_validate_json(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+async def test_every_call_writes_one_prompt_line(tmp_path, bank_gateway):
+    """M x K reply lines and M x (K+1) probe lines, with the prompt text the
+    model was actually handed.
+
+    The bank regime's central claim is that no number reaches an agent, and
+    without this file that claim is checkable only inside the test suite,
+    never against the run that produced a dataset.
+    """
+    run = _bank_run(M=4, N=1, K=2, graph_degree=2)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    rows = _prompt_rows(tmp_path)
+    replies = [r for r in rows if r.call == "reply"]
+    probes = [r for r in rows if r.call == "probe"]
+    assert len(replies) == run.M * run.K == 8
+    assert len(probes) == run.M * (run.K + 1) == 12
+
+    # Keyed on (turn, agent_id, call), one line each in an uninterrupted run.
+    keys = [(r.turn, r.agent_id, r.call) for r in rows]
+    assert len(set(keys)) == len(keys)
+    assert {r.run_id for r in rows} == {run.run_id}
+    assert all(r.prompt_text for r in rows)
+    assert all("A user posted:" in r.prompt_text for r in replies)
+    assert all(run.probe_question in r.prompt_text for r in probes)
+    # Round 0 is probed and never replies.
+    assert {r.turn for r in probes} == {0, 1, 2}
+    assert {r.turn for r in replies} == {1, 2}
+
+
+async def test_each_logged_probe_reproduces_its_logged_probe_mean(tmp_path, bank_gateway):
+    """The raw distribution, before any scoring: a logged probe_mean can be
+    recomputed from the logprobs the line carries."""
+    from sandbox.probe_scorer import score as score_probe
+
+    bank_gateway.score_next_token.side_effect = [
+        make_logprob_response(probabilities={4: 0.3, 5: 0.7}),
+        make_logprob_response(mean=2.0),
+        make_logprob_response(probabilities={6: 0.5, 7: 0.5}),
+        make_logprob_response(mean=7.0),
+    ] + [make_logprob_response(mean=5.0)] * 100
+
+    run = _bank_run(M=4, N=1, K=2, graph_degree=2)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    logged = {
+        (r.turn, r.speaker_agent_id): r.probe_mean for r in _bank_rows(tmp_path)
+    }
+    probes = [r for r in _prompt_rows(tmp_path) if r.call == "probe"]
+    assert len(probes) == 12
+
+    for line in probes:
+        assert line.top_logprobs, line
+        recomputed = score_probe(line.top_logprobs, run.probe_mass_floor)
+        assert recomputed.mean == pytest.approx(logged[(line.turn, line.agent_id)])
+    # And the four scripted reads really did differ, or the check above would
+    # pass against a constant.
+    assert len({round(m, 6) for m in logged.values()}) > 1
+
+
+async def test_a_reply_line_carries_no_logprobs(tmp_path, bank_gateway):
+    """None means "this was not a probe", never "the probe came back empty"."""
+    await build_orchestrator(
+        _bank_run(M=4, N=1, K=1, graph_degree=2), bank_gateway, runs_dir=tmp_path
+    ).run()
+
+    for line in _prompt_rows(tmp_path):
+        assert (line.top_logprobs is None) == (line.call == "reply")
+
+
+async def test_the_response_is_logged_next_to_the_prompt(tmp_path, bank_gateway):
+    bank_gateway.generate.return_value = make_backend_response(text="MARKER-REPLY")
+    await build_orchestrator(
+        _bank_run(M=4, N=1, K=1, graph_degree=2), bank_gateway, runs_dir=tmp_path
+    ).run()
+
+    replies = [r for r in _prompt_rows(tmp_path) if r.call == "reply"]
+    assert all(r.response_text == "MARKER-REPLY" for r in replies)
+
+
+async def test_a_failed_call_still_logs_its_prompt(tmp_path, bank_gateway):
+    """A failed call happened and was paid for, and it is the one most worth
+    being able to read. The response is empty rather than absent."""
+    bank_gateway.generate.side_effect = FatalGatewayError("bad key")
+    run = _bank_run(M=4, N=1, K=1, graph_degree=2)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    replies = [r for r in _prompt_rows(tmp_path) if r.call == "reply"]
+    assert len(replies) == run.M
+    assert all(r.prompt_text and r.response_text == "" for r in replies)
+
+
+async def test_an_off_scale_probe_logs_the_distribution_it_answered_with(
+    tmp_path, bank_gateway
+):
+    """ProbeMassTooLow is diagnosable only from the logprobs behind it, and
+    the interaction row leaves every probe column null by design (Fix I)."""
+    bank_gateway.score_next_token.side_effect = [
+        make_logprob_response(mean=5.0)
+    ] * 4 + [make_logprob_response(mean=5.0, off_scale=0.9)] * 4
+
+    await build_orchestrator(
+        _bank_run(M=4, N=1, K=1, graph_degree=2), bank_gateway, runs_dir=tmp_path
+    ).run()
+
+    round_one = [r for r in _prompt_rows(tmp_path) if r.call == "probe" and r.turn == 1]
+    assert len(round_one) == 4
+    for line in round_one:
+        assert line.top_logprobs
+        assert any(token.strip() == "I" for token, _ in line.top_logprobs)
+    assert all(r.probe_mean is None for r in _bank_rows(tmp_path) if r.turn == 1)
+
+
+async def test_log_prompts_off_writes_no_file(tmp_path, bank_gateway):
+    run = _bank_run(M=4, N=1, K=1, graph_degree=2, log_prompts=False)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    assert not (tmp_path / "bank_run" / "prompts.jsonl").exists()
+    assert len(_bank_rows(tmp_path)) == run.M * (run.K + 1)
+
+
+async def test_the_generated_regime_logs_no_prompts_by_default(tmp_path, mock_gateway):
+    """log_prompts defaults by regime, and the generated regime's default is
+    off: nothing about it turns on an audit of its prompts, and switching it
+    on for existing configs would change what a rerun writes to disk."""
+    run = _run(K=1)
+    assert run.log_prompts is False
+    await build_orchestrator(run, mock_gateway, runs_dir=tmp_path).run()
+    assert not (tmp_path / run.run_id / "prompts.jsonl").exists()
+
+
+async def test_the_generated_regime_can_opt_in(tmp_path, mock_gateway):
+    """The field means the same thing in both regimes; only its default
+    differs."""
+    run = _run(M=3, N=1, K=2, log_prompts=True)
+    await build_orchestrator(run, mock_gateway, runs_dir=tmp_path).run()
+
+    rows = _prompt_rows(tmp_path, run.run_id)
+    assert len(rows) == run.M * run.K
+    assert {r.call for r in rows} == {"reply"}
+    assert all("STANCE:" in r.prompt_text for r in rows)   # the old contract
+    assert all(r.top_logprobs is None for r in rows)
+
+
+async def test_a_generated_regime_format_retry_logs_both_attempts(tmp_path, mock_gateway):
+    """A retry is a second call, and a prompt log that showed one line would
+    hide the attempt whose reply could not be parsed."""
+    run = _run(M=2, N=1, K=1, log_prompts=True)
+    mock_gateway.generate.side_effect = [
+        make_backend_response(text="no stance here"),   # agent 0, attempt 1
+        make_backend_response(stance=5.0),              # agent 1
+        make_backend_response(stance=6.0),              # agent 0, attempt 2
+    ]
+    await build_orchestrator(run, mock_gateway, runs_dir=tmp_path).run()
+
+    rows = _prompt_rows(tmp_path, run.run_id)
+    assert len(rows) == 3
+    assert sum(r.response_text == "no stance here" for r in rows) == 1
+    # Last write wins on (turn, agent, call): the attempt that was used.
+    latest = {}
+    for row in rows:
+        latest[(row.turn, row.agent_id, row.call)] = row
+    assert len(latest) == 2
+    assert all("no stance here" != r.response_text for r in latest.values())
+
+
+async def test_a_resumed_run_may_duplicate_prompt_lines(tmp_path, bank_gateway):
+    """Documented, not prevented: the resumed pass re-runs the round its
+    checkpoint does not cover, so that round's prompts are appended again.
+    Keyed on (turn, agent_id, call) with the last write winning, the later
+    copy is the call whose result the run actually used."""
+    run = dict(M=4, N=1, K=3, graph_degree=2)
+    # Round 3's replies are logged, then its probes die: the one interruption
+    # that leaves prompt lines for a round the checkpoint does not cover.
+    # (A round that dies in Phase A leaves none, since nothing was called.)
+    bank_gateway.generate.return_value = make_backend_response(text="a steady reply")
+    bank_gateway.score_next_token.side_effect = [
+        make_logprob_response(mean=5.0)
+    ] * 12 + [RuntimeError("boom")] * 50
+    with pytest.raises(RuntimeError):
+        await build_orchestrator(_bank_run(**run), bank_gateway, runs_dir=tmp_path).run()
+    assert CheckpointManager(tmp_path).load("bank_run").last_completed_turn == 2
+
+    bank_gateway.score_next_token.side_effect = None
+    bank_gateway.score_next_token.return_value = make_logprob_response(mean=5.0)
+    bank_gateway.generate.return_value = make_backend_response(text="a resumed reply")
+    await build_orchestrator(_bank_run(**run), bank_gateway, runs_dir=tmp_path).run()
+
+    rows = _prompt_rows(tmp_path)
+    keys = [(r.turn, r.agent_id, r.call) for r in rows]
+    assert len(keys) > len(set(keys))  # duplicates exist
+
+    latest = {}
+    for row in rows:  # file order: last write wins
+        latest[(row.turn, row.agent_id, row.call)] = row
+    replies = [r for r in latest.values() if r.call == "reply"]
+    probes = [r for r in latest.values() if r.call == "probe"]
+    assert len(replies) == 4 * 3
+    assert len(probes) == 4 * 4
+    # The surviving copy of the re-run round is the resumed call.
+    assert all(
+        r.response_text == "a resumed reply" for r in replies if r.turn == 3
+    )
+
+
 # --- Fix F ---------------------------------------------------------------
 
 

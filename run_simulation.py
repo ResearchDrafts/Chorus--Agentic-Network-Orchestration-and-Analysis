@@ -53,12 +53,37 @@ def describe(run: ExperimentRun, runs_dir: Path) -> None:
               f"mass_floor={run.probe_mass_floor}")
         print(f"  anchors       1 = {run.stance_low_label}")
         print(f"                7 = {run.stance_high_label}")
-        print(f"  memory        {run.memory_rounds} rounds of reading and replies")
+        print(f"  memory        {_describe_memory(run)}")
         if run.delivery == "off":
             print(f"  neutral       {run.neutral_message!r}")
+        print(
+            "  prompts       "
+            + (
+                "every call logged verbatim to prompts.jsonl"
+                if run.log_prompts
+                else "NOT logged (log_prompts is off)"
+            )
+        )
         for problem in _probe_language_warnings(run):
             print()
             print(f"  WARNING: {problem}")
+
+
+def _describe_memory(run: ExperimentRun) -> str:
+    """What an agent carries from round to round.
+
+    None is the default and prints as what it means rather than as "None
+    rounds": a window bounds the effect the experiment can measure, so which
+    of the two a run is using is worth reading at a glance.
+    """
+    if run.memory_rounds is None:
+        ceiling = (
+            f", capped at {run.max_prompt_tokens} prompt tokens"
+            if run.max_prompt_tokens
+            else ", with no prompt-length ceiling set"
+        )
+        return "full history of reading and replies" + ceiling
+    return f"the last {run.memory_rounds} rounds of reading and replies"
 
 
 def _describe_neighbours(run: ExperimentRun) -> str:
@@ -224,6 +249,8 @@ async def launch(run: ExperimentRun, runs_dir: Path) -> None:
     rows = (run_dir / "interactions.jsonl").read_text().splitlines()
     print(f"\ndone. {len(rows)} interactions -> {run_dir}/")
     print("  interactions.jsonl   the dataset every analysis reads")
+    if run.log_prompts:
+        print("  prompts.jsonl        every call's prompt, response and logprobs")
     print("  agents_final.jsonl   per-agent state, including stance_history")
     print("  run_config.json      the exact config used, with git_commit_hash")
     print("  checkpoints/         resume point")

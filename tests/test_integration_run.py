@@ -419,6 +419,21 @@ async def test_a_full_bank_run_writes_every_output_file(tmp_path, rq1_config, ba
 
     assert CheckpointManager(tmp_path).load(run.run_id).last_completed_turn == run.K
 
+    # prompts.jsonl: every call, verbatim. On by default for this regime,
+    # because the no-number claim is otherwise checkable only in the test
+    # suite and never against the run that produced a dataset.
+    from sandbox.models import PromptRecord
+
+    assert run.log_prompts is True
+    prompts = [
+        PromptRecord.model_validate_json(line)
+        for line in (run_dir / "prompts.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert len([p for p in prompts if p.call == "reply"]) == run.M * run.K == 24
+    assert len([p for p in prompts if p.call == "probe"]) == run.M * (run.K + 1) == 32
+    assert all(p.run_id == run.run_id for p in prompts)
+
     # The file the generated regime never writes.
     edges = (run_dir / "graph_edges.csv").read_text().splitlines()
     assert edges[0] == "agent_a,agent_b"

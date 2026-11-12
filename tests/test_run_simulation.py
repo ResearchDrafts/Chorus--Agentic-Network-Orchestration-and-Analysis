@@ -75,6 +75,32 @@ def test_describe_prints_the_neutral_message_for_a_control_run(capsys, tmp_path)
     assert "Fares come up a lot." in capsys.readouterr().out
 
 
+# --- the memory line -----------------------------------------------------
+
+
+def test_the_memory_line_says_full_history_rather_than_none():
+    """The default prints as what it means. "None rounds of reading" reads
+    like a misconfiguration, and which of the two a run uses changes what the
+    experiment can measure."""
+    run = make_run(**BANK_KWARGS)
+    assert run.memory_rounds is None
+    line = run_simulation._describe_memory(run)
+    assert "full history" in line
+    assert "None" not in line
+    assert "no prompt-length ceiling" in line
+
+
+def test_the_memory_line_reports_the_ceiling_when_one_is_set():
+    run = make_run(**BANK_KWARGS, max_prompt_tokens=4096)
+    assert "4096" in run_simulation._describe_memory(run)
+
+
+def test_the_memory_line_reports_a_window_when_one_is_configured():
+    line = run_simulation._describe_memory(make_run(**BANK_KWARGS, memory_rounds=2))
+    assert "last 2 rounds" in line
+    assert "full history" not in line
+
+
 # --- the probe language warning -------------------------------------------
 
 

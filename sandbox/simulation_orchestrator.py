@@ -54,7 +54,7 @@ from sandbox.interaction_engine import AlphaSampling, GraphSampling, Recommendat
 from sandbox.logging_writer import LoggingWriter
 from sandbox.meme_pool_manager import MemePoolManager
 from sandbox.model_gateway import BackendResponse, FatalGatewayError, ModelGateway
-from sandbox.models import Agent, ExperimentRun, Interaction, MemeContent
+from sandbox.models import Agent, ExperimentRun, Interaction, MemeContent, PromptRecord
 from sandbox.probe_scorer import MIDPOINT, ProbeMassTooLow, ProbeScore
 from sandbox.probe_scorer import score as score_probe
 from sandbox.prompt_builder import BuiltPrompt, PromptBuilder, RoundMemory
@@ -348,6 +348,14 @@ class SimulationOrchestrator:
                 response = await self._gateway.generate(
                     built.text, image=built.image, temperature=self._run.temperature
                 )
+                # Logged before parsing, so a prompt whose reply could not be
+                # read is on disk next to the reply that could not be read.
+                # A retry logs a second line for the same (turn, agent,
+                # "reply"): keyed last-write-wins, the surviving copy is the
+                # attempt whose result the turn used.
+                await self._log_prompt(
+                    turn, agent.agent_id, "reply", built.text, response.text or ""
+                )
                 stance_after, reason = parse_stance(response.text)
                 stance_after = clamp_and_validate_scale(
                     stance_after, self._run.stance_scale
@@ -359,6 +367,7 @@ class SimulationOrchestrator:
                 emphasize_format = True
                 continue
             except FatalGatewayError:
+                await self._log_prompt(turn, agent.agent_id, "reply", built.text, "")
                 return self._failed_interaction(agent, neighbors, turn, stance_before)
 
             return Interaction(
@@ -721,7 +730,14 @@ class SimulationOrchestrator:
                 built.text, image=None, temperature=self._run.temperature
             )
         except FatalGatewayError:
+            await self._log_prompt(turn, agent.agent_id, "reply", built.text, "")
             return None
+        # Logged before the budget check, so the prompt that broke the
+        # ceiling is on disk to be read rather than only described in the
+        # exception.
+        await self._log_prompt(
+            turn, agent.agent_id, "reply", built.text, _reply_text(response)
+        )
         self._check_prompt_budget(agent.agent_id, turn, "reply", response.prompt_tokens)
         return response
 
@@ -740,13 +756,65 @@ class SimulationOrchestrator:
         """
         try:
             response = await self._gateway.score_next_token(prompt_text)
+        except FatalGatewayError:
+            await self._log_prompt(turn, agent.agent_id, "probe", prompt_text, "")
+            return None
+        # The raw distribution is logged whether or not it scores, which is
+        # the point: a probe that answered off-scale is diagnosable only from
+        # the logprobs it answered with.
+        await self._log_prompt(
+            turn,
+            agent.agent_id,
+            "probe",
+            prompt_text,
+            response.text or "",
+            response.top_logprobs,
+        )
+        self._check_prompt_budget(agent.agent_id, turn, "probe", response.prompt_tokens)
+        try:
             reading = score_probe(
                 response.top_logprobs or [], self._run.probe_mass_floor
             )
-        except (FatalGatewayError, ProbeMassTooLow):
+        except ProbeMassTooLow:
             return None
-        self._check_prompt_budget(agent.agent_id, turn, "probe", response.prompt_tokens)
         return response, reading
+
+    async def _log_prompt(
+        self,
+        turn: int,
+        agent_id: str,
+        call: str,
+        prompt_text: str,
+        response_text: str,
+        top_logprobs: list[tuple[str, float]] | None = None,
+    ) -> None:
+        """One line of prompts.jsonl, when run.log_prompts is on.
+
+        Written from inside the dispatch helpers rather than from the apply
+        loop, so the record is of the call itself: a call whose round is
+        later discarded (Fix I) still happened and was still paid for, and a
+        prompt audit has to see it.
+
+        Both regimes write here, but log_prompts defaults to on only for the
+        bank regime -- that is where the no-number claim needs checking
+        against the run that produced a dataset, and switching it on for
+        existing generated configs would change what a rerun writes to disk.
+        A generated run that asks for it gets it, one line per attempt (a
+        format retry is a second call, and a second line).
+        """
+        if not self._run.log_prompts:
+            return
+        await self._logger.write_prompt(
+            PromptRecord(
+                run_id=self._run.run_id,
+                turn=turn,
+                agent_id=agent_id,
+                call=call,
+                prompt_text=prompt_text,
+                response_text=response_text,
+                top_logprobs=list(top_logprobs) if top_logprobs else None,
+            )
+        )
 
     def _check_prompt_budget(
         self, agent_id: str, turn: int, call: str, prompt_tokens: int
