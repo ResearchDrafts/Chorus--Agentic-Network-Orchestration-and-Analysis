@@ -137,6 +137,23 @@ class BankManager:
             raise KeyError(f"unknown bank item: {item_id!r}")
         return self._items[item_id]["strength"]
 
+    def arg_id_of(self, item_id: str) -> str:
+        """The argument this item is a rendering of.
+
+        Distinct from item_id, and the distinction is what E1's model is
+        specified against: item_id names one row, arg_id names the argument
+        that row renders. The mixed model fits a random intercept per item so
+        that "this particular argument is more persuasive than average" is
+        absorbed rather than attributed to a language, and arg_id is the
+        column that says which arguments are the same argument.
+
+        Raises for an unknown item, like the two above: a fabricated arg_id
+        would silently merge two arguments into one group.
+        """
+        if item_id not in self._items:
+            raise KeyError(f"unknown bank item: {item_id!r}")
+        return self._items[item_id]["arg_id"]
+
     # --- picking ----------------------------------------------------------
 
     def pick(self, sender_id: str, turn: int, side: str, rng: random.Random) -> str:
