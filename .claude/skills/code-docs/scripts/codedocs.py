@@ -28,9 +28,9 @@ LANGS = {".py": "python", ".js": "js", ".jsx": "js", ".mjs": "js", ".cjs": "js",
          ".ts": "js", ".tsx": "js", ".java": "java", ".kt": "java", ".cs": "java",
          ".go": "go", ".c": "c", ".h": "c", ".cc": "c", ".cpp": "c", ".hpp": "c",
          ".cxx": "c", ".rs": "rust"}
-SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "env", "__pycache__", "dist",
-             "build", ".mypy_cache", ".pytest_cache", "target", "vendor", ".next",
-             ".idea", ".vscode", "coverage", ".tox", "site-packages"}
+SKIP_DIRS = {".git", ".claude", "node_modules", "venv", ".venv", "env", "__pycache__",
+             "dist", "build", ".mypy_cache", ".pytest_cache", "target", "vendor",
+             ".next", ".idea", ".vscode", "coverage", ".tox", "site-packages"}
 KEYWORDS = {"if", "for", "while", "switch", "catch", "return", "function", "else",
             "do", "try", "new", "typeof", "sizeof", "with", "elif", "await", "yield"}
 
