@@ -36,8 +36,15 @@ change what the next round shows it.
 The STANCE line goes with it. A bank-regime reply is asked only to be a
 reply; nothing parses it for a number, so there is no output contract to
 emphasise and no retry-on-parse-failure path. Constraint 1 survives
-unchanged and matters more than ever: the four language arms differ in the
-rendering of the bank text and in one directive line, and in nothing else.
+unchanged and matters more than ever: across the four language arms exactly
+three things vary -- the rendering of the bank text, the probe question, and
+the one directive line -- and nothing else does.
+
+The frame is therefore English in every arm, the anchor labels included.
+They are rendered inside English sentences (the probe's scale line, the lean
+sentence), so translating them would code-mix the frame and change the
+instrument at the same time. An instrument that differs between arms cannot
+attribute a difference between arms to the manipulation.
 
 Both regimes share `build_discussion_prompt`, which branches on run.regime.
 The generated path below is untouched.

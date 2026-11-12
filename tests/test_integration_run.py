@@ -743,6 +743,130 @@ async def test_the_control_and_the_treatment_share_their_draws(
     ).read_text()
 
 
+# --- the instrument is identical across arms -----------------------------
+
+ARM_QUESTIONS = {
+    "english": "Should city bus fares stay subsidised?",
+    "hinglish": "Kya city bus fares subsidised rehne chahiye?",
+    "romanized_hindi": "Kya shahar ki bus kiraya subsidy jaari rehni chahiye?",
+    "hindi": "क्या शहर की बस किराया सब्सिडी जारी रहनी चाहिए?",
+}
+
+
+async def test_the_four_arms_differ_only_in_bank_text_question_and_directive(
+    tmp_path, rq1_config, bank_gateway
+):
+    """The validity claim RQ1 rests on, checked against whole runs.
+
+    Exactly three things may vary across the arms: the bank text, the probe
+    question, and the one directive line. Everything else the model reads --
+    persona, topic, the lean sentence, the anchor labels, every heading, the
+    reply instruction, the scale line -- must be byte-identical, or a
+    difference between arms is a difference between four instruments as much
+    as between four languages.
+
+    The probe is driven to a constant reading, which holds the sides and
+    therefore the bank items identical across arms; in a real run they
+    diverge as soon as the readings do, and that divergence is the result.
+    """
+    from sandbox.bank_manager import BankManager
+    from sandbox.prompt_builder import LANGUAGE_DIRECTIVES
+
+    bank = BankManager("data/bank/test_bank.csv")
+    all_bank_texts = [
+        bank.text(item_id, language)
+        for side in ("pro", "con")
+        for item_id in bank.items_for_side(side)
+        for language in LANGUAGE_DIRECTIVES
+    ]
+
+    def is_variable(line: str) -> bool:
+        """True for a line carrying one of the three things that may vary."""
+        if line.strip() in {d.strip() for d in LANGUAGE_DIRECTIVES.values()}:
+            return True
+        if any(question in line for question in ARM_QUESTIONS.values()):
+            return True
+        return any(text in line for text in all_bank_texts)
+
+    def skeleton(prompt: str) -> list[str]:
+        return [line for line in prompt.split("\n") if not is_variable(line)]
+
+    replies, probes = {}, {}
+    for condition, question in ARM_QUESTIONS.items():
+        bank_gateway.generate.reset_mock()
+        bank_gateway.score_next_token.reset_mock()
+        run = load_run_config(
+            rq1_config(
+                f"{condition}.yaml",
+                K=2,
+                language_condition=condition,
+                probe_question=question,
+            )
+        )
+        # The anchor labels are English in every arm, straight from the
+        # shipped config: the decision is in the configs, not in this test.
+        assert run.stance_low_label == "fares should not be subsidised"
+        assert run.stance_high_label == "fares should stay subsidised"
+
+        await build_orchestrator(run, bank_gateway, runs_dir=tmp_path / condition).run()
+        replies[condition] = [c.args[0] for c in bank_gateway.generate.await_args_list]
+        probes[condition] = [
+            c.args[0] for c in bank_gateway.score_next_token.await_args_list
+        ]
+
+    baseline = "english"
+    for condition in ARM_QUESTIONS:
+        assert len(replies[condition]) == len(replies[baseline])
+        assert len(probes[condition]) == len(probes[baseline])
+        for prompts in (replies, probes):
+            for mine, theirs in zip(prompts[condition], prompts[baseline], strict=True):
+                assert skeleton(mine) == skeleton(theirs), (
+                    f"{condition} differs from {baseline} outside the bank text, "
+                    f"the question and the directive:\n{mine}\n---\n{theirs}"
+                )
+
+    # The filter must not be swallowing the whole prompt, or the comparison
+    # above would hold for any two strings.
+    assert skeleton(replies["hindi"][0]), replies["hindi"][0]
+    assert len(skeleton(replies["hindi"][0])) < len(replies["hindi"][0].split("\n"))
+
+    # And the arms genuinely do differ where they are allowed to.
+    assert replies["hindi"][0] != replies["english"][0]
+    assert ARM_QUESTIONS["hindi"] in probes["hindi"][0]
+    assert ARM_QUESTIONS["hindi"] not in probes["english"][0]
+
+
+async def test_the_lean_and_the_scale_line_are_english_in_every_arm(
+    tmp_path, rq1_config, bank_gateway
+):
+    """The two anchor labels sit inside English sentences, so they stay
+    English: a translated clause in an English frame would code-mix the
+    instrument and change it between arms at once."""
+    lean_lines, scale_lines = set(), set()
+    for condition, question in ARM_QUESTIONS.items():
+        bank_gateway.score_next_token.reset_mock()
+        run = load_run_config(
+            rq1_config(
+                f"{condition}.yaml",
+                K=1,
+                language_condition=condition,
+                probe_question=question,
+            )
+        )
+        await build_orchestrator(run, bank_gateway, runs_dir=tmp_path / condition).run()
+
+        probe = [c.args[0] for c in bank_gateway.score_next_token.await_args_list][0]
+        lines = [line for line in probe.split("\n") if line.strip()]
+        lean_lines.add(next(line for line in lines if "the view that" in line))
+        scale_lines.add(next(line for line in lines if line.startswith("On this scale")))
+
+    assert len(lean_lines) == 1, lean_lines
+    assert len(scale_lines) == 1, scale_lines
+    assert not any(
+        "\u0900" <= ch <= "\u097f" for ch in "".join(lean_lines | scale_lines)
+    )
+
+
 # --- 12.5: the prompt audit ----------------------------------------------
 
 

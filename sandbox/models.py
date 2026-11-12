@@ -272,6 +272,14 @@ class ExperimentRun(BaseModel):
     # make a stance number mean the same thing to every agent. Optional with
     # generic defaults, so existing configs stay valid; set them to something
     # topic-appropriate for a real run (phase4.md Q4.4).
+    #
+    # In the bank regime these stay ENGLISH in every language arm, because
+    # they are rendered inside English sentences -- the probe's scale line
+    # and the lean sentence. Exactly three things vary by condition: the bank
+    # text, probe_question, and the one directive line. Everything else about
+    # the instrument is byte-identical across arms, which is what makes a
+    # difference between arms attributable to the manipulation rather than to
+    # four subtly different questionnaires.
     stance_low_label: str = Field(default="strongly opposed", min_length=1)
     stance_high_label: str = Field(default="strongly in favour", min_length=1)
     persona_pool_id: str = Field(min_length=1)

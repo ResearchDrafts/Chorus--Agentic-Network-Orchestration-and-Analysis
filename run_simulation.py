@@ -132,13 +132,24 @@ def _describe_calls(run: ExperimentRun) -> list[str]:
 
 
 def _probe_language_warnings(run: ExperimentRun) -> list[str]:
-    """Warns when the probe text is visibly in the wrong script.
+    """Warns when the probe question is visibly in the wrong script.
 
-    The probe question and the two anchor labels have to be written in the
-    run's own language -- there is no default, deliberately, because an
-    English fallback would probe every arm in English and leave no trace of it
-    in the output. But a config copied from another arm can still carry the
-    wrong arm's question, and the run would look perfectly valid.
+    The probe question has to be written in the run's own language -- there is
+    no default, deliberately, because an English fallback would probe every
+    arm in English and leave no trace of it in the output. But a config copied
+    from another arm can still carry the wrong arm's question, and the run
+    would look perfectly valid.
+
+    **The two anchor labels are deliberately NOT checked.** They are English
+    in every arm, because they sit inside English sentences: the probe's scale
+    line ("1 means ..., and 7 means ...") and the lean sentence ("You hold the
+    view that ..."). Only three things vary by language condition -- the bank
+    text, the probe question, and the one directive line -- and everything
+    else about the instrument is held byte-identical across arms, which is
+    what makes a difference between arms attributable to the manipulation.
+    Translating a clause inside an English sentence would change the
+    instrument and code-mix the frame at the same time. Warning about them
+    would be warning about the design.
 
     Only the Devanagari arm is checkable. english, hinglish and
     romanized_hindi are all Roman script, so nothing short of language
@@ -150,18 +161,13 @@ def _probe_language_warnings(run: ExperimentRun) -> list[str]:
     """
     if run.language_condition != "hindi":
         return []
-    fields = {
-        "probe_question": run.probe_question,
-        "stance_low_label": run.stance_low_label,
-        "stance_high_label": run.stance_high_label,
-    }
-    wrong = [name for name, text in fields.items() if not _has_devanagari(text)]
-    if not wrong:
+    if _has_devanagari(run.probe_question):
         return []
     return [
-        f"language_condition is hindi but {', '.join(wrong)} contains no "
+        "language_condition is hindi but probe_question contains no "
         "Devanagari. Every arm must be probed in its own language, or the "
-        "comparison between arms is lost."
+        "comparison between arms is lost. (The anchor labels are English in "
+        "every arm by design: they sit inside English sentences.)"
     ]
 
 

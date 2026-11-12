@@ -320,24 +320,69 @@ def test_the_shipped_rq1_configs_load(name):
     assert run.git_commit_hash
 
 
-def test_the_rq1_configs_are_a_matched_set():
-    """Same seed, same graph parameters, same bank: that is what makes the
-    arms comparable. Only the language and the language-dependent text may
-    differ."""
+ARM_CONFIGS = (
+    "smoke",
+    "smoke_hinglish",
+    "smoke_romanized_hindi",
+    "smoke_hindi",
+)
+
+
+def test_all_four_arm_configs_load():
+    """Every condition RQ1 manipulates ships as a worked example, including
+    the two Roman-script ones, which are the contrast the experiment exists
+    to measure and the easiest pair to conflate."""
     from pathlib import Path
 
-    english = load_run_config(Path("configs/rq1/smoke.yaml"))
-    hinglish = load_run_config(Path("configs/rq1/smoke_hinglish.yaml"))
+    runs = {
+        name: load_run_config(Path(f"configs/rq1/{name}.yaml")) for name in ARM_CONFIGS
+    }
+    assert {r.language_condition for r in runs.values()} == {
+        "english", "hinglish", "romanized_hindi", "hindi"
+    }
+    assert len({r.run_id for r in runs.values()}) == 4
 
-    assert english.seed == hinglish.seed
-    assert english.bank_path == hinglish.bank_path
-    assert (english.M, english.N, english.K) == (hinglish.M, hinglish.N, hinglish.K)
-    assert english.graph_degree == hinglish.graph_degree
-    assert english.graph_rewire_p == hinglish.graph_rewire_p
-    assert english.topic == hinglish.topic
 
-    assert english.language_condition != hinglish.language_condition
-    assert english.probe_question != hinglish.probe_question
+def test_the_rq1_configs_differ_in_exactly_three_fields():
+    """The arms may differ in language_condition, probe_question and run_id,
+    and in nothing else.
+
+    run_id is bookkeeping (two arms must not write into one directory).
+    language_condition selects the bank column and the directive line, and
+    probe_question is the one piece of prompt text that is translated. The
+    anchor labels are NOT: they are rendered inside English sentences -- the
+    probe's scale line and the lean -- so translating them would code-mix the
+    frame and leave the four arms holding four subtly different instruments.
+    """
+    from pathlib import Path
+
+    runs = {
+        name: load_run_config(Path(f"configs/rq1/{name}.yaml")).model_dump()
+        for name in ARM_CONFIGS
+    }
+    baseline = runs["smoke"]
+    for name, cfg in runs.items():
+        differing = {k for k in baseline if baseline[k] != cfg[k]}
+        assert differing <= {"run_id", "language_condition", "probe_question"}, name
+
+    # And they really do differ in those: a config copied without editing the
+    # question would probe that arm in another arm's language.
+    assert len({cfg["probe_question"] for cfg in runs.values()}) == 4
+
+
+def test_every_arm_carries_the_same_english_anchor_labels():
+    from pathlib import Path
+
+    labels = {
+        (
+            load_run_config(Path(f"configs/rq1/{name}.yaml")).stance_low_label,
+            load_run_config(Path(f"configs/rq1/{name}.yaml")).stance_high_label,
+        )
+        for name in ARM_CONFIGS
+    }
+    assert len(labels) == 1
+    low, high = labels.pop()
+    assert not any("\u0900" <= ch <= "\u097f" for ch in low + high)
 
 
 def test_the_delivery_off_config_differs_only_in_delivery():
@@ -361,6 +406,6 @@ def test_delivery_is_quoted_in_every_shipped_config():
     import yaml
     from pathlib import Path
 
-    for name in ("smoke", "smoke_hinglish", "smoke_off"):
+    for name in (*ARM_CONFIGS, "smoke_off"):
         raw = yaml.safe_load(Path(f"configs/rq1/{name}.yaml").read_text())
         assert isinstance(raw["delivery"], str), f"{name}: delivery parsed as {raw['delivery']!r}"

@@ -104,6 +104,27 @@ def test_the_memory_line_reports_a_window_when_one_is_configured():
 # --- the probe language warning -------------------------------------------
 
 
+def test_only_the_probe_question_is_checked_for_devanagari():
+    """The anchor labels are English in every arm, because they sit inside
+    English sentences -- the probe's scale line and the lean. Warning about
+    them would be warning about the design."""
+    run = make_run(
+        **{**BANK_KWARGS, "probe_question": "क्या किराया सब्सिडी जारी रहनी चाहिए?"},
+        language_condition="hindi",
+        stance_low_label="the subsidy should end",
+        stance_high_label="the subsidy should continue",
+    )
+    assert run_simulation._probe_language_warnings(run) == []
+
+
+def test_an_english_probe_question_in_the_hindi_arm_still_warns():
+    run = make_run(**BANK_KWARGS, language_condition="hindi")
+    warnings = run_simulation._probe_language_warnings(run)
+    assert len(warnings) == 1
+    assert "probe_question" in warnings[0]
+    assert "stance_low_label" not in warnings[0]
+
+
 @pytest.mark.parametrize("condition", ["english", "hinglish", "romanized_hindi"])
 def test_the_roman_script_arms_are_never_warned_about(condition):
     """Nothing short of language identification could tell a Hinglish

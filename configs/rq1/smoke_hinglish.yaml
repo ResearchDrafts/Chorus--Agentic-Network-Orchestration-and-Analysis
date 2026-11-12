@@ -1,11 +1,18 @@
 # RQ1 bank-regime smoke test: the Hinglish arm of configs/rq1/smoke.yaml.
 #
-# Identical to smoke.yaml except for language_condition, the probe question
-# and the two anchor labels -- all three of which MUST be written in this
-# arm's language. The seed is deliberately unchanged: that is what makes this
-# a matched set. Same seed means the same graph, the same neighbour draws and
-# the same bank item for the same sender on the same side, so the two runs
-# differ in the rendering of the text and in nothing else.
+# Identical to smoke.yaml except for language_condition and the probe
+# question, which are (with the bank text that follows from the former) the
+# only three things that may vary across the four arms.
+#
+# The two anchor labels stay ENGLISH: they are rendered inside English
+# sentences (the probe's "1 means ..., and 7 means ..." line, and the lean
+# sentence "You hold the view that ..."), so translating them would code-mix
+# the frame and change the instrument at the same time.
+#
+# The seed is deliberately unchanged: that is what makes this a matched set.
+# Same seed means the same graph, the same neighbour draws and the same bank
+# item for the same sender on the same side, so the arms differ in the
+# rendering of the text and in nothing else.
 #
 #   python run_simulation.py configs/rq1/smoke_hinglish.yaml
 
@@ -35,8 +42,8 @@ regime: bank
 rq_target: RQ1_RQ2
 run_id: rq1_smoke_hinglish
 seed: 42
-stance_high_label: fares subsidised rehne chahiye
-stance_low_label: fares subsidised nahi hone chahiye
+stance_high_label: fares should stay subsidised
+stance_low_label: fares should not be subsidised
 stance_scale:
 - 1
 - 2
