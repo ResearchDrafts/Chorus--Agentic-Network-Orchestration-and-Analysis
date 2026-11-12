@@ -42,7 +42,8 @@ bank_path: data/bank/test_bank.csv
 # Quoted, and it must be: YAML 1.1 reads bare on/off/yes/no as booleans, so
 # `delivery: off` arrives as False and the schema rejects it. The quotes are
 # what make this a string.
-delivery: "on"       # "off" is the E4 control: read nothing, still be probed
+delivery: "on"       # "off" is the E4 control: read one side-free message
+                     # (neutral_message) instead of the bank, and still be probed
 
 language_condition: english
 
