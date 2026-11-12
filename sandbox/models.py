@@ -108,15 +108,30 @@ class Interaction(BaseModel):
     # only by the bank regime, where a round is two LLM calls rather than one:
     # a reply the agent writes, and a private probe that reads its stance.
 
-    # The bank item IDs this agent was shown this round, in delivery order.
-    # Empty for the round-0 probe, which is the only row in the dataset where
-    # an agent genuinely read nothing. A `delivery: off` round carries the one
-    # reserved ID "__neutral__" (bank_manager.NEUTRAL_ITEM_ID), so a control
-    # row says "read the side-free message" rather than "read nothing", and a
-    # bank is rejected at load if it uses that ID itself.
+    # The IDs this agent was shown this round, in delivery order. Empty for
+    # the round-0 probe, which is the only row in the dataset where an agent
+    # genuinely read nothing.
+    #
+    # Under `delivery: on` these are argument-bank item IDs. Under
+    # `delivery: off` they are neutral-bank IDs, N of them, each starting
+    # with bank_manager.NEUTRAL_PREFIX -- which is how a reader tells which
+    # file to look an ID up in, and why a bank item may not use that prefix.
     items_read: list[str] = Field(default_factory=list)
-    # The bank item THIS agent posted this round, for its current side. None
-    # at round 0, when nobody has posted yet.
+    # On a `delivery: off` row, the bank items whose places the neutral
+    # messages took, in the same order as items_read. The control's feed is a
+    # shape-for-shape mirror of the treatment's, and this is the record of
+    # what it mirrored: it is what lets an analysis line a control row up
+    # against the treatment row it is the baseline for.
+    #
+    # Empty on a delivery-on row, where items_read already holds the bank
+    # items, and at round 0, which read nothing.
+    shadow_items: list[str] = Field(default_factory=list)
+    # The bank item this agent's side is represented by in its NEIGHBOURS'
+    # feeds this round -- the argument the feed shows on its behalf, matched
+    # to the side its last probe put it on. The agent is never shown this
+    # item and is never told it posted anything; "posted" names the item's
+    # role in the delivery, not an act the agent performed. None at round 0,
+    # before any side has been read.
     posted_item_id: str | None = None
     # What the agent wrote in reply. Duplicated into reason_text, which stays
     # the column every existing analysis reads; this one says what it is.
@@ -341,15 +356,24 @@ class ExperimentRun(BaseModel):
     # nothing to say has a history that never changes, so the arm could not
     # show drift even in principle.
     delivery: str = Field(default="on", pattern="^(on|off)$")
-    # The one post a delivery-off agent reads, every round, in the run's own
-    # language. On-topic and taking no side: it holds the activity constant
-    # against the treatment while holding the persuasive content at zero.
+    # The CSV of side-free messages a delivery-off agent reads: columns
+    # neutral_id and the four language columns, every ID prefixed
+    # "neutral_". The control reads N of them a round, one standing in for
+    # each bank item it would have been delivered, so it matches the
+    # treatment in how much it reads and in how often it reads the same thing
+    # twice, and differs in persuasive content alone.
+    #
+    # A file rather than a single string, which is what this was. One fixed
+    # message meant the control read one post a round against the treatment's
+    # N, with no repeats against the treatment's natural pattern of them, so
+    # the arms differed in the amount and shape of reading as well as in the
+    # factor being manipulated.
     #
     # Required when regime="bank" and delivery="off", never defaulted, for
     # the same reason probe_question is not: a generic English fallback would
     # silently make every arm's control read English, and the control is what
     # every treatment effect is measured against.
-    neutral_message: str | None = None
+    neutral_bank_path: str | None = None
 
     # The 7-point survey question, written in this run's language. Asked in a
     # fresh context that never enters the agent's history, so the agent is
@@ -502,21 +526,22 @@ class ExperimentRun(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def check_neutral_message_for_the_off_control(self) -> "ExperimentRun":
-        """The E4 control cannot run without the message it delivers.
+    def check_neutral_bank_for_the_off_control(self) -> "ExperimentRun":
+        """The E4 control cannot run without the messages it delivers.
 
-        Required rather than defaulted, and non-empty rather than merely
-        present: an empty string would deliver a blank post to every agent in
-        the control arm every round, which is indistinguishable in the output
-        from a message that failed to move anyone.
+        Required rather than defaulted, and non-blank rather than merely
+        present. The file's own contents are validated at config load, not
+        here: this model is constructed in tests and from a checkpoint as
+        well as from YAML, and reading a CSV off disk during schema
+        validation would make those paths depend on the filesystem.
         """
         if self.regime != "bank" or self.delivery != "off":
             return self
-        if self.neutral_message is None or not self.neutral_message.strip():
+        if self.neutral_bank_path is None or not self.neutral_bank_path.strip():
             raise ValueError(
-                "regime='bank' with delivery='off' requires a non-empty "
-                "neutral_message: the control reads one on-topic message that "
-                "takes no side, written in this run's language"
+                "regime='bank' with delivery='off' requires a neutral_bank_path: "
+                "the control reads N on-topic messages that take no side, "
+                "written in this run's language"
             )
         return self
 

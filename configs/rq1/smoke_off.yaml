@@ -1,6 +1,6 @@
 # RQ1 bank-regime smoke test: the E4 control arm (delivery: off).
 #
-# Agents read one on-topic message that takes no side, reply to it, and are
+# Agents read N on-topic messages that take no side, reply to them, and are
 # probed every round, exactly like a treatment arm. It measures how far
 # stance drifts from taking part at all -- reading something, writing
 # something, being asked -- which is the baseline every delivery-on arm is
@@ -9,8 +9,12 @@
 # Sides, posted items and neighbours are still resolved and still logged, so
 # every seeded stream consumes identically to the delivery-on arm and the two
 # differ in the persuasive content of what agents READ and in nothing else.
-# items_read is the reserved id "__neutral__" on every round, and the call
-# count matches the treatment arm: 8 x 3 = 24 replies, 8 x 4 = 32 probes.
+# The feed mirrors the treatment's shape: one neutral message stands in for
+# each bank item an agent would have been delivered, so the control matches
+# it in how much is read and in how often the same thing is read twice.
+# items_read holds N "neutral_" ids each round, shadow_items records which
+# bank items they stood in for, and the call count matches the treatment
+# arm: 8 x 3 = 24 replies, 8 x 4 = 32 probes.
 #
 # Note the quotes on delivery: YAML 1.1 reads bare `off` as the boolean False.
 #
@@ -33,12 +37,14 @@ memory_rounds: null
 max_prompt_tokens: null
 model_backend_id: hosted_vllm/Qwen/Qwen2.5-7B-Instruct
 neighbor_strategy: graph
-# The one post every agent reads, every round. On topic, and deliberately
-# takes neither side: it holds the activity constant against the treatment
-# arm while holding the persuasive content at zero. Written in this run's
-# language -- there is no default, for the same reason probe_question has
-# none.
-neutral_message: Bus fares come up a lot in conversations about the city.
+# The side-free messages every agent reads, N per round. On topic, and
+# deliberately taking neither side: they hold the activity constant against
+# the treatment arm while holding the persuasive content at zero. One CSV
+# with the same four language columns the argument bank has -- there is no
+# default, for the same reason probe_question has none -- and every id in it
+# must start with "neutral_", which is how a logged id is told apart from an
+# argument-bank item.
+neutral_bank_path: data/bank/test_neutral.csv
 persona_pool_id: pool_20
 probe_mass_floor: 0.5
 probe_question: Should city bus fares stay subsidised?

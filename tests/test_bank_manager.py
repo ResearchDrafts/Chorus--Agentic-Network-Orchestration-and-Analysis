@@ -102,33 +102,55 @@ def test_duplicate_item_ids_are_rejected(tmp_path):
         BankManager(path)
 
 
-def test_the_reserved_neutral_item_id_is_rejected(tmp_path):
-    """"__neutral__" names the delivery-off control's side-free message,
-    which is rendered from ExperimentRun.neutral_message. A bank item under
-    that ID would never be read -- the orchestrator resolves the ID from the
-    run, not from the CSV -- and a control row would be indistinguishable
-    from a treatment row that read that argument."""
-    from sandbox.bank_manager import NEUTRAL_ITEM_ID
+def test_an_item_id_under_the_reserved_prefix_is_rejected(tmp_path):
+    """The prefix names the neutral bank's messages. A bank item carrying it
+    would be looked up in the neutral file, so the argument in this row would
+    silently never be read, and a control row would be indistinguishable from
+    a treatment row that read that argument."""
+    from sandbox.bank_manager import NEUTRAL_PREFIX
 
     path = _write_bank(
-        tmp_path, [_row(NEUTRAL_ITEM_ID), _row("b2", side="con")]
+        tmp_path, [_row(f"{NEUTRAL_PREFIX}t01"), _row("b2", side="con")]
     )
-    with pytest.raises(BankValidationError, match="reserved"):
+    with pytest.raises(BankValidationError, match="reserved prefix"):
         BankManager(path)
 
 
-def test_the_reserved_id_is_reported_with_every_other_problem(tmp_path):
-    """Accumulated, like every other bank error: one run to fix, not three."""
-    from sandbox.bank_manager import NEUTRAL_ITEM_ID
+def test_the_prefix_is_rejected_on_any_id_not_only_an_exact_match(tmp_path):
+    """It is a prefix rule, not a reserved word: every neutral id starts with
+    it, so every bank id that starts with it is ambiguous."""
+    from sandbox.bank_manager import NEUTRAL_PREFIX
 
     path = _write_bank(
         tmp_path,
-        [_row(NEUTRAL_ITEM_ID), _row("b2", side="con", strength="medium")],
+        [_row(f"{NEUTRAL_PREFIX}anything_at_all"), _row("b2", side="con")],
+    )
+    with pytest.raises(BankValidationError, match="reserved prefix"):
+        BankManager(path)
+
+
+def test_the_reserved_prefix_is_reported_with_every_other_problem(tmp_path):
+    """Accumulated, like every other bank error: one run to fix, not three."""
+    from sandbox.bank_manager import NEUTRAL_PREFIX
+
+    path = _write_bank(
+        tmp_path,
+        [_row(f"{NEUTRAL_PREFIX}t01"), _row("b2", side="con", strength="medium")],
     )
     with pytest.raises(BankValidationError) as caught:
         BankManager(path)
-    assert any("reserved" in problem for problem in caught.value.errors)
+    assert any("reserved prefix" in problem for problem in caught.value.errors)
     assert any("strength" in problem for problem in caught.value.errors)
+
+
+def test_all_item_ids_returns_every_item_sorted(tmp_path):
+    """Sorted, because NeutralBank.stand_in_for indexes into this sequence:
+    re-sorting the CSV must not change which message stands in for which
+    argument."""
+    path = _write_bank(
+        tmp_path, [_row("b3"), _row("b1"), _row("b2", side="con")]
+    )
+    assert BankManager(path).all_item_ids() == ["b1", "b2", "b3"]
 
 
 def test_a_missing_side_is_rejected(tmp_path):
@@ -420,3 +442,195 @@ def test_restore_rejects_a_bad_side_or_a_negative_count():
         bank.restore_post_counts({("agent_0000", "middle"): 1})
     with pytest.raises(ValueError, match="negative"):
         bank.restore_post_counts({("agent_0000", "pro"): -1})
+
+
+# --- the neutral bank, for the delivery-off control -----------------------
+
+
+NEUTRAL_HEADER = "neutral_id,english,hinglish,romanized_hindi,hindi"
+FIXTURE_NEUTRAL_BANK = Path("data/bank/test_neutral.csv")
+
+
+def _write_neutral(tmp_path, rows: list[str], header: str = NEUTRAL_HEADER) -> Path:
+    path = tmp_path / "neutral.csv"
+    path.write_text("\n".join([header, *rows]) + "\n", encoding="utf-8")
+    return path
+
+
+def _neutral_row(neutral_id="neutral_1", texts=("e", "hi", "rh", "h")):
+    return ",".join([neutral_id, *texts])
+
+
+def test_the_shipped_neutral_fixture_loads():
+    from sandbox.bank_manager import NEUTRAL_PREFIX, NeutralBank
+
+    neutral = NeutralBank(FIXTURE_NEUTRAL_BANK)
+    ids = neutral.ids()
+    assert len(ids) == 3
+    assert ids == sorted(ids)
+    assert all(i.startswith(NEUTRAL_PREFIX) for i in ids)
+    for neutral_id in ids:
+        for language in ("english", "hinglish", "romanized_hindi", "hindi"):
+            assert neutral.text(neutral_id, language).strip()
+
+
+def test_the_shipped_neutral_fixture_is_digit_free():
+    """Like the argument bank fixture, and for the same reason: the prompt
+    audit has to be able to tell a leaked position number from the text of
+    something an agent was shown."""
+    from sandbox.bank_manager import NeutralBank
+
+    neutral = NeutralBank(FIXTURE_NEUTRAL_BANK)
+    for neutral_id in neutral.ids():
+        for language in ("english", "hinglish", "romanized_hindi", "hindi"):
+            text = neutral.text(neutral_id, language)
+            assert not any(ch.isdigit() for ch in text), text
+
+
+def test_a_missing_neutral_file_is_rejected(tmp_path):
+    from sandbox.bank_manager import NeutralBank
+
+    with pytest.raises(BankValidationError, match="file not found"):
+        NeutralBank(tmp_path / "nope.csv")
+
+
+def test_an_empty_neutral_bank_is_rejected(tmp_path):
+    from sandbox.bank_manager import NeutralBank
+
+    with pytest.raises(BankValidationError, match="empty"):
+        NeutralBank(_write_neutral(tmp_path, []))
+
+
+def test_a_neutral_bank_missing_a_language_column_is_rejected(tmp_path):
+    """The column names ARE language_condition values, so a header typo
+    makes the file unrenderable for that arm."""
+    from sandbox.bank_manager import NeutralBank
+
+    path = _write_neutral(
+        tmp_path,
+        ["neutral_1,e,hi,rh"],
+        header="neutral_id,english,hinglish,romanized_hindi",
+    )
+    with pytest.raises(BankValidationError, match="missing required column"):
+        NeutralBank(path)
+
+
+def test_a_neutral_id_without_the_prefix_is_rejected(tmp_path):
+    """The prefix is how a logged ID is told apart from an argument-bank
+    item, on the resume path and by a reader of the dataset alike."""
+    from sandbox.bank_manager import NeutralBank
+
+    path = _write_neutral(tmp_path, [_neutral_row("msg_1")])
+    with pytest.raises(BankValidationError, match="must start with"):
+        NeutralBank(path)
+
+
+def test_an_empty_neutral_language_cell_is_rejected(tmp_path):
+    """A blank message would give that arm's control a blank post every
+    round, which is indistinguishable in the output from a message nobody
+    moved for."""
+    from sandbox.bank_manager import NeutralBank
+
+    path = _write_neutral(tmp_path, [_neutral_row(texts=("e", "hi", "", "h"))])
+    with pytest.raises(BankValidationError, match="empty romanized_hindi text"):
+        NeutralBank(path)
+
+
+def test_every_neutral_problem_is_reported_at_once(tmp_path):
+    """One run to fix the file, not three."""
+    from sandbox.bank_manager import NeutralBank
+
+    path = _write_neutral(
+        tmp_path,
+        [
+            _neutral_row("msg_1"),
+            _neutral_row("neutral_2", texts=("e", "", "rh", "")),
+            _neutral_row("neutral_2"),
+        ],
+    )
+    with pytest.raises(BankValidationError) as caught:
+        NeutralBank(path)
+    problems = caught.value.errors
+    assert any("must start with" in p for p in problems)
+    assert any("empty hinglish text" in p for p in problems)
+    assert any("empty hindi text" in p for p in problems)
+    assert any("duplicate" in p for p in problems)
+
+
+def test_neutral_text_raises_on_an_unknown_id_or_language():
+    """Never a fallback: an English stand-in in the Hindi arm would quietly
+    turn one arm's control into a second copy of another's."""
+    from sandbox.bank_manager import NeutralBank
+
+    neutral = NeutralBank(FIXTURE_NEUTRAL_BANK)
+    with pytest.raises(KeyError):
+        neutral.text("neutral_nope", "english")
+    with pytest.raises(ValueError, match="unknown language condition"):
+        neutral.text(neutral.ids()[0], "urdu")
+
+
+# --- stand_in_for ---------------------------------------------------------
+
+
+def test_stand_in_for_is_deterministic_and_depends_only_on_the_item():
+    from sandbox.bank_manager import NeutralBank
+
+    neutral = NeutralBank(FIXTURE_NEUTRAL_BANK)
+    bank = BankManager(FIXTURE_BANK)
+    items = bank.all_item_ids()
+
+    first = {i: neutral.stand_in_for(i, items) for i in items}
+    for _ in range(3):
+        assert {i: neutral.stand_in_for(i, items) for i in items} == first
+    # A second NeutralBank over the same file agrees, so nothing is carried
+    # in instance state.
+    other = NeutralBank(FIXTURE_NEUTRAL_BANK)
+    assert {i: other.stand_in_for(i, items) for i in items} == first
+
+
+def test_stand_in_for_is_the_same_in_every_language():
+    """It takes no language, which is the point: four arms' controls read
+    the same messages, rendered four ways, just as their treatments read the
+    same arguments."""
+    from sandbox.bank_manager import NeutralBank
+
+    neutral = NeutralBank(FIXTURE_NEUTRAL_BANK)
+    bank = BankManager(FIXTURE_BANK)
+    items = bank.all_item_ids()
+    import inspect
+
+    params = list(inspect.signature(NeutralBank.stand_in_for).parameters)
+    assert params == ["self", "item_id", "all_item_ids"]
+    assert all(neutral.stand_in_for(i, items).startswith("neutral_") for i in items)
+
+
+def test_stand_in_for_ignores_the_order_it_is_given_the_items_in():
+    """It sorts first, so re-sorting the bank CSV cannot change which message
+    stands in for which argument."""
+    from sandbox.bank_manager import NeutralBank
+
+    neutral = NeutralBank(FIXTURE_NEUTRAL_BANK)
+    items = BankManager(FIXTURE_BANK).all_item_ids()
+    shuffled = list(reversed(items))
+    assert [neutral.stand_in_for(i, shuffled) for i in items] == [
+        neutral.stand_in_for(i, items) for i in items
+    ]
+
+
+def test_stand_in_for_wraps_when_there_are_fewer_messages_than_items(tmp_path):
+    """Allowed, and the mirror property survives it: several arguments share
+    a message, but equal items still map to equal messages, which is what
+    makes the control's repeat structure match the treatment's."""
+    from sandbox.bank_manager import NeutralBank
+
+    neutral = NeutralBank(_write_neutral(tmp_path, [_neutral_row("neutral_only")]))
+    items = ["b1", "b2", "b3"]
+    assert [neutral.stand_in_for(i, items) for i in items] == ["neutral_only"] * 3
+
+
+def test_stand_in_for_raises_for_an_item_not_in_the_bank():
+    from sandbox.bank_manager import NeutralBank
+
+    neutral = NeutralBank(FIXTURE_NEUTRAL_BANK)
+    with pytest.raises(KeyError):
+        neutral.stand_in_for("not_a_bank_item", BankManager(FIXTURE_BANK).all_item_ids())

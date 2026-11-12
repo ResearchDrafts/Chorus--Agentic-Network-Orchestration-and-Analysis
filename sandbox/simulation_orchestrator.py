@@ -14,7 +14,8 @@ agent per turn, which both writes a post and states a stance. The bank regime
 the same thing:
 
     Phase A   every reader is shown its neighbours' bank posts -- or, in the
-              delivery: off control, one side-free message -- and writes a reply
+              delivery: off control, one side-free message standing in for
+              each of them -- and writes a reply
     Phase B   every agent is privately probed for its stance
 
 Both phases are computed against the same frozen snapshot, and no agent state
@@ -47,7 +48,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from sandbox.agent_manager import AgentManager, agent_id_for
-from sandbox.bank_manager import NEUTRAL_ITEM_ID, BankManager
+from sandbox.bank_manager import NEUTRAL_PREFIX, BankManager, NeutralBank
 from sandbox.checkpoint_manager import CheckpointManager
 from sandbox.cost_tracker import CostTracker
 from sandbox.interaction_engine import AlphaSampling, GraphSampling, RecommendationStrategy
@@ -120,6 +121,7 @@ class SimulationOrchestrator:
         cost_tracker: CostTracker | None = None,
         runs_dir: Path = Path("runs"),
         bank: BankManager | None = None,
+        neutral_bank: NeutralBank | None = None,
     ):
         self._run = run
         self._agent_manager = agent_manager
@@ -146,6 +148,14 @@ class SimulationOrchestrator:
         self._bank = bank
         if self._is_bank and self._bank is None:
             raise ValueError("regime='bank' requires a BankManager")
+        # The control's side-free messages. Required when it is the control
+        # being run, and refused rather than defaulted for the reason the
+        # schema refuses a missing path: a control that silently read
+        # something other than what the config named would be a baseline for
+        # a run nobody configured.
+        self._neutral_bank = neutral_bank
+        if self._is_bank and self._run.delivery == "off" and neutral_bank is None:
+            raise ValueError("delivery='off' requires a NeutralBank")
         # agent_id -> the rounds it remembers, oldest first. Held here rather
         # than on StanceRecord: the memory section needs the TEXT of what an
         # agent read, and putting that on the agent would copy those strings
@@ -464,8 +474,8 @@ class SimulationOrchestrator:
             1. each agent's side, from its last probe reading
             2. the bank item each agent posts, for that side
             3. each agent's neighbours
-            4. what each agent is delivered (the neutral message, under
-               delivery: off)
+            4. what each agent is delivered (one neutral message per bank
+               item it would have been delivered, under delivery: off)
             5. Phase A: every reply, concurrently
             6. Phase B: every probe, concurrently
             7. one Interaction per agent, written, then applied
@@ -505,23 +515,50 @@ class SimulationOrchestrator:
             for agent in all_agents
         }
 
-        # 4. Delivery. Under `delivery: off` every agent is shown exactly one
-        # post -- the run's neutral message, which is on topic and takes no
-        # side -- instead of its neighbours' bank items. Sides, items and
-        # neighbours are still resolved above and the neighbour ids are still
-        # logged. That is deliberate: it keeps every seeded stream consuming
-        # identically to a delivery-on arm, so the control differs from the
-        # treatment in the persuasive content of what agents READ and in
-        # nothing else -- which is the only way its drift measurement is a
-        # baseline for the treatment rather than for a different run.
+        # 4. Delivery. Under `delivery: off` each agent is shown N side-free
+        # messages instead of its neighbours' N bank items -- one standing in
+        # for each item it would have been delivered, chosen by a pure
+        # function of the item. Same count, and the same repeat structure:
+        # when two neighbours would have posted the same argument, the
+        # control reads the same message twice, as the treatment would have.
+        # A single fixed message, which is what this was, matched the
+        # treatment in neither.
+        #
+        # Sides, items and neighbours are still resolved above and the
+        # neighbour ids are still logged. That is deliberate: it keeps every
+        # seeded stream consuming identically to a delivery-on arm, so the
+        # control differs from the treatment in the persuasive content of
+        # what agents READ and in nothing else -- which is the only way its
+        # drift measurement is a baseline for the treatment rather than for a
+        # different run.
         delivered_items: dict[str, list[str]] = {}
         delivered_texts: dict[str, list[str]] = {}
+        # What the control's messages stood in for, per agent. Empty under
+        # delivery: on, where items_read already holds the bank items.
+        shadow_map: dict[str, list[str]] = {}
+        all_item_ids = self._bank.all_item_ids()
         for agent in all_agents:
-            if self._run.delivery == "off":
-                delivered_items[agent.agent_id] = [NEUTRAL_ITEM_ID]
-                delivered_texts[agent.agent_id] = [self._neutral_text()]
-                continue
             senders = neighbor_map[agent.agent_id]
+            if self._run.delivery == "off":
+                shadow = [post_map[n.agent_id] for n in senders]
+                shadow_map[agent.agent_id] = shadow
+                delivered_items[agent.agent_id] = [
+                    self._neutral_bank.stand_in_for(item_id, all_item_ids)
+                    for item_id in shadow
+                ]
+                # Rendered in the SENDER's language, exactly as the delivery-on
+                # branch below does, so the two arms differ in the text and
+                # not in whose language it arrives in.
+                delivered_texts[agent.agent_id] = [
+                    self._neutral_bank.text(
+                        neutral_id, by_id[n.agent_id].language_condition
+                    )
+                    for neutral_id, n in zip(
+                        delivered_items[agent.agent_id], senders, strict=True
+                    )
+                ]
+                continue
+            shadow_map[agent.agent_id] = []
             delivered_items[agent.agent_id] = [post_map[n.agent_id] for n in senders]
             # Rendered in the SENDER's language. Identical to the run's
             # language today, since initialize_population gives every agent
@@ -535,7 +572,7 @@ class SimulationOrchestrator:
             ]
 
         # 5. Phase A. Run in both delivery modes: the control replies to the
-        # neutral message. It used to be skipped under delivery: off, which
+        # neutral messages. It used to be skipped under delivery: off, which
         # made the control a different activity from the treatment rather
         # than the same activity minus the manipulated factor -- an agent
         # that reads nothing and writes nothing has a history that never
@@ -589,6 +626,7 @@ class SimulationOrchestrator:
                 turn=turn,
                 neighbors=neighbor_map[agent_id],
                 items_read=delivered_items[agent_id],
+                shadow_items=shadow_map[agent_id],
                 posted_item_id=post_map[agent_id],
                 reply=reply,
                 probe=probe,
@@ -677,31 +715,24 @@ class SimulationOrchestrator:
             return SIDE_CON
         return tie_break
 
-    def _neutral_text(self) -> str:
-        """The delivery-off control's one post.
-
-        Required by ExperimentRun when regime="bank" and delivery="off", so
-        this is unreachable through the loader -- kept for the same reason
-        _probe_question's guard is: delivering an empty string to every agent
-        in the control arm, every round, would be indistinguishable in the
-        output from a message that moved nobody.
-        """
-        if not self._run.neutral_message or not self._run.neutral_message.strip():
-            raise ValueError(
-                "delivery='off' requires neutral_message: refusing to deliver "
-                "an empty post, which would look like a message nobody moved for"
-            )
-        return self._run.neutral_message
-
     def _remembered_text(self, item_id: str) -> str:
-        """The text of one logged item, for the resume path.
+        """The text of one logged ID, for the resume path.
 
-        The reserved neutral ID renders from the run rather than the bank,
-        which is also why it must never name a bank item: the two sources
-        would disagree and only one of them would be what the agent read.
+        The prefix decides which file to look it up in, which is the whole
+        reason an argument-bank item may not carry it: two files answering
+        for one ID would disagree, and only one of them would be what the
+        agent read. Both raise on an unknown ID rather than falling back, so
+        a log written against a different bank fails here rather than
+        rebuilding a history out of the wrong text.
         """
-        if item_id == NEUTRAL_ITEM_ID:
-            return self._neutral_text()
+        if item_id.startswith(NEUTRAL_PREFIX):
+            if self._neutral_bank is None:
+                raise ValueError(
+                    f"{item_id!r} is a neutral-bank ID, but this run has no "
+                    "neutral bank: a delivery-on run cannot rebuild a "
+                    "delivery-off run's history"
+                )
+            return self._neutral_bank.text(item_id, self._run.language_condition)
         return self._bank.text(item_id, self._run.language_condition)
 
     def _reply_seed(self, turn: int, agent_id: str) -> int:
@@ -866,6 +897,7 @@ class SimulationOrchestrator:
         neighbors: list[Agent],
         items_read: list[str],
         posted_item_id: str | None,
+        shadow_items: list[str] | None = None,
         reply: BackendResponse | None,
         probe: tuple[BackendResponse, ProbeScore] | None,
     ) -> Interaction:
@@ -916,6 +948,7 @@ class SimulationOrchestrator:
                 meme_id=None,
                 used_vision_fallback=False,
                 items_read=items_read,
+                shadow_items=list(shadow_items or []),
                 posted_item_id=posted_item_id,
                 reply_text=reply_text,
                 probe_mean=None,
@@ -949,6 +982,7 @@ class SimulationOrchestrator:
             meme_id=None,
             used_vision_fallback=False,
             items_read=items_read,
+            shadow_items=list(shadow_items or []),
             posted_item_id=posted_item_id,
             reply_text=reply_text,
             probe_mean=reading.mean,
@@ -988,7 +1022,7 @@ class SimulationOrchestrator:
 
         A round with neither reads nor a reply is not remembered at all. That
         is now only a failed round, which Fix I excludes anyway: a
-        `delivery: off` round reads the neutral message and writes a reply,
+        `delivery: off` round reads its neutral messages and writes a reply,
         so it is remembered like any other.
 
         Trimmed here as well as in prompt_builder when a window is
@@ -1275,6 +1309,11 @@ def build_orchestrator(
         cost_tracker=cost_tracker,
         runs_dir=runs_dir,
         bank=BankManager(run.bank_path) if run.regime == "bank" else None,
+        neutral_bank=(
+            NeutralBank(run.neutral_bank_path)
+            if run.regime == "bank" and run.delivery == "off"
+            else None
+        ),
     )
 
 

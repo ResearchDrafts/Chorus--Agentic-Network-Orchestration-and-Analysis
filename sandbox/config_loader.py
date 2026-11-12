@@ -163,7 +163,44 @@ def _bank_errors(raw: dict) -> list[str]:
     return []
 
 
+def _neutral_bank_errors(raw: dict) -> list[str]:
+    """Validates a delivery-off control's neutral bank at config-load time.
+
+    Loaded in full, for _bank_errors' reason: an empty Hindi cell here gives
+    that arm's control a blank post every round, and a blank post is
+    indistinguishable in the output from a message nobody moved for. The
+    control is what every treatment effect is measured against, so a quietly
+    broken one invalidates the arms it is the baseline for, not just itself.
+
+    Reads regime and delivery from the raw dict so this runs whether or not
+    Pydantic validation succeeded.
+    """
+    if raw.get("regime") != "bank" or raw.get("delivery") != "off":
+        return []
+
+    neutral_bank_path = raw.get("neutral_bank_path")
+    if not isinstance(neutral_bank_path, str) or not neutral_bank_path.strip():
+        # ExperimentRun's own validator reports the missing field; repeating
+        # it here would put the same problem in the list twice.
+        return []
+
+    path = Path(neutral_bank_path)
+    if not path.exists():
+        return [f"neutral_bank_path '{neutral_bank_path}' not found at {path}"]
+
+    # Imported inside the function for _bank_errors' reason: config_loader is
+    # Tier 0 and bank_manager is Tier 1.
+    from sandbox.bank_manager import BankValidationError, NeutralBank
+
+    try:
+        NeutralBank(path)
+    except BankValidationError as e:
+        return [f"neutral bank {neutral_bank_path}: {problem}" for problem in e.errors]
+    return []
+
 def _resolve_git_commit_hash() -> str:
+
+
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -183,8 +220,9 @@ def _referenced_asset_errors(raw: dict) -> list[str]:
     """
     Checks that meme_pool_id (if meme_injection.enabled) resolves to an
     actual dataset file, that the persona pool referenced by the run
-    exists, and that a bank-regime run's bank loads and validates. Returns
-    ALL missing-asset errors found, not just the first.
+    exists, that a bank-regime run's bank loads and validates, and that a
+    delivery-off control's neutral bank does too. Returns ALL missing-asset
+    errors found, not just the first.
 
     Reads directly from the raw (possibly Pydantic-invalid) dict rather
     than a validated ExperimentRun, so this check runs independently of
@@ -193,6 +231,7 @@ def _referenced_asset_errors(raw: dict) -> list[str]:
     """
     errors: list[str] = []
     errors.extend(_bank_errors(raw))
+    errors.extend(_neutral_bank_errors(raw))
 
     meme_injection = raw.get("meme_injection")
     if isinstance(meme_injection, dict) and meme_injection.get("enabled") is True:

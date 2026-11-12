@@ -204,7 +204,7 @@ def test_bank_regime_fields_default_to_the_previous_behaviour():
     assert (run.probe_top_logprobs, run.probe_mass_floor) == (20, 0.5)
     assert run.memory_rounds is None
     assert run.max_prompt_tokens is None
-    assert run.neutral_message is None
+    assert run.neutral_bank_path is None
 
 
 @pytest.mark.parametrize(
@@ -310,40 +310,59 @@ BANK_KWARGS = dict(
 
 
 @pytest.mark.parametrize("neutral", [None, "", "   "])
-def test_the_delivery_off_control_requires_a_neutral_message(neutral):
-    """The control reads one on-topic, side-free message every round. An
-    empty one would deliver a blank post to every agent in the arm, which is
-    indistinguishable in the output from a message that moved nobody."""
+def test_the_delivery_off_control_requires_a_neutral_bank_path(neutral):
+    """The control reads N on-topic, side-free messages every round, and the
+    file they come from is not defaulted: a generic English fallback would
+    silently make every arm's control read English."""
     from sandbox.models import ExperimentRun
 
     overrides = dict(BANK_KWARGS, delivery="off")
     if neutral is not None:
-        overrides["neutral_message"] = neutral
-    with pytest.raises(ValidationError, match="neutral_message"):
+        overrides["neutral_bank_path"] = neutral
+    with pytest.raises(ValidationError, match="neutral_bank_path"):
         ExperimentRun(**_run_kwargs(**overrides))
 
 
-def test_the_delivery_off_control_with_a_neutral_message_is_accepted():
+def test_the_delivery_off_control_with_a_neutral_bank_path_is_accepted():
     from sandbox.models import ExperimentRun
 
     run = ExperimentRun(
-        **_run_kwargs(**BANK_KWARGS, delivery="off", neutral_message="Fares come up a lot.")
+        **_run_kwargs(
+            **BANK_KWARGS,
+            delivery="off",
+            neutral_bank_path="data/bank/test_neutral.csv",
+        )
     )
-    assert run.neutral_message == "Fares come up a lot."
+    assert run.neutral_bank_path == "data/bank/test_neutral.csv"
 
 
-def test_a_delivery_on_bank_run_needs_no_neutral_message():
+def test_the_schema_does_not_read_the_neutral_bank_off_disk():
+    """A path that does not exist still validates here. The file's contents
+    are checked at config load; this model is also built in tests and from a
+    checkpoint, and reading a CSV during schema validation would make those
+    paths depend on the filesystem."""
+    from sandbox.models import ExperimentRun
+
+    run = ExperimentRun(
+        **_run_kwargs(
+            **BANK_KWARGS, delivery="off", neutral_bank_path="data/bank/nope.csv"
+        )
+    )
+    assert run.neutral_bank_path == "data/bank/nope.csv"
+
+
+def test_a_delivery_on_bank_run_needs_no_neutral_bank():
     """The requirement is conditional: the treatment arm never delivers it."""
     from sandbox.models import ExperimentRun
 
-    assert ExperimentRun(**_run_kwargs(**BANK_KWARGS)).neutral_message is None
+    assert ExperimentRun(**_run_kwargs(**BANK_KWARGS)).neutral_bank_path is None
 
 
-def test_the_generated_regime_needs_no_neutral_message():
+def test_the_generated_regime_needs_no_neutral_bank():
     """delivery is a bank-regime switch; a generated run ignores it."""
     from sandbox.models import ExperimentRun
 
-    assert ExperimentRun(**_run_kwargs(delivery="off")).neutral_message is None
+    assert ExperimentRun(**_run_kwargs(delivery="off")).neutral_bank_path is None
 
 
 def test_generated_regime_ignores_the_bank_fields():

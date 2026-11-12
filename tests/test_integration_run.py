@@ -12,6 +12,7 @@ the LLM call itself.
 
 from __future__ import annotations
 
+import itertools
 import json
 from pathlib import Path
 
@@ -20,7 +21,13 @@ import yaml
 
 from sandbox.checkpoint_manager import CheckpointManager
 from sandbox.config_loader import load_run_config
-from sandbox.models import Agent, ExperimentRun, Interaction
+from sandbox.models import (
+    LANGUAGE_CONDITIONS,
+    Agent,
+    ExperimentRun,
+    Interaction,
+    PromptRecord,
+)
 from sandbox.simulation_orchestrator import build_orchestrator
 
 EXAMPLE_CONFIG = Path("configs/example_run.yaml")
@@ -54,6 +61,21 @@ def _rows(runs_dir, run_id="integration_run") -> list[Interaction]:
     return [
         Interaction.model_validate_json(line)
         for line in path.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def _prompt_records(runs_dir, run_id="integration_run") -> list[PromptRecord]:
+    """Every call a run made, as the run itself recorded it.
+
+    Auditing this rather than the gateway double's call list is the stronger
+    check: it is the file a real run leaves behind, so the same assertion can
+    be made against a campaign's output and not only inside the suite.
+    """
+    path = runs_dir / run_id / "prompts.jsonl"
+    return [
+        PromptRecord.model_validate_json(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
 
@@ -734,29 +756,37 @@ async def test_a_resumed_run_keeps_its_graph_edges_file(tmp_path, rq1_config, ba
 # --- 12.4: delivery: off, the E4 control ---------------------------------
 
 
-NEUTRAL = "Bus fares come up a lot in conversations about the city."
+NEUTRAL_BANK = "data/bank/test_neutral.csv"
 
 
 async def test_the_shipped_delivery_off_config_loads(tmp_path):
-    """configs/rq1/smoke_off.yaml is the worked example of the E4 control."""
+    """configs/rq1/smoke_off.yaml is the worked example of the E4 control,
+    and its neutral bank is validated in full at load like the argument
+    bank is."""
+    from sandbox.bank_manager import NEUTRAL_PREFIX, NeutralBank
+
     run = load_run_config(Path("configs/rq1/smoke_off.yaml"))
     assert run.delivery == "off"
-    assert run.neutral_message and run.neutral_message.strip()
+    assert run.neutral_bank_path and run.neutral_bank_path.strip()
+    ids = NeutralBank(run.neutral_bank_path).ids()
+    assert ids and all(i.startswith(NEUTRAL_PREFIX) for i in ids)
 
 
-async def test_the_delivery_off_control_reads_one_neutral_message(
+async def test_the_delivery_off_control_reads_n_neutral_messages(
     tmp_path, rq1_config, bank_gateway
 ):
-    """It makes the same calls a treatment arm does, reads one side-free
-    message every round, and never sees a bank argument.
+    """It makes the same calls a treatment arm does, reads N side-free
+    messages every round, and never sees a bank argument.
 
-    The control used to deliver nothing and reply to nothing, which made it a
-    different activity from the treatment rather than the same activity
-    without the manipulated factor.
+    N, not one. The control used to read a single fixed message against the
+    treatment's N, so the two arms differed in how much was read and in how
+    often something was read twice, as well as in persuasive content.
     """
-    from sandbox.bank_manager import NEUTRAL_ITEM_ID, BankManager
+    from sandbox.bank_manager import NEUTRAL_PREFIX, BankManager
 
-    run = load_run_config(rq1_config(delivery="off", neutral_message=NEUTRAL))
+    run = load_run_config(
+        rq1_config(delivery="off", neutral_bank_path=NEUTRAL_BANK)
+    )
     await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
 
     assert bank_gateway.generate.await_count == run.M * run.K == 24
@@ -768,23 +798,76 @@ async def test_the_delivery_off_control_reads_one_neutral_message(
     for row in rows:
         if row.turn == 0:
             assert row.items_read == [] and row.reply_text == ""
+            assert row.shadow_items == []
         else:
-            assert row.items_read == [NEUTRAL_ITEM_ID]
+            assert len(row.items_read) == run.N == 3
+            assert all(i.startswith(NEUTRAL_PREFIX) for i in row.items_read)
+            assert len(row.shadow_items) == run.N
             assert row.reply_text
 
+    # The audit, against the file a real run leaves behind rather than only
+    # against the mock's call list: no argument from the bank, in any
+    # language, reaches any prompt of the control arm.
     bank = BankManager(run.bank_path)
     arguments = [
-        bank.text(item_id, run.language_condition)
-        for side in ("pro", "con")
-        for item_id in bank.items_for_side(side)
+        bank.text(item_id, language)
+        for item_id in bank.all_item_ids()
+        for language in LANGUAGE_CONDITIONS
     ]
-    prompts = [c.args[0] for c in bank_gateway.generate.await_args_list] + [
-        c.args[0] for c in bank_gateway.score_next_token.await_args_list
-    ]
-    for prompt in prompts:
-        assert all(argument not in prompt for argument in arguments)
-    for prompt in (c.args[0] for c in bank_gateway.generate.await_args_list):
-        assert prompt.count(f"A user posted: {NEUTRAL}") == 1
+    logged = _prompt_records(tmp_path, "rq1_run")
+    assert len(logged) == run.M * run.K + run.M * (run.K + 1)
+    for record in logged:
+        assert all(argument not in record.prompt_text for argument in arguments)
+    for record in (r for r in logged if r.call == "reply"):
+        assert record.prompt_text.count("A user posted:") == run.N
+
+
+async def test_the_control_feed_mirrors_the_treatment_feed(
+    tmp_path, rq1_config, bank_gateway
+):
+    """Same shape, no arguments.
+
+    With the probe driven to one constant reading in both arms, the sides and
+    therefore the bank items match, so the control's shadow_items must equal
+    the treatment's items_read row for row -- including the repeats, which is
+    the part a single fixed message could not reproduce. The stand-in is a
+    pure function of the item, so equal items give equal messages and the
+    control reads the same thing twice exactly when the treatment would have.
+    """
+    on, off = tmp_path / "on", tmp_path / "off"
+    await build_orchestrator(
+        load_run_config(rq1_config("on.yaml")), bank_gateway, runs_dir=on
+    ).run()
+    await build_orchestrator(
+        load_run_config(
+            rq1_config("off.yaml", delivery="off", neutral_bank_path=NEUTRAL_BANK)
+        ),
+        bank_gateway,
+        runs_dir=off,
+    ).run()
+
+    treatment = {
+        (r.turn, r.speaker_agent_id): r for r in _rows(on, "rq1_run")
+    }
+    control = {(r.turn, r.speaker_agent_id): r for r in _rows(off, "rq1_run")}
+    assert set(treatment) == set(control)
+
+    repeats_seen = 0
+    for key, t_row in treatment.items():
+        c_row = control[key]
+        assert c_row.shadow_items == t_row.items_read, key
+        assert c_row.neighbor_agent_ids == t_row.neighbor_agent_ids, key
+        assert c_row.posted_item_id == t_row.posted_item_id, key
+        # Equal items map to equal messages, so the repeat structure matches.
+        for i, j in itertools.combinations(range(len(t_row.items_read)), 2):
+            same_item = t_row.items_read[i] == t_row.items_read[j]
+            assert (c_row.items_read[i] == c_row.items_read[j]) == same_item
+            repeats_seen += same_item
+
+    # Not vacuous: the treatment really did deliver the same argument twice
+    # in some round, which is the case a single fixed message got wrong in
+    # one direction and N distinct messages would get wrong in the other.
+    assert repeats_seen > 0
 
 
 async def test_the_control_and_the_treatment_share_their_draws(
@@ -799,7 +882,9 @@ async def test_the_control_and_the_treatment_share_their_draws(
         load_run_config(rq1_config("on.yaml")), bank_gateway, runs_dir=on
     ).run()
     await build_orchestrator(
-        load_run_config(rq1_config("off.yaml", delivery="off", neutral_message=NEUTRAL)),
+        load_run_config(
+            rq1_config("off.yaml", delivery="off", neutral_bank_path=NEUTRAL_BANK)
+        ),
         bank_gateway,
         runs_dir=off,
     ).run()

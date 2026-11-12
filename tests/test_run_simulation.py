@@ -17,6 +17,8 @@ import pytest
 import run_simulation
 from tests.factories import make_run
 
+NEUTRAL_BANK = "data/bank/test_neutral.csv"
+
 BANK_KWARGS = dict(
     regime="bank",
     bank_path="data/bank/test_bank.csv",
@@ -45,11 +47,9 @@ def test_a_bank_run_counts_two_calls_per_agent_round_plus_round_zero():
 
 
 def test_the_delivery_off_control_costs_the_same_as_a_treatment_arm():
-    """It reads the neutral message and replies to it, so it makes M x K
+    """It reads N neutral messages and replies to them, so it makes M x K
     reply calls too. It used to make none, and the printed plan said so."""
-    run = make_run(
-        **BANK_KWARGS, delivery="off", neutral_message="Fares come up a lot."
-    )
+    run = make_run(**BANK_KWARGS, delivery="off", neutral_bank_path=NEUTRAL_BANK)
     lines = run_simulation._describe_calls(run)
 
     assert "24 reply calls" in lines[0]
@@ -59,20 +59,39 @@ def test_the_delivery_off_control_costs_the_same_as_a_treatment_arm():
     assert not any("none" in line for line in lines)
 
 
-def test_the_regime_line_says_what_the_control_reads():
-    off = make_run(**BANK_KWARGS, delivery="off", neutral_message="Fares come up.")
-    assert "side-free message" in run_simulation._describe_regime(off)
+def test_the_regime_line_says_how_much_the_control_reads():
+    """N, not one. The count is the part that changed, and the part a
+    reviewer checks the control against the treatment on."""
+    off = make_run(**BANK_KWARGS, delivery="off", neutral_bank_path=NEUTRAL_BANK)
+    line = run_simulation._describe_regime(off)
+    assert "side-free messages" in line
+    assert f"{off.N} side-free" in line
     assert "delivery ON" in run_simulation._describe_regime(make_run(**BANK_KWARGS))
 
 
-def test_describe_prints_the_neutral_message_for_a_control_run(capsys, tmp_path):
-    """So a reviewer can read the one post the whole arm is built on, the same
-    way describe() prints the probe question in full."""
+def test_describe_prints_the_neutral_bank_and_its_size(capsys, tmp_path):
+    """So a reviewer can see which file the whole arm is built on and how
+    many messages it has -- a bank smaller than the argument bank means
+    several arguments share a stand-in, which is allowed and worth seeing
+    before the run rather than after."""
+    run = make_run(**BANK_KWARGS, delivery="off", neutral_bank_path=NEUTRAL_BANK)
+    run_simulation.describe(run, tmp_path)
+    out = capsys.readouterr().out
+    assert NEUTRAL_BANK in out
+    assert "3 messages" in out
+
+
+def test_describe_still_prints_a_plan_when_the_neutral_bank_is_unreadable(
+    capsys, tmp_path
+):
+    """The file is validated at config load, so a broken one here is a file
+    that changed underneath a loaded config. The plan should still print,
+    saying so."""
     run = make_run(
-        **BANK_KWARGS, delivery="off", neutral_message="Fares come up a lot."
+        **BANK_KWARGS, delivery="off", neutral_bank_path="data/bank/missing.csv"
     )
     run_simulation.describe(run, tmp_path)
-    assert "Fares come up a lot." in capsys.readouterr().out
+    assert "UNREADABLE" in capsys.readouterr().out
 
 
 # --- the memory line -----------------------------------------------------

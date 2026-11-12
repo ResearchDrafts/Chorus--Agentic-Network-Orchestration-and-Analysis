@@ -387,16 +387,16 @@ def test_every_arm_carries_the_same_english_anchor_labels():
 
 def test_the_delivery_off_config_differs_only_in_delivery():
     """And in run_id, so the two arms do not write into the same directory,
-    and in neutral_message, which only the control delivers."""
+    and in neutral_bank_path, which only the control reads from."""
     from pathlib import Path
 
     on = load_run_config(Path("configs/rq1/smoke.yaml")).model_dump()
     off = load_run_config(Path("configs/rq1/smoke_off.yaml")).model_dump()
 
     differing = {k for k in on if on[k] != off[k]}
-    assert differing == {"delivery", "run_id", "neutral_message"}
-    assert on["neutral_message"] is None
-    assert off["neutral_message"].strip()
+    assert differing == {"delivery", "run_id", "neutral_bank_path"}
+    assert on["neutral_bank_path"] is None
+    assert off["neutral_bank_path"].strip()
 
 
 def test_delivery_is_quoted_in_every_shipped_config():
@@ -409,3 +409,123 @@ def test_delivery_is_quoted_in_every_shipped_config():
     for name in (*ARM_CONFIGS, "smoke_off"):
         raw = yaml.safe_load(Path(f"configs/rq1/{name}.yaml").read_text())
         assert isinstance(raw["delivery"], str), f"{name}: delivery parsed as {raw['delivery']!r}"
+
+
+# --- the delivery-off control's neutral bank ------------------------------
+
+
+NEUTRAL_HEADER = "neutral_id,english,hinglish,romanized_hindi,hindi"
+
+
+def test_a_delivery_off_config_without_a_neutral_bank_is_rejected(
+    valid_config_dict, write_config
+):
+    """Never defaulted, for probe_question's reason: a generic fallback would
+    silently make every arm's control read English, and the control is what
+    every treatment effect is measured against."""
+    path = write_config(_bank_config(valid_config_dict, delivery="off"))
+    with pytest.raises(ConfigLoadError) as excinfo:
+        load_run_config(path)
+    assert any("neutral_bank_path" in e for e in excinfo.value.errors)
+
+
+def test_a_valid_delivery_off_config_loads(valid_config_dict, write_config):
+    run = load_run_config(
+        write_config(
+            _bank_config(
+                valid_config_dict,
+                delivery="off",
+                neutral_bank_path="data/bank/test_neutral.csv",
+            )
+        )
+    )
+    assert run.delivery == "off"
+    assert run.neutral_bank_path == "data/bank/test_neutral.csv"
+
+
+def test_a_missing_neutral_bank_file_is_reported_with_its_path(
+    valid_config_dict, write_config
+):
+    path = write_config(
+        _bank_config(
+            valid_config_dict,
+            delivery="off",
+            neutral_bank_path="data/bank/nope.csv",
+        )
+    )
+    with pytest.raises(ConfigLoadError) as excinfo:
+        load_run_config(path)
+    assert any("data/bank/nope.csv" in e for e in excinfo.value.errors)
+
+
+def test_a_broken_neutral_bank_is_rejected_at_config_load(
+    tmp_path, valid_config_dict, write_config
+):
+    """Loaded in full, like the argument bank. A blank cell here gives that
+    arm's control a blank post every round, and a control that reads nothing
+    is not a baseline for an arm that reads something."""
+    neutral = tmp_path / "broken_neutral.csv"
+    neutral.write_text(
+        NEUTRAL_HEADER + "\n"
+        "neutral_1,english text,hinglish text,roman text,\n",
+        encoding="utf-8",
+    )
+    path = write_config(
+        _bank_config(
+            valid_config_dict, delivery="off", neutral_bank_path=str(neutral)
+        )
+    )
+    with pytest.raises(ConfigLoadError) as excinfo:
+        load_run_config(path)
+    assert any("empty hindi text" in e for e in excinfo.value.errors)
+
+
+def test_an_unprefixed_neutral_id_is_rejected_at_config_load(
+    tmp_path, valid_config_dict, write_config
+):
+    neutral = tmp_path / "unprefixed.csv"
+    neutral.write_text(
+        NEUTRAL_HEADER + "\n" "msg_1,e,hi,rh,h\n", encoding="utf-8"
+    )
+    path = write_config(
+        _bank_config(
+            valid_config_dict, delivery="off", neutral_bank_path=str(neutral)
+        )
+    )
+    with pytest.raises(ConfigLoadError) as excinfo:
+        load_run_config(path)
+    assert any("must start with" in e for e in excinfo.value.errors)
+
+
+def test_a_delivery_on_config_ignores_the_neutral_bank(
+    valid_config_dict, write_config
+):
+    """The requirement is conditional. A treatment arm with a broken neutral
+    path is not a broken treatment arm, and reporting one would send someone
+    to fix a file the run never opens."""
+    path = write_config(
+        _bank_config(valid_config_dict, neutral_bank_path="data/bank/nope.csv")
+    )
+    assert load_run_config(path).delivery == "on"
+
+
+def test_both_banks_are_reported_together(tmp_path, valid_config_dict, write_config):
+    """Accumulated like every other config error: a config with two broken
+    files should take one run to diagnose."""
+    neutral = tmp_path / "broken_neutral.csv"
+    neutral.write_text(
+        NEUTRAL_HEADER + "\n" "neutral_1,e,hi,rh,\n", encoding="utf-8"
+    )
+    path = write_config(
+        _bank_config(
+            valid_config_dict,
+            bank_path="data/bank/nope.csv",
+            delivery="off",
+            neutral_bank_path=str(neutral),
+        )
+    )
+    with pytest.raises(ConfigLoadError) as excinfo:
+        load_run_config(path)
+    errors = excinfo.value.errors
+    assert any("data/bank/nope.csv" in e for e in errors)
+    assert any("empty hindi text" in e for e in errors)

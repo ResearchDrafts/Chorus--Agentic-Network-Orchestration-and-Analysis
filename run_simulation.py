@@ -55,7 +55,7 @@ def describe(run: ExperimentRun, runs_dir: Path) -> None:
         print(f"                7 = {run.stance_high_label}")
         print(f"  memory        {_describe_memory(run)}")
         if run.delivery == "off":
-            print(f"  neutral       {run.neutral_message!r}")
+            print(f"  neutral       {run.neutral_bank_path}  {_neutral_bank_size(run)}")
         print(
             "  prompts       "
             + (
@@ -86,7 +86,28 @@ def _describe_memory(run: ExperimentRun) -> str:
     return f"the last {run.memory_rounds} rounds of reading and replies"
 
 
+def _neutral_bank_size(run: ExperimentRun) -> str:
+    """How many side-free messages the control has to draw stand-ins from.
+
+    Printed because it is the one number about the control a reviewer cannot
+    get from anywhere else in the plan, and because a neutral bank smaller
+    than the argument bank means several arguments share a stand-in -- which
+    is allowed, and worth seeing before the run rather than after.
+
+    Reported rather than raised on: the file has already been validated at
+    config load, so anything wrong here is a file that changed underneath a
+    loaded config, and the plan should still print.
+    """
+    from sandbox.bank_manager import BankValidationError, NeutralBank
+
+    try:
+        return f"({len(NeutralBank(run.neutral_bank_path).ids())} messages)"
+    except BankValidationError as e:
+        return f"(UNREADABLE: {e})"
+
 def _describe_neighbours(run: ExperimentRun) -> str:
+
+
     if run.neighbor_strategy == "graph":
         return (
             f"graph  WS(M={run.M}, degree={run.graph_degree}, p={run.graph_rewire_p})"
@@ -101,7 +122,7 @@ def _describe_regime(run: ExperimentRun) -> str:
     delivery = (
         "delivery ON"
         if run.delivery == "on"
-        else "delivery OFF (E4 control: reads one side-free message)"
+        else f"delivery OFF (E4 control: reads {run.N} side-free messages per round)"
     )
     return f"bank  posts from {run.bank_path}, stance by probe  [{delivery}]"
 
@@ -113,8 +134,8 @@ def _describe_calls(run: ExperimentRun) -> list[str]:
     round 0 -- so a bank run of the same M and K is about twice the traffic of
     a generated one, which is worth seeing before starting rather than after.
 
-    The delivery-off control costs the same as a treatment arm: it reads the
-    neutral message and replies to it, so it makes M x K reply calls too.
+    The delivery-off control costs the same as a treatment arm: it reads N
+    neutral messages and replies to them, so it makes M x K reply calls too.
     That is the point of it -- the two arms differ in the persuasive content
     of what agents read, not in how much work they do.
     """
@@ -125,7 +146,11 @@ def _describe_calls(run: ExperimentRun) -> list[str]:
     probes = run.M * (run.K + 1)  # +1 for the round-0 probe
     return [
         f"{replies} reply calls  (M x K"
-        + ("; the control replies to the neutral message)" if run.delivery == "off" else ")"),
+        + (
+            "; the control replies to its neutral messages)"
+            if run.delivery == "off"
+            else ")"
+        ),
         f"{probes} probe calls  (M x (K+1), including the round-0 probe)",
         f"{replies + probes} LLM calls in total",
     ]

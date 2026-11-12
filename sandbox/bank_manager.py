@@ -38,13 +38,17 @@ SIDES = ("pro", "con")
 STRENGTHS = ("strong", "weak")
 REQUIRED_COLUMNS = ("item_id", "arg_id", "strength", "side", *LANGUAGE_CONDITIONS)
 
-# The item ID a `delivery: off` round logs for the side-free message it
-# delivers. Reserved, not a bank item: it has no side and no strength, it is
-# rendered from ExperimentRun.neutral_message rather than from any CSV, and a
-# bank that used it would make a control row indistinguishable from a
-# treatment row that happened to read that argument. Validated against the
-# bank at load, so the collision is a config error rather than a silent one.
-NEUTRAL_ITEM_ID = "__neutral__"
+# Every ID in the neutral bank starts with this, and no argument-bank item
+# may. The two files are read back through one column -- items_read holds
+# whichever the agent was shown -- so the prefix is what lets a reader, and
+# _remembered_text on the resume path, tell which file to look an ID up in
+# without a second column saying so. A bank item under this prefix would be
+# rendered from the neutral file rather than from its own row, so the
+# argument in the CSV would silently never be read. Checked at load, so the
+# collision is a config error rather than a silent one.
+NEUTRAL_PREFIX = "neutral_"
+
+NEUTRAL_REQUIRED_COLUMNS = ("neutral_id", *LANGUAGE_CONDITIONS)
 
 
 class BankValidationError(Exception):
@@ -98,6 +102,15 @@ class BankManager:
         """
         self._require_side(side)
         return list(self._by_side[side])
+
+    def all_item_ids(self) -> list[str]:
+        """Every item ID in the bank, sorted, both sides together.
+
+        Sorted for items_for_side's reason: NeutralBank.stand_in_for indexes
+        into this sequence, so it has to be a function of the bank's contents
+        rather than of how someone happened to order the rows.
+        """
+        return sorted(self._items)
 
     def text(self, item_id: str, language: str) -> str:
         """The item's rendering in one language condition.
@@ -208,7 +221,142 @@ class BankManager:
             raise ValueError(f"unknown side {side!r}, expected one of {list(SIDES)}")
 
 
+class NeutralBank:
+    """The side-free messages the `delivery: off` control reads.
+
+    The control exists to measure how much stance drifts from taking part at
+    all -- reading something, writing something, being asked -- so it has to
+    do the same amount of the same activity a treatment arm does, differing
+    only in whether what it reads argues anything. One fixed message per
+    round was not that: a treatment agent reads N posts a round, with a
+    pattern of repeats that follows from who its neighbours are, so the two
+    arms differed in how much was read and in how often something was read
+    twice, as well as in persuasive content.
+
+    So the control reads N of these a round, one standing in for each bank
+    item it would have been delivered, chosen by `stand_in_for`. Same count,
+    same repeat structure, no argument.
+
+    Validated like the argument bank and for the same reason: an empty Hindi
+    cell here would give one arm's control a blank post every round, which is
+    indistinguishable in the output from a message nobody moved for.
+    """
+
+    def __init__(self, path: str | Path):
+        self._path = Path(path)
+        self._messages = _load_and_validate_neutral(self._path)
+        self._ids = sorted(self._messages)
+
+    def ids(self) -> list[str]:
+        """The neutral IDs, sorted. Sorted for items_for_side's reason: what
+        `stand_in_for` returns must be a function of the file's contents and
+        not of its row order."""
+        return list(self._ids)
+
+    def text(self, neutral_id: str, language: str) -> str:
+        """The message's rendering in one language condition.
+
+        Raises for an unknown ID or language rather than falling back, for
+        BankManager.text's reason: a fallback to English would quietly turn
+        one arm's control into a second copy of another's.
+        """
+        if neutral_id not in self._messages:
+            raise KeyError(f"unknown neutral message: {neutral_id!r}")
+        if language not in LANGUAGE_CONDITIONS:
+            raise ValueError(
+                f"unknown language condition {language!r}, "
+                f"expected one of {list(LANGUAGE_CONDITIONS)}"
+            )
+        return self._messages[neutral_id][language]
+
+    def stand_in_for(self, item_id: str, all_item_ids: list[str]) -> str:
+        """The neutral message that takes the place of one bank item.
+
+        A pure function of the two files' contents:
+
+            ids()[sorted(all_item_ids).index(item_id) % len(ids())]
+
+        No seed, no turn, no agent, no language. That is the whole point. The
+        control's feed has to mirror the treatment's *shape* -- N posts, with
+        the same two-of-them-are-the-same pattern whenever the treatment would
+        have delivered one item twice -- and a stand-in drawn from a stream
+        would reproduce the count but not the repeats, while one that varied
+        by language would give the four arms' controls different feeds.
+
+        Being a function of the bank rather than of the round also means the
+        mapping survives a resume with nothing to restore: round 3 rebuilt
+        from the log maps the same item to the same message it did live.
+
+        The two files need not be the same size. A neutral bank smaller than
+        the argument bank wraps, so several items share a message, and the
+        mirror property still holds: equal items map to equal messages, which
+        is what makes the repeat structure match.
+        """
+        if item_id not in all_item_ids:
+            raise KeyError(
+                f"{item_id!r} is not in the argument bank, so it has no stand-in"
+            )
+        return self._ids[sorted(all_item_ids).index(item_id) % len(self._ids)]
+
+
+def _load_and_validate_neutral(path: Path) -> dict[str, dict[str, str]]:
+    """Reads the neutral CSV and reports every problem at once.
+
+    Same contract as _load_and_validate, minus side and strength, which a
+    message that takes no side has neither of.
+    """
+    if not path.exists():
+        raise BankValidationError(path, [f"file not found: {path}"])
+
+    with path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames or []
+        missing_columns = [c for c in NEUTRAL_REQUIRED_COLUMNS if c not in fieldnames]
+        if missing_columns:
+            raise BankValidationError(
+                path, [f"missing required column(s): {', '.join(missing_columns)}"]
+            )
+        rows = list(reader)
+
+    if not rows:
+        raise BankValidationError(
+            path, ["neutral bank is empty: no rows after the header"]
+        )
+
+    errors: list[str] = []
+    messages: dict[str, dict[str, str]] = {}
+
+    for line_no, row in enumerate(rows, start=2):  # start=2: line 1 is the header
+        neutral_id = (row.get("neutral_id") or "").strip()
+        if not neutral_id:
+            errors.append(f"line {line_no}: empty neutral_id")
+            continue
+        if neutral_id in messages:
+            errors.append(f"line {line_no}: duplicate neutral_id {neutral_id!r}")
+            continue
+        if not neutral_id.startswith(NEUTRAL_PREFIX):
+            errors.append(
+                f"line {line_no}: neutral_id {neutral_id!r} must start with "
+                f"{NEUTRAL_PREFIX!r}, which is how a logged ID is told apart "
+                "from an argument-bank item"
+            )
+            continue
+
+        renderings = {}
+        for language in LANGUAGE_CONDITIONS:
+            text = (row.get(language) or "").strip()
+            if not text:
+                errors.append(f"line {line_no} ({neutral_id}): empty {language} text")
+            renderings[language] = text
+        messages[neutral_id] = {"neutral_id": neutral_id, **renderings}
+
+    if errors:
+        raise BankValidationError(path, errors)
+    return messages
+
 def _cycle_rng(rng: random.Random, side: str, cycle: int) -> random.Random:
+
+
     """A generator for one (sender, side, cycle), derived without consuming rng.
 
     `rng` carries the (seed, sender) part of the derivation. Its state is
@@ -264,14 +412,13 @@ def _load_and_validate(path: Path) -> dict[str, dict[str, str]]:
         if item_id in items:
             errors.append(f"line {line_no}: duplicate item_id {item_id!r}")
             continue
-        if item_id == NEUTRAL_ITEM_ID:
-            # Reserved for the delivery-off control's side-free message. A
-            # bank item under this ID would be rendered from
-            # neutral_message rather than from its own row, so the argument
-            # in the CSV would silently never be read.
+        if item_id.startswith(NEUTRAL_PREFIX):
+            # Reserved for the neutral bank. See NEUTRAL_PREFIX: an item
+            # under this prefix would be looked up in the neutral file, so
+            # the argument in this row would silently never be read.
             errors.append(
-                f"line {line_no}: item_id {NEUTRAL_ITEM_ID!r} is reserved for the "
-                "delivery-off control's neutral message and cannot name a bank item"
+                f"line {line_no}: item_id {item_id!r} starts with the reserved prefix "
+                f"{NEUTRAL_PREFIX!r}, which names the neutral bank's messages"
             )
             continue
 

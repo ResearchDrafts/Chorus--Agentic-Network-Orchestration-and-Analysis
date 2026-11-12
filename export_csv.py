@@ -10,8 +10,9 @@ Produces three files:
                     The main dataset. Bank-regime runs additionally carry
                     probe_mean, x (the stance rescaled to [-1, 1] about the
                     midpoint), probe_mass, side_conf, items_read,
-                    n_items_read, posted_item_id, is_round_zero, reply_seed
-                    and the two per-call prompt lengths; these are present but
+                    n_items_read, posted_item_id, shadow_items,
+                    is_round_zero, reply_seed and the two per-call prompt
+                    lengths; these are present but
                     empty for generated-regime rows, so a campaign mixing
                     both regimes still exports as one table.
   agents.csv        one row per agent per run: final stance, total movement,
@@ -178,6 +179,11 @@ def _derive_bank_columns(df: pd.DataFrame) -> pd.DataFrame:
     # is already pipe-joined and a reader splitting the wrong column on the
     # wrong separator gets a silently wrong answer rather than an error.
     df["items_read"] = items.map(_join_items)
+    # What a control row's neutral messages stood in for, in the same order,
+    # semicolon-joined like items_read. Empty on a delivery-on row and at
+    # round 0. This is what lines a control row up against the treatment row
+    # it is the baseline for.
+    df["shadow_items"] = _column(df, "shadow_items", object).map(_join_items)
     df["posted_item_id"] = _column(df, "posted_item_id", object)
     # How much of the next-token distribution actually landed on the scale.
     # A quality measure, not a stance: a mean of 5.0 read off 0.95 mass and
@@ -218,9 +224,10 @@ def _join_items(value) -> str:
     An empty string is the round-0 probe, the only row where an agent
     genuinely read nothing -- as distinct from a missing column, which is a
     pre-bank dataset and also lands here as empty. A `delivery: off` row
-    carries the reserved id "__neutral__", since the control reads one
-    side-free message rather than nothing. n_items_read carries the count so
-    an analysis does not have to split the string to know.
+    carries N neutral-bank IDs, all prefixed "neutral_", since the control
+    reads one side-free message for each bank item it would have been
+    delivered; shadow_items says which items those were. n_items_read carries
+    the count so an analysis does not have to split the string to know.
     """
     if isinstance(value, list):
         return ";".join(str(item) for item in value)

@@ -541,6 +541,7 @@ async def test_prompt_is_built_at_most_twice_across_the_retry_budget(
 from tests.factories import make_logprob_response  # noqa: E402
 
 FIXTURE_BANK = "data/bank/test_bank.csv"
+FIXTURE_NEUTRAL_BANK = "data/bank/test_neutral.csv"
 
 
 def _rendered_leans(run) -> set[str]:
@@ -581,7 +582,7 @@ def _bank_run(**overrides) -> ExperimentRun:
         # window pass memory_rounds=n explicitly.
         # Required only when delivery="off", harmless otherwise, and set
         # unconditionally so a test can flip delivery with one override.
-        neutral_message="Fares come up a lot in conversations about the city.",
+        neutral_bank_path=FIXTURE_NEUTRAL_BANK,
     )
     base.update(overrides)
     return make_run(**base)
@@ -837,10 +838,14 @@ async def test_delivery_off_makes_the_same_calls_as_a_treatment_arm(
     assert bank_gateway.score_next_token.await_count == run.M * (run.K + 1)
 
 
-async def test_delivery_off_rows_read_the_reserved_neutral_id(tmp_path, bank_gateway):
-    """So a control row says "read the side-free message" rather than "read
-    nothing", which is what round 0 says and a different fact."""
-    from sandbox.bank_manager import NEUTRAL_ITEM_ID
+async def test_delivery_off_rows_read_n_prefixed_neutral_ids(tmp_path, bank_gateway):
+    """A control row reads N side-free messages, not one and not none.
+
+    N, because the treatment reads N: an arm that read one post a round
+    against the treatment's three differs in how much was read as well as in
+    whether it argued anything.
+    """
+    from sandbox.bank_manager import NEUTRAL_PREFIX
 
     run = _bank_run(delivery="off")
     await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
@@ -852,22 +857,27 @@ async def test_delivery_off_rows_read_the_reserved_neutral_id(tmp_path, bank_gat
         assert row.probe_mean is not None
         if row.turn == 0:
             assert row.items_read == []
+            assert row.shadow_items == []
             assert row.reply_text == ""
         else:
-            assert row.items_read == [NEUTRAL_ITEM_ID]
-            # posted_item_id is still the bank item this agent WOULD have
-            # posted, so the control's draws stay comparable to the
-            # treatment's row by row.
+            assert len(row.items_read) == run.N
+            assert all(i.startswith(NEUTRAL_PREFIX) for i in row.items_read)
+            # One bank item per message, in the same order, so a control row
+            # can be lined up against the treatment row it is a baseline for.
+            assert len(row.shadow_items) == run.N
+            # posted_item_id is still the bank item this agent's side WOULD
+            # have been represented by, so the control's draws stay
+            # comparable to the treatment's row by row.
             assert row.posted_item_id is not None
             assert row.reply_text
 
 
-async def test_delivery_off_delivers_the_neutral_message_and_no_bank_text(
+async def test_delivery_off_delivers_neutral_messages_and_no_bank_text(
     tmp_path, bank_gateway
 ):
-    """Every post the control reads is the neutral message, and no argument
-    from the bank reaches any prompt in either phase."""
-    from sandbox.bank_manager import BankManager
+    """Every post the control reads comes from the neutral bank, and no
+    argument from the bank reaches any prompt in either phase."""
+    from sandbox.bank_manager import BankManager, NeutralBank
 
     run = _bank_run(delivery="off", K=2)
     await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
@@ -876,9 +886,14 @@ async def test_delivery_off_delivers_the_neutral_message_and_no_bank_text(
     probes = [c.args[0] for c in bank_gateway.score_next_token.await_args_list]
     assert replies
 
+    neutral = NeutralBank(FIXTURE_NEUTRAL_BANK)
+    neutral_texts = [
+        neutral.text(nid, run.language_condition) for nid in neutral.ids()
+    ]
     for prompt in replies:
-        assert prompt.count(f"A user posted: {run.neutral_message}") == 1
-        assert prompt.count("A user posted:") == 1
+        assert prompt.count("A user posted:") == run.N
+        shown = sum(prompt.count(f"A user posted: {t}") for t in neutral_texts)
+        assert shown == run.N
 
     bank = BankManager(FIXTURE_BANK)
     bank_texts = [
@@ -901,7 +916,9 @@ async def test_delivery_off_remembers_its_rounds(tmp_path, bank_gateway):
     round_one, round_three = replies[: run.M], replies[2 * run.M : 3 * run.M]
     assert all("Earlier in this discussion" not in p for p in round_one)
     assert all(p.count("You replied:") == 2 for p in round_three)
-    assert all(p.count("You read:") == 2 for p in round_three)
+    # One "You read:" line per post, so two remembered rounds of N posts each
+    # give 2 x N lines -- the same shape a treatment arm's memory has.
+    assert all(p.count("You read:") == 2 * run.N for p in round_three)
 
 
 async def test_delivery_off_still_resolves_neighbours_and_posts(tmp_path, bank_gateway):
@@ -1867,10 +1884,10 @@ async def test_a_resumed_delivery_off_run_matches_an_uninterrupted_one(
 ):
     """The control resumes like any other arm.
 
-    It has history to rebuild now -- every round reads the neutral message
-    and writes a reply -- and the reserved id in items_read has to render
-    from run.neutral_message rather than through the bank, which would raise
-    a KeyError on it.
+    It has history to rebuild now -- every round reads N neutral messages
+    and writes a reply -- and those ids in items_read have to render through
+    the neutral bank rather than the argument bank, which would raise a
+    KeyError on them.
     """
     run = dict(delivery="off", K=4)
     bank_gateway.generate.return_value = make_backend_response(text="a reply")
@@ -1897,20 +1914,37 @@ async def test_a_resumed_delivery_off_run_matches_an_uninterrupted_one(
     assert signature(crashed) == signature(clean)
 
 
-async def test_a_resumed_delivery_off_run_remembers_the_neutral_message(
+async def test_a_resumed_delivery_off_run_remembers_its_neutral_messages(
     tmp_path, bank_gateway
 ):
-    """Rebuilt from the log, where the round is recorded as the reserved id."""
+    """Rebuilt from the log, where the round is recorded as N neutral ids.
+
+    Those have to render back through the neutral bank: looking them up in
+    the argument bank would raise, and a fallback would rebuild the control's
+    history out of arguments it never read.
+    """
+    from sandbox.bank_manager import NeutralBank
+
     run = _bank_run(delivery="off", K=2)
     bank_gateway.generate.return_value = make_backend_response(text="a reply")
     await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
 
+    live = {
+        (r.turn, r.speaker_agent_id): r.items_read for r in _bank_rows(tmp_path)
+    }
     resumed = build_orchestrator(run, bank_gateway, runs_dir=tmp_path)
     resumed._restore_bank_state(run.K)
 
+    neutral = NeutralBank(FIXTURE_NEUTRAL_BANK)
     assert len(resumed._history) == run.M
-    for remembered in resumed._history.values():
-        assert [r.posts_read for r in remembered] == [[run.neutral_message]] * 2
+    for agent_id, remembered in resumed._history.items():
+        assert len(remembered) == run.K
+        for turn, round_memory in enumerate(remembered, start=1):
+            assert round_memory.posts_read == [
+                neutral.text(nid, run.language_condition)
+                for nid in live[(turn, agent_id)]
+            ]
+            assert len(round_memory.posts_read) == run.N
 
 
 # --- resume: rows from uncommitted rounds are ignored --------------------
@@ -2190,3 +2224,80 @@ async def test_the_generated_regime_sends_no_seed(tmp_path, mock_gateway):
     assert mock_gateway.generate.await_count == run.M * run.K
     for call in mock_gateway.generate.await_args_list:
         assert "seed" not in call.kwargs
+
+
+async def test_a_delivery_off_resume_ignores_a_partially_written_round(
+    tmp_path, bank_gateway
+):
+    """The Fix 4 case, for the control arm.
+
+    The control has history to rebuild now -- every round reads N messages
+    and writes a reply -- so a half-written round left on disk with no
+    checkpoint can put those agents' remembered rounds one step ahead of
+    everyone else's, exactly as it could for a treatment arm. The neutral IDs
+    in those rows also have to render back through the neutral bank; looking
+    them up in the argument bank would raise.
+    """
+    off = dict(delivery="off", K=4)
+    bank_gateway.generate.return_value = make_backend_response(text="a steady reply")
+    clean = tmp_path / "clean"
+    await build_orchestrator(_bank_run(**off), bank_gateway, runs_dir=clean).run()
+
+    # Rounds 1 and 2 complete, round 3 fails for everyone, so the checkpoint
+    # is at 2 and no round-3 row was written.
+    crashed = tmp_path / "crashed"
+    _crash_in_round_replying(bank_gateway, 3, "a steady reply")
+    with pytest.raises(RuntimeError):
+        await build_orchestrator(_bank_run(**off), bank_gateway, runs_dir=crashed).run()
+    assert CheckpointManager(crashed).load("bank_run").last_completed_turn == 2
+
+    # Stage half of round 3's rows, as a crash between two write_interaction
+    # calls would have left them.
+    log = crashed / "bank_run" / "interactions.jsonl"
+    partial = [
+        row.model_dump_json()
+        for row in sorted(_bank_rows(clean), key=lambda r: (r.turn, r.speaker_agent_id))
+        if row.turn == 3
+    ][:4]
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(partial) + "\n")
+    assert len([r for r in _bank_rows(crashed) if r.turn == 3]) == 4
+
+    bank_gateway.generate.side_effect = None
+    bank_gateway.generate.return_value = make_backend_response(text="a steady reply")
+    await build_orchestrator(_bank_run(**off), bank_gateway, runs_dir=crashed).run()
+
+    assert _deduped_signature(_bank_rows(crashed)) == _deduped_signature(_bank_rows(clean))
+
+
+async def test_a_delivery_off_resume_rebuilds_the_feed_it_read(tmp_path, bank_gateway):
+    """Over four rounds, the rebuilt history holds N posts a round, rendered
+    from the neutral bank rather than the argument bank."""
+    off = dict(delivery="off", K=4)
+    bank_gateway.generate.return_value = make_backend_response(text="a steady reply")
+    await build_orchestrator(_bank_run(**off), bank_gateway, runs_dir=tmp_path).run()
+
+    run = _bank_run(**off)
+    resumed = build_orchestrator(run, bank_gateway, runs_dir=tmp_path)
+    resumed._restore_bank_state(run.K)
+
+    assert len(resumed._history) == run.M
+    for remembered in resumed._history.values():
+        assert len(remembered) == run.K
+        assert all(len(r.posts_read) == run.N for r in remembered)
+
+
+async def test_a_delivery_on_run_cannot_rebuild_a_delivery_off_log(
+    tmp_path, bank_gateway
+):
+    """A neutral ID in the log has no reading in the argument bank. It raises
+    rather than falling back, since a fallback would rebuild a history out of
+    text the agent never read."""
+    off = _bank_run(delivery="off", K=2)
+    bank_gateway.generate.return_value = make_backend_response(text="a reply")
+    await build_orchestrator(off, bank_gateway, runs_dir=tmp_path).run()
+
+    # Same run directory, delivery on: no neutral bank is wired at all.
+    on = build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path)
+    with pytest.raises(ValueError, match="neutral bank"):
+        on._restore_bank_state(2)
