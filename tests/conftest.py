@@ -109,3 +109,48 @@ def bank_gateway(mock_gateway):
         text="The cost point is the one that lands for me."
     )
     return mock_gateway
+
+
+# --- RQ1 single-exposure scripts ------------------------------------------
+
+
+# The per-language base config the three single-reader scripts read, as
+# scripts/make_rq1_configs.py writes it. Built from the shipped smoke config
+# rather than a handwritten dict, so a schema change breaks these tests
+# instead of leaving them testing a config shape nothing produces.
+SINGLE_PROBE_QUESTIONS = {
+    "english": "Should city bus fares stay subsidised?",
+    "hinglish": "Kya city bus fares subsidised rehne chahiye?",
+    "romanized_hindi": "Kya shahar ki bus kiraya subsidy jaari rehni chahiye?",
+    "hindi": "क्या शहर की बस किराया सब्सिडी जारी रहनी चाहिए?",
+}
+
+
+@pytest.fixture
+def single_configs(tmp_path):
+    """Writes single_<language>.yaml for the arms a test asks for.
+
+    Points at the 4-entry persona pool and the fixture banks, so a whole
+    sweep is a handful of trials and a test can assert an exact count.
+    """
+
+    def _write(languages=("english",), **overrides):
+        from pathlib import Path
+
+        raw = yaml.safe_load(Path("configs/rq1/smoke.yaml").read_text())
+        raw["persona_pool_id"] = "test_pool"
+        raw["neutral_bank_path"] = "data/bank/test_neutral.csv"
+        raw.update(overrides)
+        config_dir = tmp_path / "configs"
+        config_dir.mkdir(exist_ok=True)
+        for language in languages:
+            arm = dict(raw)
+            arm["run_id"] = f"single_{language}"
+            arm["language_condition"] = language
+            arm["probe_question"] = SINGLE_PROBE_QUESTIONS[language]
+            (config_dir / f"single_{language}.yaml").write_text(
+                yaml.safe_dump(arm, allow_unicode=True), encoding="utf-8"
+            )
+        return config_dir
+
+    return _write

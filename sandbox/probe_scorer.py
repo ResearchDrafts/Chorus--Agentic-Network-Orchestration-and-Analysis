@@ -21,6 +21,7 @@ what to do with a failure.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 # The 7-point Likert scale the probe question is written against. Fixed rather
@@ -132,6 +133,97 @@ def score(top_logprobs: list[tuple[str, float]], mass_floor: float) -> ProbeScor
     )
 
 
+@dataclass(frozen=True)
+class ChoiceScore:
+    """One forced-choice read: a distribution over a short list of answers.
+
+    The comprehension check's counterpart to ProbeScore. There is no mean and
+    no side here -- the answers are letters, not scale points, so the only
+    questions are which one the model picked and how much of its probability
+    went to answering at all.
+
+    choices   the answers scored, in the order `dist` reports them
+    dist      their probabilities, renormalized to sum to 1
+    mass      how much of the RAW next-token distribution landed on them,
+              before renormalizing -- the same quality measure ProbeScore.mass
+              is, and what the floor is checked against
+    """
+
+    choices: tuple[str, ...]
+    dist: list[float]
+    mass: float
+
+    def probability(self, choice: str) -> float:
+        """The renormalized probability of one choice.
+
+        Raises for a choice that was not scored, rather than returning 0: a
+        caller asking about "C" when the prompt offered "A" and "B" has a bug,
+        and a 0 would read as "the model never said C", which is a different
+        and much more interesting claim.
+        """
+        try:
+            index = self.choices.index(choice)
+        except ValueError:
+            raise KeyError(
+                f"{choice!r} was not one of the scored choices {list(self.choices)}"
+            ) from None
+        return self.dist[index]
+
+
+def score_choices(
+    top_logprobs: list[tuple[str, float]],
+    choices: Sequence[str],
+    mass_floor: float,
+) -> ChoiceScore:
+    """Aggregates next-token probability over a short list of literal answers.
+
+    Same contract as `score`, with a different support. Tokens whose stripped
+    text equals one of `choices` count; everything else is ignored but still
+    counts against the floor, since it is probability the model spent not
+    answering. Duplicates are summed, so a tokenizer that emits " A" and one
+    that emits "A" are read the same way.
+
+    **The match is case-sensitive, and that is deliberate.** The prompt asks
+    for a capital letter, and folding case would also fold in the "a" that
+    begins an English sentence -- so a model answering "a post like this
+    supports..." would be scored as having chosen A with high confidence. That
+    is precisely the off-support probability the mass floor exists to catch,
+    and case folding would launder it into an answer.
+
+    Raises ProbeMassTooLow below the floor, for `score`'s reason: renormalizing
+    whatever scraps happened to be in range would manufacture a confident
+    answer out of a model that was answering some other question, and the
+    fabricated value would look exactly like a real one in the output.
+    """
+    if not (0.0 < mass_floor <= 1.0):
+        raise ValueError(f"mass_floor must be in (0, 1], got {mass_floor}")
+    if len(choices) < 2:
+        raise ValueError(f"need at least 2 choices to score, got {list(choices)}")
+    if len(set(choices)) != len(choices):
+        raise ValueError(f"choices must be distinct, got {list(choices)}")
+    if not top_logprobs:
+        # Distinct from "the mass was too low", exactly as in `score`: there
+        # was nothing to read at all, which is a gateway or wiring problem
+        # rather than a model that answered off-support.
+        raise ValueError("top_logprobs is empty: nothing to score")
+
+    on_support = {choice: 0.0 for choice in choices}
+    for token, logprob in top_logprobs:
+        stripped = token.strip()
+        if stripped in on_support:
+            on_support[stripped] += math.exp(logprob)
+
+    mass = sum(on_support.values())
+    if mass < mass_floor or mass <= 0.0:
+        raise ProbeMassTooLow(mass, mass_floor)
+
+    return ChoiceScore(
+        choices=tuple(choices),
+        dist=[on_support[choice] / mass for choice in choices],
+        mass=mass,
+    )
+
+
 def _side_confidence(mean: float, dist: list[float]) -> float:
     """How concentrated the read is on the side the mean falls on.
 
@@ -157,3 +249,23 @@ def _side_confidence(mean: float, dist: list[float]) -> float:
     if mean < MIDPOINT:
         return below
     return at
+
+
+def to_x(mean: float) -> float:
+    """The probe mean on the signed scale every RQ1 model is specified in.
+
+    -1 is the con pole, 0 undecided, +1 the pro pole:
+
+        x = (mean - 4) / 3
+
+    One definition, in one place. It was computed inline in export_csv.py and
+    would have been recomputed in the calibration script, the E1 script and
+    three analysis modules -- six chances to get the divisor or the sign
+    wrong, and a sign error here does not raise, it reverses every reported
+    effect. Importing it is cheap; rederiving it is not.
+
+    Takes the raw mean rather than a ProbeScore so the analysis tier, which
+    reads a float out of a CSV column and has no ProbeScore to hand, uses the
+    same function the live scripts do.
+    """
+    return (mean - MIDPOINT) / (max(SCALE_POINTS) - MIDPOINT)

@@ -15,6 +15,29 @@ from pathlib import Path
 from sandbox.models import Agent, ExperimentRun, Interaction, StanceRecord
 
 
+def load_persona_pool(persona_pool_id: str) -> list[str]:
+    """The personas in one pool, in file order.
+
+    Despite the .jsonl extension these files are plain text, one free-text
+    description per line -- nothing parses JSON here.
+
+    Module-level rather than a method because the single-exposure scripts
+    (sandbox/single_exposure.py) need the same pool the population is drawn
+    from, and read it by persona index. A second reader would be a second
+    chance to disagree about blank lines or ordering, and a persona index
+    that meant different things in a calibration run and in a campaign run
+    would silently mismatch the two.
+
+    Raises FileNotFoundError if the pool file is missing -- config_loader
+    already validated the path for a run, but this does not trust that check
+    blindly, and a script may be pointed at a pool no config mentions.
+    """
+    path = Path("data/personas") / f"{persona_pool_id}.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(f"persona pool vanished: {path}")
+    return [line.strip() for line in path.read_text().splitlines() if line.strip()]
+
+
 def agent_id_for(index: int) -> str:
     """The canonical agent id for a population index.
 
@@ -67,13 +90,9 @@ class AgentManager:
         return agents
 
     def _load_persona_pool(self) -> list[str]:
-        """Raises FileNotFoundError if the pool file is missing -- should
-        never happen here since config_loader already validated this path
-        exists, but this does not trust that check blindly."""
-        path = Path("data/personas") / f"{self._run.persona_pool_id}.jsonl"
-        if not path.exists():
-            raise FileNotFoundError(f"persona pool vanished: {path}")
-        return [line.strip() for line in path.read_text().splitlines() if line.strip()]
+        """Delegates to load_persona_pool, so the population and the
+        single-exposure scripts read one pool the same way."""
+        return load_persona_pool(self._run.persona_pool_id)
 
     def _draw_initial_stance(self) -> float:
         # Uniform draw across the configured finite stance scale. Uses

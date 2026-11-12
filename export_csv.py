@@ -57,6 +57,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from sandbox.probe_scorer import to_x
+
 # Joined onto every interaction row so the CSV is groupable without a second file.
 # Set by _derive_exposure_columns, and listed here so the three are
 # declared in one place: a bank-free campaign still exports all three, empty.
@@ -177,8 +179,10 @@ def _derive_bank_columns(df: pd.DataFrame) -> pd.DataFrame:
     # x is the stance on a signed [-1, 1] scale centred on the 7-point
     # midpoint: -1 is the con pole, 0 undecided, +1 the pro pole. Every RQ1
     # model is specified in these units, and computing it in each analysis
-    # instead would mean four chances to get the sign or the divisor wrong.
-    df["x"] = (probe_mean - 4) / 3
+    # instead would mean four chances to get the sign or the divisor wrong --
+    # so the arithmetic lives in probe_scorer.to_x and is imported here, by
+    # the single-exposure scripts and by the analysis tier alike.
+    df["x"] = probe_mean.map(to_x)
 
     # Read once, before the column is overwritten below: counting from the
     # joined string would count zero for every row, since the strings are no
