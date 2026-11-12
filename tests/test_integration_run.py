@@ -591,10 +591,12 @@ async def test_a_matched_set_differs_only_in_the_rendering(
             "hi.yaml",
             language_condition="hindi",
             probe_question="क्या शहर की बस किराया सब्सिडी जारी रहनी चाहिए?",
-            stance_low_label="किराये पर सब्सिडी नहीं होनी चाहिए",
-            stance_high_label="किराये पर सब्सिडी जारी रहनी चाहिए",
+            # The anchor labels are NOT overridden: they stay English in
+            # every arm, because they are rendered inside English sentences.
+            # Only the bank text, the question and the directive vary.
         )
     )
+    assert hindi.stance_low_label == english.stance_low_label
     assert english.seed == hindi.seed
 
     en_dir, hi_dir = tmp_path / "en", tmp_path / "hi"
