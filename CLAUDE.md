@@ -44,10 +44,11 @@ The system is built as strict dependency tiers — a module only depends on tier
 - **Tier 0** (`sandbox/models.py`, `config_loader.py`, `seed_manager.py`, `cost_tracker.py`, `rate_limiter.py`, `probe_scorer.py`) — pure data models and standalone infrastructure. No dependency on each other. `probe_scorer.py` is pure arithmetic: top-logprobs in, `(mean, dist, mass, side_conf)` out, no I/O. (`config_loader` imports `bank_manager` *inside a function* to validate a bank at load time, deliberately, so the tier direction is not inverted at module scope.)
 - **Tier 1** (`agent_manager.py`, `meme_pool_manager.py`, `model_gateway.py`, `bank_manager.py`) — depends only on Tier 0.
 - **Tier 2** (`interaction_engine.py`, `stance_parser.py`, `vision_fallback.py`, `logging_writer.py`, `checkpoint_manager.py`) — depends only on Tier 0/1, and not on each other. Built and unit-tested.
-- **Tier 3** (`simulation_orchestrator.py`, `prompt_builder.py`) — the integration tier; the only module that calls every other component, wiring them into the per-turn loop. Built and unit-tested, including one end-to-end integration test. `prompt_builder.py` has no design in either `Architecture-docs/` file: it was designed from scratch, and the reasoning lives in its module docstring and in git history.
-- **Post-hoc analysis** (**not yet built**: `stance_regression.py`, `coherence_scorer.py`, `codemix_ratio_tracker.py`, `sentiment_proxy.py`, `bimodality_analysis.py`, `embedding_cluster.py`) — offline, operates only on a completed run's `interactions.jsonl`, no orchestrator dependency.
+- **Tier 3** (`simulation_orchestrator.py`, `prompt_builder.py`, `single_exposure.py`) — the integration tier; the only modules that call every other component. `prompt_builder.py` has no design in either `Architecture-docs/` file: it was designed from scratch, and the reasoning lives in its module docstring and in git history. `single_exposure.py` is the shared machinery for the three single-reader scripts in `scripts/`; it depends on the same tiers the orchestrator does and on nothing the orchestrator imports.
+- **`analysis/`** (`metrics.py`, `stats.py`, `figures.py`) — RQ1's post-hoc analysis, offline, reading only a completed run's `interactions.jsonl`, `graph_edges.csv` and `run_config.json` plus the single-reader scripts' own output. Nothing the orchestrator touches imports it, so a change to an analysis cannot change a dataset.
+- **RQ2/RQ3 analysis** (**not yet built**: `coherence_scorer.py`, `codemix_ratio_tracker.py`, `sentiment_proxy.py`, `bimodality_analysis.py`, `embedding_cluster.py`) — the parts of the original design that are not RQ1's.
 
-Tier status drifts in prose. Don't trust a status line here; check the filesystem and `python -m pytest`. Current: **17 modules, 660 passing tests, Tiers 0-3 complete**, including the RQ1 bank regime. The post-hoc analysis tier is the only unbuilt part of the original design.
+Tier status drifts in prose. Don't trust a status line here; check the filesystem and `python -m pytest`. Current: **18 `sandbox/` modules plus `analysis/` (3) and `scripts/` (5), 869 passing tests, Tiers 0-3 and RQ1's analysis complete**. RQ2's and RQ3's own analysis modules are the unbuilt part of the original design.
 
 Check `Architecture-docs/full_design_doc.md` §3 for the authoritative module-by-module LLD (function signatures, error-handling contract, concurrency notes) before implementing any new module — the design doc's sample code is the spec each module is a direct port of, not just background reading. `Architecture-docs/sandbox_hld.md` carries the HLD, the schema derivation, and three passes of adversarial self-critique with numbered Fixes (Fix A–N) — when a design decision seems arbitrary (e.g. why the memory window is turn-count-based, not token-budget-based; why the same RNG seed is deliberately reused across language conditions), it's almost certainly resolving a specific numbered Fix in that document, not an accident.
 
@@ -81,6 +82,73 @@ Config Loader → `ExperimentRun` → Agent Manager creates M agents → for eac
 
 The frozen-snapshot ordering guarantee (neighbor and meme-injection resolution both complete *before* any dispatch begins, so no agent's turn-t output is ever read by another agent's turn-t neighbor/meme resolution) is load-bearing for reproducibility and is referred to throughout the docs and codebase as "Fix F."
 
+### The RQ1 pipeline (`scripts/` and `analysis/`)
+
+Eight commands, each consuming what the one before it wrote; README's "The
+RQ1 pipeline" lists them with their outputs. Three things about them are
+load-bearing enough to restate here:
+
+**The three single-reader scripts use the same instrument the network runs
+use.** `calibrate_tau.py`, `run_e1.py` and `check_comprehension.py` build
+every prompt with `PromptBuilder`, score every probe with
+`probe_scorer.score`, and take every setting from one `ExperimentRun` YAML per
+language (`single_<language>.yaml`, written by `make_rq1_configs.py`). There
+is **no second copy of any prompt text in `scripts/`** — a τ measured against
+a slightly different probe prompt is a threshold for a different instrument,
+and nothing downstream could tell. The shared machinery is
+`sandbox/single_exposure.py`.
+
+A single-exposure trial is numbered like a one-round run: the baseline probe
+is **turn 0** (the orchestrator's own round number for a reading taken before
+anything is read) and the exposure, reply and second probe are **turn 1**. So
+one `prompts.jsonl` audit reads a calibration sweep and a campaign alike.
+
+**Every script is resumable and every failure is a row.** Each appends one
+JSONL row per trial as it finishes and skips keys already carrying
+`status="ok"`; a probe below the mass floor or a fatal gateway error produces
+`status="failed"` with null readings, never a dropped trial. An invisible
+failure in a τ calibration shifts the threshold every later result is judged
+against. A `ContextLengthExceeded` is fatal for the script, as it is for a
+run.
+
+**`x = (probe_mean - 4) / 3` is defined once**, in `probe_scorer.to_x`, and
+imported by `export_csv.py`, the scripts and the analysis tier. A sign error
+there does not raise — it reverses every reported effect.
+
+Three definitions the analysis turns on, each pinned by a test in
+`tests/test_analysis_metrics.py`:
+
+- **`sign(x)` makes 0 its own sign.** A move off the midpoint is a change of
+  sign, and (if it clears τ) a flip. Folding 0 in with a pole would make the
+  midpoint arbitrarily belong to one side and turn half of the undecided
+  population's movements into hardening.
+- **`var_x` is the population variance (ddof=0).** These agents are the
+  population; the inferential step happens later, across runs, in
+  `analysis/stats.py`. ddof=1 is also undefined at n=1, which is real when
+  every probe but one failed in a round.
+- **An undefined round-to-round change is not within ε.** A null
+  assortativity at either end of a step makes that step uncomputable, and
+  "we cannot tell whether this moved" is not evidence that it stopped —
+  otherwise a run would become stationary precisely because its population
+  collapsed to one position.
+
+Two refusals rather than defaults: a run whose language has no τ raises
+`MissingTau` (classifying an uncalibrated arm against another arm's noise
+would look exactly like a calibrated result), and `analysis.metrics` requires
+exactly one of `--epsilon` and `--epsilon-from-e4` (a default tolerance would
+set the threshold for every reported `t_stationary`).
+
+In `analysis/stats.py`, the unit of analysis differs between the two halves
+and that is deliberate: **E1 is trial-level** (mixed model, random intercept
+per item, variance component for persona) while **the networks are run-level,
+paired by seed** — a hundred agents inside one run are not a hundred
+independent observations. Holm is applied **within families**, not across
+everything, so one question's tests are not penalised for another being asked
+alongside; `p_raw` survives in every row so a reader who wants a different
+family can recompute. A non-converged `MixedLM` is never reported as a
+result; the fallback is cluster-robust OLS and `e1_model.txt` leads with
+which one you have.
+
 ### Key design invariants (apply when touching any module)
 
 - **Never silently clamp or default.** Invalid `alpha`/`N`, out-of-range parsed stances, unrecognized model ids, missing pricing entries — all raise immediately (`ValueError`/custom exceptions) rather than being coerced to a safe value. This is a deliberate, repeated pattern across the codebase (see Fix I: "never fabricate a placeholder stance") — don't add fallback/default behavior to "fix" a raised error unless the design doc says to.
@@ -100,10 +168,13 @@ The frozen-snapshot ordering guarantee (neighbor and meme-injection resolution b
 - `data/personas/*.jsonl` — **despite the extension, these are plain text, one free-text persona description per line, not JSON**. `agent_manager.py`'s `_load_persona_pool()` just strips and splits lines; nothing parses JSON. Don't add `model_validate_json()` here.
 - `test_pool.jsonl` variants are small (3-4 entries) fixtures for tests; `pool_20.jsonl`/`empty_pool.jsonl` exist for specific acceptance-criteria tests (cycling, empty-pool error path). All three images referenced by `data/memes/test_pool.jsonl` now exist; two were missing until a pre-flight audit found the meme path would raise `FileNotFoundError` for roughly two sampled memes in three.
 - `data/bank/*.csv` — argument banks: `item_id, arg_id, strength, side, english, hinglish, romanized_hindi, hindi`. The language column names ARE `language_condition` values, so a header typo makes the bank unrenderable for that arm. Validated in full at config load (not merely stat()ed), reporting every problem at once: a bank with one empty Hindi cell would otherwise run to completion and produce an arm in which one argument was silently blank, which is indistinguishable in the output from an argument that failed to persuade. `test_bank.csv` is a 4-item fixture, both sides, both strengths, and deliberately **digit-free in every language column** so the prompt audit can tell a leaked position number from the argument's own text. An item id starting with `neutral_` is rejected: that prefix names the neutral bank's messages.
+- An item ID listed in a run's `exclude_items_path` is dropped from the bank **after** validation, never instead of it: an excluded item does not make an empty Hindi cell in its row acceptable, because the next run may not exclude it. An unknown ID, a duplicate, or an exclusion that leaves a side empty all raise, and `config_loader` applies the list too, so a bank-emptying exclusion is a config error rather than something found on the first round of a paid run. `scripts/check_comprehension.py` writes `failed_items.txt` in exactly that format (comments and blank lines are skipped) — and deliberately does **not** read it, since it is the check that decides what belongs in it.
 - `data/bank/test_neutral.csv` — the **neutral bank**, read by the `delivery: off` control: `neutral_id, english, hinglish, romanized_hindi, hindi`, every id prefixed `neutral_`, no side and no strength. Validated in full at config load like the argument bank, and digit-free for the same reason. One column (`items_read`) carries both kinds of id, so the prefix is how a reader — and `_remembered_text` on the resume path — knows which file to look an id up in.
 - `pricing_table.yaml` — hand-maintained `provider -> model_id -> modality -> {prompt_per_1k, completion_per_1k}`, keyed by the BARE model id (`ModelGateway._bare_model_id` strips the provider prefix). `CostTracker` raises on a missing entry *after* the call completes, so every model actually used must appear here. The openai/anthropic/google entries remain illustrative placeholders; the `hosted_vllm`, `ollama`, `groq` and `cerebras` entries are genuinely 0.0, since self-hosted compute is billed by the hour rather than per token.
 - `export_csv.py` columns added for the bank regime, beyond the probe and prompt-length ones: `reply_seed` (the seed that reply call carried; empty at round 0 and on a generated row), `shadow_items` (semicolon-joined, the bank items a control row's neutral messages stood in for, in `items_read`'s order — this is what lines a control row up against the treatment row it is a baseline for), and three **exposure counts** over this agent's earlier rounds in this run: `n_repeat_reads`, `max_prior_exposures` and `n_distinct_items_read_so_far`. The three count only bank rows that are valid for analysis and not superseded duplicates; round 0 is `0, 0, 0` (it genuinely read nothing), while a failed row, a superseded duplicate and a generated row are null and contribute nothing. Both repeat columns are counted against the state *before* the round, so an item two neighbours both posted is one round's stimulus rather than a repeat of itself — though it still counts twice toward later rounds. `derive()` must run after `mark_duplicates()` or it raises.
 - `runs/` — output directory, one run = one subdirectory (`run_config.json`, `interactions.jsonl`, `agents_final.jsonl`, `checkpoints/`, plus `prompts.jsonl` when `log_prompts` is on and `graph_edges.csv` under the graph strategy), per `logging_writer.py`. Gitignored. Completed campaigns are kept under `outputs/` instead; `outputs/chorus_run1/` holds the first real dataset, 8 runs and 8,000 interactions.
+- `configs/rq1/base.yaml` — the campaign template `scripts/make_rq1_configs.py` expands, and a complete valid config on its own. Every smoke value in it is marked PLACEHOLDER. Six fields are overwritten by the generator (`run_id`, `language_condition`, `probe_question`, `delivery`, `seed`, `trial_number`); `neutral_bank_path` is kept on the `e4_*` and `single_*` files and dropped from the `e3_*` ones, which never read it. `configs/rq1/probe_questions.yaml` holds the one piece of prompt text that is translated, with no default and no fallback.
+- `configs/rq1/campaign/` — generated, and checked in. A test asserts it is byte-identical to what the current generator and base config produce: a base edited without re-running the generator would leave a campaign nobody could reproduce. `scripts/run_campaign.py` discovers runs from the **filenames** rather than from `manifest.csv`, so a config added or removed by hand changes what runs.
 - `configs/` — run configs. `example_run.yaml` documents every field; `smoke_test.yaml` (vLLM) and `smoke_local.yaml` (Ollama on Apple Silicon) are minimal five-call runs for checking plumbing. `configs/rq1/` holds the bank-regime smoke configs: one per language arm (`smoke.yaml`, `smoke_hinglish.yaml`, `smoke_romanized_hindi.yaml`, `smoke_hindi.yaml`, all sharing a seed) plus `smoke_off.yaml` (the `delivery: off` control, which also needs a `neutral_bank_path`). The four arms differ in exactly `run_id`, `language_condition` and `probe_question`; a test in `tests/test_config_loader.py` pins that, including that the anchor labels stay English. **`delivery` must be quoted in YAML** — YAML 1.1 reads bare `off` as the boolean `False`, so an unquoted value is rejected by the schema; a test asserts every shipped config parses it as a string.
 
 ### Where to look before starting new work
@@ -129,6 +200,28 @@ python run_simulation.py configs/smoke_test.yaml             # a real run
 python export_csv.py outputs/chorus_run1                     # runs -> analysis CSVs
 ```
 
+The whole RQ1 pipeline, in order (README's "The RQ1 pipeline" has the outputs
+of each):
+
+```bash
+python scripts/make_rq1_configs.py --seeds 5 --out configs/rq1/campaign
+python scripts/check_comprehension.py --runs-dir runs
+python scripts/calibrate_tau.py --runs-dir runs
+python scripts/run_e1.py --runs-dir runs
+python scripts/run_campaign.py configs/rq1/campaign --runs-dir runs
+python -m analysis.metrics --runs-dir runs --tau runs/calibration/tau.json \
+        --out results/ --epsilon-from-e4
+python -m analysis.stats --e1 runs/e1/trials.jsonl --results results/ --out results/
+python -m analysis.figures --results results/ --e1 runs/e1/trials.jsonl \
+        --calibration runs/calibration/ --out results/figures/
+```
+
+Each script runs both as `python scripts/x.py` and as an import (`from scripts
+import run_e1`), which is how the tests drive the real entry points against a
+mocked gateway. `scripts/` is deliberately excluded from
+`[tool.setuptools.packages.find]`: these are scripts run from a checkout, not
+library code.
+
 `notebooks/chorus_colab.ipynb` runs a full campaign on a Colab GPU: vLLM
 serving, the topic x language grid, and the combining step. Inference is
 self-hosted on open-weight models, so a campaign costs GPU time and nothing
@@ -141,10 +234,16 @@ depends on, so `--runs-dir` must point at mounted Drive.
 
 ### Known gaps
 
-- **Post-hoc analysis does not exist.** No regression, bimodality, code-mix
-  index, sentiment, embedding, or network analysis, and no τ calibration or
-  assortativity computation over `graph_edges.csv`. `export_csv.py` is the only
-  analysis tooling.
+- **RQ2's and RQ3's analyses do not exist.** No coherence scoring, code-mix
+  index, sentiment, bimodality or embedding analysis. RQ1's analysis is built
+  (`analysis/`), including τ calibration and assortativity over
+  `graph_edges.csv`.
+- **Nothing has been run against a real server yet.** Every script and every
+  analysis module is exercised against the mocked gateway in the test suite
+  and against output the orchestrator produced under it; none has met a
+  live vLLM endpoint, so the operational numbers (how long a matched set
+  takes, what `probe_mass` a real model puts on the scale, whether the four
+  arms' τ are comparable) are unknown.
 - **One language per run.** The bank regime renders a delivered post in its
   *sender's* language while the resume path renders remembered posts in the
   *run's* language, since the log records item IDs and not who posted each one.

@@ -57,15 +57,16 @@ The frozen-snapshot ordering guarantee, that neighbor and meme-injection resolut
 
 | Tier | Modules | Status |
 |---|---|---|
-| **Tier 0** | `models.py`, `config_loader.py`, `seed_manager.py`, `cost_tracker.py`, `rate_limiter.py` | Built and tested |
-| **Tier 1** | `agent_manager.py`, `meme_pool_manager.py`, `model_gateway.py` | Built and tested |
+| **Tier 0** | `models.py`, `config_loader.py`, `seed_manager.py`, `cost_tracker.py`, `rate_limiter.py`, `probe_scorer.py` | Built and tested |
+| **Tier 1** | `agent_manager.py`, `meme_pool_manager.py`, `model_gateway.py`, `bank_manager.py` | Built and tested |
 | **Tier 2** | `interaction_engine.py`, `stance_parser.py`, `vision_fallback.py`, `logging_writer.py`, `checkpoint_manager.py` | Built and tested |
-| **Tier 3** | `simulation_orchestrator.py`, `prompt_builder.py` | Built and tested |
-| **Post-hoc analysis** | `stance_regression.py`, `coherence_scorer.py`, `codemix_ratio_tracker.py`, `sentiment_proxy.py`, `bimodality_analysis.py`, `embedding_cluster.py` | Planned, not yet implemented |
+| **Tier 3** | `simulation_orchestrator.py`, `prompt_builder.py`, `single_exposure.py` | Built and tested |
+| **RQ1 analysis** | `analysis/metrics.py`, `analysis/stats.py`, `analysis/figures.py` | Built and tested |
+| **RQ2/RQ3 analysis** | `coherence_scorer.py`, `codemix_ratio_tracker.py`, `sentiment_proxy.py`, `bimodality_analysis.py`, `embedding_cluster.py` | Planned, not yet implemented |
 
-Tier 3 is the integration layer, the only module that calls every other component and wires them into the per-turn loop. **The system runs end to end today**; what remains unbuilt is offline analysis and a CLI.
+Tier 3 is the integration layer, the only module that calls every other component and wires them into the per-turn loop. **The system runs end to end today**, from config to figures; what remains unbuilt is RQ2's and RQ3's own analyses and a CLI.
 
-Post-hoc analysis operates only on a completed run's `interactions.jsonl` and has no dependency on the orchestrator, so that tier is unblocked and can be built against data from a real run.
+Every analysis module operates only on a completed run's output and has no dependency on the orchestrator, so a change to an analysis cannot change a dataset.
 
 ### Key design invariants
 
@@ -157,6 +158,77 @@ Output lands in `runs/{run_id}/`: `interactions.jsonl` (one record per agent-tur
 
 > **Before a real campaign:** validate that your chosen model produces consistent Hinglish, on roughly 100 calls. If it cannot, RQ1 measures model deficiency rather than a language effect, and no post-hoc analysis repairs that.
 
+## The RQ1 pipeline
+
+RQ1 asks whether the language or script of a post changes how much it moves an
+LLM reader. It runs in the **bank regime**: posts come from a fixed,
+pre-translated argument CSV, so the argument is identical across the four
+language arms and only its rendering varies, and stance is read by a separate
+probe call whose next-token logprobs over the digits 1-7 give a continuous
+value. No number ever reaches an agent.
+
+Eight commands, in order. Each consumes what the one before it wrote, and
+every one is resumable -- re-running skips what already finished.
+
+```bash
+# 1. Expand one base config into the campaign's matched sets.
+#    -> configs/rq1/campaign/{e3,e4}_<language>_ws_s<NN>.yaml,
+#       single_<language>.yaml, manifest.csv
+#    The seed is shared by all four languages AND by E3 and E4 of one seed
+#    index, which is what makes an arm comparable to its control.
+python scripts/make_rq1_configs.py --seeds 5 --out configs/rq1/campaign
+
+# 2. Can the model read each bank item, in each language, at all?
+#    -> runs/comprehension/{trials.jsonl,summary.csv,failed_items.txt}
+#    failed_items.txt is a valid exclude_items_path exactly as written.
+python scripts/check_comprehension.py --runs-dir runs
+
+# 3. How far does a reading move when nothing persuasive happened?
+#    -> runs/calibration/{trials.jsonl,tau.json}
+#    Every later "flip" is a claim against this, per language.
+python scripts/calibrate_tau.py --runs-dir runs
+
+# 4. Does one argument move one reader, and does that depend on language?
+#    -> runs/e1/trials.jsonl   (--with-reply writes runs/e1_with_reply/)
+python scripts/run_e1.py --runs-dir runs
+
+# 5. The network runs, in matched-set order: seed index, experiment, language.
+#    -> runs/<run_id>/{interactions,prompts,agents_final}.jsonl, graph_edges.csv
+#    A campaign cut short leaves complete matched sets.
+python scripts/run_campaign.py configs/rq1/campaign --runs-dir runs
+
+# 6. Runs -> three tidy tables, every change classified against its arm's tau.
+#    -> results/{probes,round_metrics,run_metrics}.csv
+python -m analysis.metrics --runs-dir runs --tau runs/calibration/tau.json \
+        --out results/ --epsilon-from-e4
+
+# 7. The models and the planned contrasts.
+#    -> results/{e1_model.txt,e1_contrasts.csv,network_contrasts.csv}
+python -m analysis.stats --e1 runs/e1/trials.jsonl --results results/ --out results/
+
+# 8. Four figures, as PDF and PNG.
+#    -> results/figures/{trajectories,e1_toward,tau,instrument}.{pdf,png}
+python -m analysis.figures --results results/ --e1 runs/e1/trials.jsonl \
+        --calibration runs/calibration/ --out results/figures/
+```
+
+[`notebooks/chorus_colab.ipynb`](notebooks/chorus_colab.ipynb) Part 3 runs all
+eight on a Colab GPU, with the output under mounted Drive.
+
+**Edit `configs/rq1/base.yaml` first.** It is a complete, valid bank-regime
+config on its own (`python run_simulation.py configs/rq1/base.yaml --dry-run`),
+but every value marked PLACEHOLDER is a smoke-test value: `M`, `N`, `K`, the
+graph settings, the bank paths, the persona pool, the model and
+`max_concurrency` all need setting before a real campaign.
+
+Three things to check before believing any result: the **manipulation check**
+reported first in `e1_model.txt` (a strong argument must move an English
+reader further than a weak one, or the bank's own strength labels do not
+describe the stimuli); the **comprehension pass rate** per language; and
+**n** in every row of `network_contrasts.csv` -- below six seeds the smallest
+attainable two-sided Wilcoxon p value is above 0.05, so no row could have been
+significant however large the effect.
+
 ## Testing
 
 ```bash
@@ -175,9 +247,12 @@ python -m pytest tests/test_agent_manager.py::test_name -q
 ## Repository layout
 
 ```
-sandbox/              Package source (15 modules), organized by dependency tier
-tests/                17 test modules, including one end-to-end integration test
+sandbox/              Package source (18 modules), organized by dependency tier
+analysis/             RQ1 post-hoc analysis: metrics, statistics, figures
+scripts/              RQ1 command-line entry points (see "The RQ1 pipeline")
+tests/                Test modules, including end-to-end integration tests
 configs/              Run configs; example_run.yaml documents every field
+configs/rq1/          Bank-regime configs; base.yaml is the campaign template
 notebooks/            Colab notebook for running a full campaign on a GPU
 outputs/              Collected campaign data, one directory per campaign
 configs/              Run configs; example_run.yaml is the worked example
