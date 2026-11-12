@@ -156,10 +156,18 @@ def _bank_errors(raw: dict) -> list[str]:
     # dependency direction the whole architecture is built on.
     from sandbox.bank_manager import BankManager, BankValidationError
 
+    # The exclusion list is applied here too, so a typo'd or bank-emptying
+    # exclusion is a config error rather than something discovered on the
+    # first round of a paid run.
+    exclude = raw.get("exclude_items_path")
+    exclude_path = (
+        Path(exclude) if isinstance(exclude, str) and exclude.strip() else None
+    )
     try:
-        BankManager(path)
+        BankManager(path, exclude_items_path=exclude_path)
     except BankValidationError as e:
-        return [f"bank {bank_path}: {problem}" for problem in e.errors]
+        label = f"bank {bank_path}" if e.path == path else f"exclusions {exclude}"
+        return [f"{label}: {problem}" for problem in e.errors]
     return []
 
 

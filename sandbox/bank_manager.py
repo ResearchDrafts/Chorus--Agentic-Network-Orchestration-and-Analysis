@@ -77,9 +77,13 @@ class BankManager:
     authority on what was actually posted.
     """
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, exclude_items_path: str | Path | None = None):
         self._path = Path(path)
         self._items = _load_and_validate(self._path)
+        if exclude_items_path is not None:
+            self._items = _without_excluded(
+                self._items, Path(exclude_items_path)
+            )
         self._by_side: dict[str, list[str]] = {
             side: sorted(
                 item_id for item_id, row in self._items.items() if row["side"] == side
@@ -314,6 +318,67 @@ class NeutralBank:
                 f"{item_id!r} is not in the argument bank, so it has no stand-in"
             )
         return self._ids[sorted(all_item_ids).index(item_id) % len(self._ids)]
+
+
+def read_exclusions(path: Path) -> list[str]:
+    """The item IDs in an exclusion file, in file order, duplicates kept.
+
+    One ID per line; blank lines and "#" comments are skipped, so the file the
+    comprehension check writes -- which carries a comment header saying what
+    failed and why -- can be fed straight back into `exclude_items_path`.
+
+    Duplicates are not collapsed here, deliberately: the caller reports them
+    as a problem rather than silently accepting a list that says the same
+    thing twice, which is usually a sign that two files were concatenated.
+    """
+    if not path.exists():
+        raise BankValidationError(path, [f"exclusion file not found: {path}"])
+    out: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.split("#", 1)[0].strip()
+        if stripped:
+            out.append(stripped)
+    return out
+
+
+def _without_excluded(
+    items: dict[str, dict[str, str]], exclude_path: Path
+) -> dict[str, dict[str, str]]:
+    """`items` minus the IDs in `exclude_path`, or a listed set of problems.
+
+    Three ways this raises, all of them for the same reason -- an exclusion
+    that did not do what the config asked must not pass silently:
+
+    * an unknown ID. A typo'd exclusion leaves the item in the bank, which is
+      the opposite of what was asked and leaves no trace in the output.
+    * a duplicate. Usually two concatenated lists, and worth seeing.
+    * an empty side. `pick` raises for a side with no items the first time an
+      agent lands on it, which is mid-run and per-agent; a bank that cannot
+      represent one side of the argument is a config error, and the whole
+      point of excluding incomprehensible items is to be left with a bank the
+      experiment can still run on.
+
+    Every problem is reported at once, like the rest of this module.
+    """
+    wanted = read_exclusions(exclude_path)
+    errors: list[str] = []
+    for item_id in sorted(set(wanted)):
+        if item_id not in items:
+            errors.append(f"unknown item_id {item_id!r}: not in the argument bank")
+    for item_id in sorted({i for i in wanted if wanted.count(i) > 1}):
+        errors.append(f"duplicate item_id {item_id!r} in the exclusion list")
+
+    kept = {k: v for k, v in items.items() if k not in set(wanted)}
+    for side in SIDES:
+        if not any(row["side"] == side for row in kept.values()):
+            errors.append(
+                f"excluding these items leaves no {side!r} items: a bank that "
+                "cannot represent one side of the argument cannot run"
+            )
+
+    if errors:
+        raise BankValidationError(exclude_path, errors)
+    return kept
 
 
 def _load_and_validate_neutral(path: Path) -> dict[str, dict[str, str]]:

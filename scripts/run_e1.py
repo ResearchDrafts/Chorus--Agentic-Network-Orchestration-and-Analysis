@@ -324,7 +324,11 @@ async def main_async(args: argparse.Namespace) -> int:
         harness = SingleReaderHarness(run, out_dir)
         await run_language(
             harness,
-            BankManager(run.bank_path),
+            # Honours exclude_items_path, so an E1 sweep re-run after the
+            # comprehension check drops the items no arm could read -- a
+            # language effect measured on an item nobody understood is a
+            # comprehension failure wearing a persuasion effect's clothes.
+            BankManager(run.bank_path, exclude_items_path=run.exclude_items_path),
             personas_for(run),
             args.leans,
             store,

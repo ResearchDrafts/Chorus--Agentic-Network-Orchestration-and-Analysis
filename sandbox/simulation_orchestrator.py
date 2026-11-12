@@ -1308,7 +1308,16 @@ def build_orchestrator(
         seeds=seeds,
         cost_tracker=cost_tracker,
         runs_dir=runs_dir,
-        bank=BankManager(run.bank_path) if run.regime == "bank" else None,
+        # exclude_items_path is None in every config that does not set it, so
+        # this changes nothing for an existing run. It is passed here because
+        # a field the schema accepts and the wiring drops is worse than one
+        # that does not exist: run_config.json would record an exclusion the
+        # run did not apply.
+        bank=(
+            BankManager(run.bank_path, exclude_items_path=run.exclude_items_path)
+            if run.regime == "bank"
+            else None
+        ),
         neutral_bank=(
             NeutralBank(run.neutral_bank_path)
             if run.regime == "bank" and run.delivery == "off"

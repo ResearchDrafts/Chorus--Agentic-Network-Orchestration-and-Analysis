@@ -375,6 +375,21 @@ class ExperimentRun(BaseModel):
     # every treatment effect is measured against.
     neutral_bank_path: str | None = None
 
+    # Item IDs to drop from the argument bank, one per line (blank lines and
+    # "#" comments skipped). What the comprehension check writes to
+    # comprehension/failed_items.txt, so the file it produces can be fed
+    # straight back in here.
+    #
+    # Exclusion happens AFTER validation, not instead of it: an item being
+    # excluded does not make an empty Hindi cell in its row acceptable, since
+    # the next run may not exclude it. And an unknown ID here raises rather
+    # than being ignored -- a typo'd exclusion silently keeps the item in the
+    # bank, which is the opposite of what the config asked for and leaves no
+    # trace in the output.
+    #
+    # None means exclude nothing, which is every existing config.
+    exclude_items_path: str | None = None
+
     # The 7-point survey question, written in this run's language. Asked in a
     # fresh context that never enters the agent's history, so the agent is
     # never told its own position as a number and never anchors on one.
