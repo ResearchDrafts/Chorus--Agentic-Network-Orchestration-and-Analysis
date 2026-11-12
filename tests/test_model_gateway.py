@@ -806,3 +806,83 @@ async def test_all_probes_complete_under_the_cap(rate_limiter, cost_tracker):
 
     assert len(results) == 40
     assert all(r.top_logprobs for r in results)
+
+
+# --- the reply seed -------------------------------------------------------
+
+
+async def test_a_seed_reaches_the_provider(rate_limiter, cost_tracker):
+    """The whole point: the server's sampler becomes a function of the run's
+    seed, so a rerun reproduces the replies and therefore the probe readings
+    taken from the history they build."""
+    gateway = ModelGateway("gpt-4o", rate_limiter, cost_tracker)
+    mock_completion = AsyncMock(return_value=_make_raw_response())
+
+    with patch("litellm.acompletion", mock_completion):
+        await gateway.generate("p", seed=123)
+
+    assert mock_completion.await_args.kwargs["seed"] == 123
+
+
+async def test_no_seed_sends_no_seed_key(rate_limiter, cost_tracker):
+    """Absent, not null. A generated-regime call must be byte-identical to
+    what it was before the parameter existed, and a provider that treats a
+    missing key and an explicit null differently would otherwise change that
+    regime's traffic for a reason it never asked for."""
+    gateway = ModelGateway("gpt-4o", rate_limiter, cost_tracker)
+    mock_completion = AsyncMock(return_value=_make_raw_response())
+
+    with patch("litellm.acompletion", mock_completion):
+        await gateway.generate("p")
+
+    assert "seed" not in mock_completion.await_args.kwargs
+
+
+async def test_a_transient_retry_reuses_the_same_seed(rate_limiter, cost_tracker):
+    """A retry is the same request, not a new one. Re-sampling on a 429 would
+    hand back a different reply for a failure the agent had no part in, and a
+    rerun that hit no 429 would then diverge from one that did."""
+    gateway = ModelGateway("gpt-4o", rate_limiter, cost_tracker)
+    mock_completion = AsyncMock(
+        side_effect=[
+            litellm.exceptions.RateLimitError(
+                message="rate limited", llm_provider="openai", model="gpt-4o"
+            ),
+            _make_raw_response(text="after the retry"),
+        ]
+    )
+
+    with patch("litellm.acompletion", mock_completion):
+        response = await gateway.generate("p", seed=777)
+
+    assert response.text == "after the retry"
+    assert mock_completion.await_count == 2
+    assert [c.kwargs["seed"] for c in mock_completion.await_args_list] == [777, 777]
+
+
+async def test_the_probe_call_is_never_seeded(rate_limiter, cost_tracker):
+    """score_next_token runs at temperature 0 and samples nothing worth
+    pinning; a seed there would suggest the measurement had a draw in it."""
+    gateway = ModelGateway("gpt-4o", rate_limiter, cost_tracker)
+    raw = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="5"),
+                logprobs=SimpleNamespace(
+                    content=[
+                        SimpleNamespace(
+                            top_logprobs=[SimpleNamespace(token="5", logprob=-0.1)]
+                        )
+                    ]
+                ),
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=1),
+    )
+    raw.model_dump = lambda: {}
+    mock_completion = AsyncMock(return_value=raw)
+
+    with patch("litellm.acompletion", mock_completion):
+        await gateway.score_next_token("p")
+
+    assert "seed" not in mock_completion.await_args.kwargs

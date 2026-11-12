@@ -155,6 +155,8 @@ class ModelGateway:
         prompt_text: str,
         image: bytes | None = None,
         temperature: float = 0.7,
+        *,
+        seed: int | None = None,
     ) -> BackendResponse:
         """
         Normalizes a call to self.model_backend_id via LiteLLM. If image
@@ -163,6 +165,13 @@ class ModelGateway:
         (via vision_fallback.py) BEFORE calling this method -- this method
         does not itself perform the fallback substitution, it only
         reports supports_vision so callers can decide.
+
+        `seed` is passed to the provider so its sampler is a function of the
+        run's seed rather than of the hour. None means the key is not sent at
+        all, not sent as null: a generated-regime call must be byte-identical
+        to what it was before this parameter existed, since a provider that
+        treats an absent seed and a null seed differently would make the two
+        regimes' traffic differ for no reason either of them chose.
         """
         provider = self._provider_name()
         # The semaphore is held across the whole call, retries included, so an
@@ -171,7 +180,9 @@ class ModelGateway:
         async with self._concurrency_slot():
             await self._rate_limiter.acquire(provider)
             try:
-                response = await self._call_with_retry(prompt_text, image, temperature)
+                response = await self._call_with_retry(
+                    prompt_text, image, temperature, seed
+                )
             finally:
                 self._rate_limiter.release(provider)
 
@@ -280,15 +291,25 @@ class ModelGateway:
         reraise=True,
     )
     async def _call_with_retry(
-        self, prompt_text: str, image: bytes | None, temperature: float
+        self,
+        prompt_text: str,
+        image: bytes | None,
+        temperature: float,
+        seed: int | None = None,
     ) -> BackendResponse:
         started = time.monotonic()
+        # Built rather than passed inline so an absent seed sends no key.
+        # A retry re-enters this method with the same argument, so the second
+        # attempt is the same request: a retry that re-sampled would hand back
+        # a different reply for a failure the agent had no part in.
+        extra = {} if seed is None else {"seed": seed}
         try:
             raw = await litellm.acompletion(
                 model=self.model_backend_id,
                 messages=_build_messages(prompt_text, image),
                 temperature=temperature,
                 api_base=self._api_base,
+                **extra,
             )
         except litellm.exceptions.RateLimitError as e:
             raise TransientGatewayError(str(e)) from e

@@ -2038,3 +2038,155 @@ async def test_rerunning_a_completed_bank_run_is_a_no_op(tmp_path, bank_gateway)
     assert len(_bank_rows(tmp_path)) == rows_before
     assert bank_gateway.generate.await_count == replies_before
     assert bank_gateway.score_next_token.await_count == probes_before
+
+
+# --- the reply seed -------------------------------------------------------
+
+
+def _reply_seeds(bank_gateway) -> list[int | None]:
+    """The seed each generate() call carried, in dispatch order."""
+    return [c.kwargs.get("seed") for c in bank_gateway.generate.await_args_list]
+
+
+async def test_every_reply_call_carries_a_seed(tmp_path, bank_gateway):
+    """Without one, a rerun of the same config samples different replies, and
+    the probe reads a stance out of a history made of them."""
+    run = _bank_run(K=2)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    seeds = _reply_seeds(bank_gateway)
+    assert len(seeds) == run.M * run.K
+    assert all(isinstance(s, int) for s in seeds)
+    # One per (turn, agent), so no two calls in a round sample alike.
+    assert len(set(seeds)) == len(seeds)
+
+
+async def test_a_runs_probe_calls_are_never_seeded(tmp_path, bank_gateway):
+    """It runs at temperature 0. A seed there would suggest the measurement
+    had a draw in it."""
+    await build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path).run()
+
+    for call in bank_gateway.score_next_token.await_args_list:
+        assert "seed" not in call.kwargs
+
+
+async def test_two_language_arms_send_identical_reply_seeds(tmp_path, bank_gateway):
+    """A matched set differs in the text of the prompt, not in how the reply
+    to it was sampled. A seed that varied by arm would leave the four arms
+    drawing differently from the one comparison RQ1 reports."""
+    logged, dispatched = {}, {}
+    for condition in ("english", "hinglish", "romanized_hindi", "hindi"):
+        bank_gateway.generate.reset_mock()
+        # seed 1000: its WS(8, 4, 0.1) graph starves no node, which the
+        # constructor checks before anything is dispatched.
+        run = _bank_run(K=2, seed=1000, language_condition=condition,
+                        run_id=f"bank_{condition}")
+        await build_orchestrator(
+            run, bank_gateway, runs_dir=tmp_path / condition
+        ).run()
+        logged[condition] = {
+            (r.turn, r.speaker_agent_id): r.reply_seed
+            for r in _bank_rows(tmp_path / condition, f"bank_{condition}")
+        }
+        # The seeds the calls carried, in dispatch order, not only the ones
+        # the rows recorded: the two agree, and it is the first that matters.
+        dispatched[condition] = _reply_seeds(bank_gateway)
+
+    assert logged["english"]
+    assert len(dispatched["english"]) == 8 * 2
+    for condition in logged:
+        assert logged[condition] == logged["english"], condition
+        assert dispatched[condition] == dispatched["english"], condition
+
+    # Not vacuous: the seeds are not a constant the comparison would pass
+    # against regardless. A different base seed moves every one of them.
+    other = _bank_run(K=2, seed=1001, run_id="bank_other")
+    bank_gateway.generate.reset_mock()
+    await build_orchestrator(other, bank_gateway, runs_dir=tmp_path / "other").run()
+    assert _reply_seeds(bank_gateway) != dispatched["english"]
+
+
+async def test_a_resumed_round_sends_the_seed_it_would_have_sent(tmp_path, bank_gateway):
+    """The seed is a function of (seed, turn, agent) and of nothing about
+    when the call happened, so the rerun of an interrupted round is the same
+    request an uninterrupted run would have made."""
+    run = dict(K=4)
+    bank_gateway.generate.return_value = make_backend_response(text="a steady reply")
+    clean = tmp_path / "clean"
+    await build_orchestrator(_bank_run(**run), bank_gateway, runs_dir=clean).run()
+    clean_seeds = {
+        (r.turn, r.speaker_agent_id): r.reply_seed for r in _bank_rows(clean)
+    }
+
+    crashed = tmp_path / "crashed"
+    _crash_in_round_replying(bank_gateway, 3, "a steady reply")
+    with pytest.raises(RuntimeError):
+        await build_orchestrator(_bank_run(**run), bank_gateway, runs_dir=crashed).run()
+
+    bank_gateway.generate.side_effect = None
+    bank_gateway.generate.return_value = make_backend_response(text="a steady reply")
+    bank_gateway.generate.reset_mock()
+    await build_orchestrator(_bank_run(**run), bank_gateway, runs_dir=crashed).run()
+
+    resumed_seeds = {
+        (r.turn, r.speaker_agent_id): r.reply_seed for r in _bank_rows(crashed)
+    }
+    assert resumed_seeds == clean_seeds
+    # And round 3, the one that was re-run, really was dispatched again with
+    # the seed the clean run used.
+    rerun = {
+        (3, agent): seed for (turn, agent), seed in clean_seeds.items() if turn == 3
+    }
+    assert set(_reply_seeds(bank_gateway)) >= set(rerun.values())
+
+
+async def test_round_zero_rows_carry_no_reply_seed(tmp_path, bank_gateway):
+    """Nothing replied there, so there is no seed to record. A number would
+    claim a call that was never made."""
+    run = _bank_run(K=2)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    for row in _bank_rows(tmp_path):
+        if row.turn == 0:
+            assert row.reply_seed is None
+        else:
+            assert isinstance(row.reply_seed, int)
+
+
+async def test_a_failed_row_still_records_its_reply_seed(tmp_path, bank_gateway):
+    """The call was made and was seeded; only its result was unusable."""
+    bank_gateway.generate.side_effect = FatalGatewayError("bad key")
+    run = _bank_run(M=4, N=1, K=1, graph_degree=2)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    failed = [r for r in _bank_rows(tmp_path) if r.turn == 1]
+    assert len(failed) == run.M
+    assert all(r.api_call_status == "failed_logged_null" for r in failed)
+    assert all(isinstance(r.reply_seed, int) for r in failed)
+
+
+async def test_prompt_lines_carry_the_seed_on_replies_only(tmp_path, bank_gateway):
+    run = _bank_run(M=4, N=1, K=2, graph_degree=2)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    rows = _prompt_rows(tmp_path)
+    replies = [r for r in rows if r.call == "reply"]
+    probes = [r for r in rows if r.call == "probe"]
+    assert len(replies) == run.M * run.K
+    assert all(isinstance(r.seed, int) for r in replies)
+    assert all(r.seed is None for r in probes)
+
+    # The logged seed is the one the row records, for the same call.
+    by_key = {(r.turn, r.speaker_agent_id): r.reply_seed for r in _bank_rows(tmp_path)}
+    for line in replies:
+        assert line.seed == by_key[(line.turn, line.agent_id)]
+
+
+async def test_the_generated_regime_sends_no_seed(tmp_path, mock_gateway):
+    """Out of scope by design: its behaviour and its traffic are unchanged."""
+    run = _run(M=3, N=1, K=2)
+    await build_orchestrator(run, mock_gateway, runs_dir=tmp_path).run()
+
+    assert mock_gateway.generate.await_count == run.M * run.K
+    for call in mock_gateway.generate.await_args_list:
+        assert "seed" not in call.kwargs

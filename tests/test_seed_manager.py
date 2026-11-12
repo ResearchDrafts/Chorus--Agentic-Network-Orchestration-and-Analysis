@@ -167,6 +167,68 @@ def test_sender_rng_rejects_an_unknown_purpose_and_an_empty_sender():
         seeds.sender_rng("argument", "")
 
 
+# --- the reply seed, handed to the provider -------------------------------
+
+
+def test_call_seed_is_a_pure_function_of_seed_purpose_turn_and_agent():
+    """Two SeedManagers on one seed hand the server the same number.
+
+    This is what makes a rerun reproduce a run's replies, and therefore the
+    probe readings taken from the history those replies build.
+    """
+    a, b = SeedManager(2026), SeedManager(2026)
+    for turn in (0, 1, 2, 17):
+        for agent in ("agent_0000", "agent_0042"):
+            assert a.call_seed("reply", turn, agent) == b.call_seed("reply", turn, agent)
+    assert SeedManager(2026).call_seed("reply", 1, "agent_0000") != SeedManager(
+        2027
+    ).call_seed("reply", 1, "agent_0000")
+
+
+def test_call_seed_differs_across_turns_agents_and_purposes():
+    """A seed shared between two calls would make them the same draw.
+
+    Two agents handed one seed in the same round sample the same way from
+    different prompts, and one agent handed one seed in every round samples
+    identically every round, which looks like an agent that stopped moving.
+    """
+    seeds = SeedManager(42)
+    values = {
+        (purpose, turn, agent): seeds.call_seed(purpose, turn, agent)
+        for purpose in ("reply", "argument", "probe")
+        for turn in (0, 1, 2, 3)
+        for agent in ("agent_0000", "agent_0001", "agent_0002")
+    }
+    assert len(set(values.values())) == len(values)
+
+
+def test_call_seed_fits_in_a_non_negative_int32():
+    """The range every OpenAI-compatible server accepts. A wider integer is
+    rejected by some and silently truncated by others, which would make the
+    seed a function of the provider as well as of the run."""
+    seeds = SeedManager(7)
+    for turn in range(0, 50):
+        value = seeds.call_seed("reply", turn, f"agent_{turn:04d}")
+        assert isinstance(value, int)
+        assert 0 <= value <= 2**31 - 1
+
+
+def test_call_seed_rejects_an_unknown_purpose_a_negative_turn_and_an_empty_agent():
+    seeds = SeedManager(1)
+    with pytest.raises(ValueError, match="unknown rng purpose"):
+        seeds.call_seed("persona", 1, "agent_0000")
+    with pytest.raises(ValueError, match="turn must be"):
+        seeds.call_seed("reply", -1, "agent_0000")
+    with pytest.raises(ValueError, match="non-empty"):
+        seeds.call_seed("reply", 1, "")
+
+
+def test_call_seed_accepts_round_zero():
+    """turn_rng requires turn >= 1; this does not. Round 0 is a real turn
+    number in the bank regime, and asking for its seed is not an error even
+    though nothing replies there."""
+    assert isinstance(SeedManager(3).call_seed("reply", 0, "agent_0000"), int)
+
 # --- RQ1: variety must never enter a seed --------------------------------
 
 
@@ -205,3 +267,11 @@ def test_two_runs_differing_only_in_language_draw_identically():
         a = english.sender_rng("argument", sender)
         b = hindi.sender_rng("argument", sender)
         assert [a.random() for _ in range(5)] == [b.random() for _ in range(5)]
+
+    # And the seed each arm hands the provider for a reply, or the arms would
+    # differ in how their replies were sampled as well as in their text.
+    for turn in (0, 1, 2):
+        for agent in ("agent_0000", "agent_0007"):
+            assert english.call_seed("reply", turn, agent) == hindi.call_seed(
+                "reply", turn, agent
+            )

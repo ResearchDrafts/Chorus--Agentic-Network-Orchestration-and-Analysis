@@ -7,16 +7,18 @@ two ExperimentRun configs (e.g. an English-condition run and a Hinglish-
 condition run in a combined sweep) reproduces identical meme-injection and
 neighbor-sampling draw sequences across both runs.
 
-Three derived families sit alongside those: turn_rng (per purpose and
-turn), sender_rng (per purpose and sender, with no turn in it) and
-graph_seed (per run). None of them takes language, topic, trial or any other
-condition as input. That omission is the point: it is what makes two runs
-differing only in language draw identically, and it is load-bearing for
+Four derived families sit alongside those: turn_rng (per purpose and
+turn), sender_rng (per purpose and sender, with no turn in it), graph_seed
+(per run) and call_seed (per purpose, turn and agent, handed to the provider
+rather than drawn from here). None of them takes language, topic, trial or
+any other condition as input. That omission is the point: it is what makes
+two runs differing only in language draw identically, and it is load-bearing for
 RQ1's matched sets, where the same argument must reach the same reader in
 four languages.
 
 This feature makes no claim about LLM sampling determinism -- provider
-APIs do not guarantee deterministic output even at temperature=0.
+APIs do not guarantee deterministic output even at temperature=0, and
+call_seed asks a server to be reproducible rather than making it so.
 """
 
 from __future__ import annotations
@@ -85,11 +87,17 @@ class SeedManager:
     # path; the probe itself runs at temperature 0 and consumes nothing today,
     # and the purpose exists so that adding one later cannot be done by
     # borrowing another purpose's stream.
+    #
+    # "reply" seeds the provider's own sampler for a bank-regime reply call.
+    # It is not drawn from here as a stream -- call_seed derives an integer
+    # the server is handed -- but it lives in this table so a reply seed
+    # cannot collide with any other purpose's derivation.
     _TURN_PURPOSES = {
         "neighbor": 1_000_003,
         "meme": 2_000_003,
         "argument": 3_000_003,
         "probe": 4_000_003,
+        "reply": 5_000_003,
     }
 
     def turn_rng(self, purpose: str, turn: int) -> random.Random:
@@ -143,3 +151,43 @@ class SeedManager:
         if not sender_id:
             raise ValueError("sender_id must be a non-empty string")
         return random.Random(f"{self._base_seed}|{purpose}|{sender_id}")
+
+    def call_seed(self, purpose: str, turn: int, agent_id: str) -> int:
+        """An integer seed to hand the provider for one (purpose, turn, agent).
+
+        Not a stream. The other derivations here produce a random.Random this
+        process draws from; this produces a number that leaves the process and
+        is given to the server, so that the server's own sampler is a function
+        of the run's seed rather than of whatever it felt like that afternoon.
+        Without it a bank reply is sampled afresh on every rerun, and since the
+        probe reads the stance out of a history made of those replies, a rerun
+        of the same config produced different readings and the run was
+        reproducible in its draws and in nothing else.
+
+        Keyed by a string, like sender_rng and for the same reason: an agent id
+        is not a number, and arithmetic on hash(agent_id) is neither stable
+        across processes nor collision-free, while random.Random seeds a string
+        through SHA-512.
+
+        31 bits, so the result is a non-negative int32. That is the range every
+        OpenAI-compatible server accepts; a wider integer is rejected by some
+        and silently truncated by others, which would make the seed a function
+        of the provider as well as of the run.
+
+        Language, topic and trial are absent, as everywhere else in this class.
+        Two runs differing only in language_condition therefore send the same
+        seed for the same (turn, agent), so the four arms of a matched set
+        differ in the text of the prompt and not in how it was sampled.
+        """
+        if purpose not in self._TURN_PURPOSES:
+            raise ValueError(f"unknown rng purpose: {purpose!r}")
+        # turn >= 0, not >= 1 as turn_rng requires: round 0 is a real turn
+        # number in the bank regime, and a caller asking for its seed should
+        # get one rather than an error about a round that exists.
+        if turn < 0:
+            raise ValueError(f"turn must be >= 0, got {turn}")
+        if not agent_id:
+            raise ValueError("agent_id must be a non-empty string")
+        return random.Random(
+            f"{self._base_seed}|{purpose}|{turn}|{agent_id}"
+        ).getrandbits(31)

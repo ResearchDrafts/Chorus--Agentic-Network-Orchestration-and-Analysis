@@ -10,8 +10,8 @@ Produces three files:
                     The main dataset. Bank-regime runs additionally carry
                     probe_mean, x (the stance rescaled to [-1, 1] about the
                     midpoint), probe_mass, side_conf, items_read,
-                    n_items_read, posted_item_id, is_round_zero and the two
-                    per-call prompt lengths; these are present but
+                    n_items_read, posted_item_id, is_round_zero, reply_seed
+                    and the two per-call prompt lengths; these are present but
                     empty for generated-regime rows, so a campaign mixing
                     both regimes still exports as one table.
   agents.csv        one row per agent per run: final stance, total movement,
@@ -195,6 +195,11 @@ def _derive_bank_columns(df: pd.DataFrame) -> pd.DataFrame:
     # int column cannot hold.
     df["reply_prompt_tokens"] = _column(df, "reply_prompt_tokens", float)
     df["probe_prompt_tokens"] = _column(df, "probe_prompt_tokens", float)
+    # The seed the reply call carried. Float for the same reason the two
+    # above are: a pre-seed dataset has no such column and lands here as NaN,
+    # which an int column cannot hold. Empty at round 0 and on a generated
+    # row, neither of which sends a seed.
+    df["reply_seed"] = _column(df, "reply_seed", float)
     return df
 
 

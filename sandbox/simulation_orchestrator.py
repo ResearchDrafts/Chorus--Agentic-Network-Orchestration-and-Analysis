@@ -704,6 +704,15 @@ class SimulationOrchestrator:
             return self._neutral_text()
         return self._bank.text(item_id, self._run.language_condition)
 
+    def _reply_seed(self, turn: int, agent_id: str) -> int:
+        """The seed this agent's reply call carries in this round.
+
+        One derivation site, read by the dispatch helper that sends it and by
+        the row builder that records it. Pure, so calling it twice costs
+        nothing and the logged number cannot drift from the sent one.
+        """
+        return self._seeds.call_seed("reply", turn, agent_id)
+
     async def _dispatch_reply(
         self,
         agent: Agent,
@@ -717,6 +726,12 @@ class SimulationOrchestrator:
         reply is not parsed for anything, so there is no malformed output to
         re-ask for. Transient provider errors are still retried inside the
         gateway.
+
+        The call carries a seed, so the provider's sampler is a function of
+        the run's seed. Without it a rerun of one config produced different
+        replies, and since the probe reads a stance out of the history those
+        replies build, different readings too: the run was reproducible in
+        every draw this process makes and in nothing the server does.
         """
         built = self._prompt_builder.build_discussion_prompt(
             agent,
@@ -725,18 +740,24 @@ class SimulationOrchestrator:
             delivered_posts=delivered_texts,
             history_rounds=history,
         )
+        seed = self._reply_seed(turn, agent.agent_id)
         try:
             response = await self._gateway.generate(
-                built.text, image=None, temperature=self._run.temperature
+                built.text,
+                image=None,
+                temperature=self._run.temperature,
+                seed=seed,
             )
         except FatalGatewayError:
-            await self._log_prompt(turn, agent.agent_id, "reply", built.text, "")
+            await self._log_prompt(
+                turn, agent.agent_id, "reply", built.text, "", seed=seed
+            )
             return None
         # Logged before the budget check, so the prompt that broke the
         # ceiling is on disk to be read rather than only described in the
         # exception.
         await self._log_prompt(
-            turn, agent.agent_id, "reply", built.text, _reply_text(response)
+            turn, agent.agent_id, "reply", built.text, _reply_text(response), seed=seed
         )
         self._check_prompt_budget(agent.agent_id, turn, "reply", response.prompt_tokens)
         return response
@@ -787,6 +808,7 @@ class SimulationOrchestrator:
         prompt_text: str,
         response_text: str,
         top_logprobs: list[tuple[str, float]] | None = None,
+        seed: int | None = None,
     ) -> None:
         """One line of prompts.jsonl, when run.log_prompts is on.
 
@@ -813,6 +835,7 @@ class SimulationOrchestrator:
                 prompt_text=prompt_text,
                 response_text=response_text,
                 top_logprobs=list(top_logprobs) if top_logprobs else None,
+                seed=seed,
             )
         )
 
@@ -867,6 +890,12 @@ class SimulationOrchestrator:
 
         reply_prompt_tokens = reply.prompt_tokens if reply else 0
         probe_prompt_tokens = probe[0].prompt_tokens if probe else 0
+        # Recorded from the same derivation the call used, on failed rows too:
+        # the reply was dispatched and was seeded whether or not its result
+        # could be applied. None at round 0, where no reply was ever asked for.
+        reply_seed = (
+            None if turn == ROUND_ZERO else self._reply_seed(turn, agent.agent_id)
+        )
         prompt_tokens = reply_prompt_tokens + probe_prompt_tokens
         completion_tokens = (
             (reply.completion_tokens if reply else 0) + (probe[0].completion_tokens if probe else 0)
@@ -895,6 +924,7 @@ class SimulationOrchestrator:
                 side_conf=None,
                 reply_prompt_tokens=reply_prompt_tokens,
                 probe_prompt_tokens=probe_prompt_tokens,
+                reply_seed=reply_seed,
                 prompt_token_count=prompt_tokens,
                 completion_token_count=completion_tokens,
                 model_backend_id=self._run.model_backend_id,
@@ -927,6 +957,7 @@ class SimulationOrchestrator:
             side_conf=reading.side_conf,
             reply_prompt_tokens=reply_prompt_tokens,
             probe_prompt_tokens=probe_prompt_tokens,
+            reply_seed=reply_seed,
             prompt_token_count=prompt_tokens,
             completion_token_count=completion_tokens,
             model_backend_id=self._run.model_backend_id,

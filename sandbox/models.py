@@ -133,6 +133,13 @@ class Interaction(BaseModel):
     # failed call has no reported count.
     reply_prompt_tokens: int = Field(default=0, ge=0)
     probe_prompt_tokens: int = Field(default=0, ge=0)
+    # The seed the reply call carried, so a rerun of this round can be checked
+    # against the row rather than only against the config. Set on every
+    # bank-regime row from round 1 on, failed rows included -- the call was
+    # made and was seeded whether or not its result could be used. None at
+    # round 0, which has no reply, and on every generated-regime row, which
+    # sends no seed.
+    reply_seed: int | None = None
     # The probe result. probe_mean is s-bar, the expected value on 1..7 under
     # the next-token distribution over the digits -- a continuous stance read
     # out of the model rather than a number it was asked to state. None on a
@@ -215,6 +222,12 @@ class PromptRecord(BaseModel):
     # sent, and a failed call is exactly the one worth being able to read.
     response_text: str = ""
     top_logprobs: list[tuple[str, float]] | None = None
+    # The seed sent to the provider for this call. Set on reply lines, None on
+    # probes, which run at temperature 0 and are sent no seed at all. Recorded
+    # rather than left to be re-derived: the point of the seed is that a rerun
+    # reproduces the reply, and that is only checkable against the number the
+    # call actually carried.
+    seed: int | None = None
 
 
 class MemeInjectionConfig(BaseModel):
