@@ -1,0 +1,110 @@
+# RQ1 campaign base config -- the template scripts/make_rq1_configs.py
+# expands into one file per (experiment, language, seed index).
+#
+#   python scripts/make_rq1_configs.py --seeds 5 --out configs/rq1/campaign
+#
+# This is a complete, valid bank-regime ExperimentRun on its own, so it can
+# be checked before it is expanded:
+#
+#   python run_simulation.py configs/rq1/base.yaml --dry-run
+#
+# **Every value marked PLACEHOLDER is a smoke-test value, not a campaign
+# value.** They are deliberately the smoke config's, so that a mistake while
+# wiring the pipeline costs eight agents and three rounds rather than a GPU
+# afternoon. Set them before the real campaign.
+#
+# Five fields are overwritten by the generator and whatever is here is
+# ignored: run_id, language_condition, probe_question, delivery, seed and
+# trial_number. The rest is copied through byte for byte, which is what makes
+# a matched set matched -- four arms differing in exactly the rendering of
+# the text and in nothing else.
+
+run_id: rq1_base           # overwritten: the generator uses the file stem
+rq_target: RQ1_RQ2
+topic: whether city bus fares should stay subsidised
+
+# --- who reads whom ------------------------------------------------------
+# A fixed Watts-Strogatz graph, not stance-based sampling -- the "ws" in a
+# generated filename. Under alpha sampling who an agent reads depends on
+# where it already stands, so a stance effect and a selection effect cannot
+# be separated afterwards.
+neighbor_strategy: graph
+graph_degree: 4            # PLACEHOLDER (smoke). Even, and < M.
+graph_rewire_p: 0.1        # Watts-Strogatz: 0 is a ring, 1 is random
+N: 3                       # PLACEHOLDER (smoke). Neighbours read per round; <= graph_degree.
+
+# alpha is unused under the graph strategy but still required by the schema.
+alpha: 0.5
+
+M: 8                       # PLACEHOLDER (smoke). 100 for the campaign.
+K: 3                       # PLACEHOLDER (smoke). 20+ for the campaign.
+trial_number: 1            # overwritten: the generator uses the seed index
+
+# --- what agents post ----------------------------------------------------
+regime: bank
+bank_path: data/bank/test_bank.csv   # PLACEHOLDER (4-item fixture)
+# Quoted, and it must be: YAML 1.1 reads bare on/off as booleans, so
+# `delivery: off` arrives as False and the schema rejects it.
+delivery: "on"             # overwritten: e3_* gets "on", e4_* gets "off"
+# The side-free messages the E4 control reads, N per round. The generator
+# keeps this on the e4_* and single_* files and drops it from the e3_* ones,
+# which never read it -- so an E3 run_config.json does not record a neutral
+# bank the run never opened.
+neutral_bank_path: data/bank/test_neutral.csv   # PLACEHOLDER (3-message fixture)
+# Item IDs to drop, one per line -- what scripts/check_comprehension.py
+# writes to comprehension/failed_items.txt. Null means drop nothing; point it
+# at that file once the comprehension check has run, so no arm is measured on
+# an item the model could not read.
+exclude_items_path: null
+
+language_condition: english   # overwritten: one file per arm
+probe_question: Should city bus fares stay subsidised?   # overwritten per arm
+
+# --- how stance is measured ---------------------------------------------
+probe_top_logprobs: 20     # all seven digits must be reachable within this many
+probe_mass_floor: 0.5      # below this the read is refused, never renormalised
+
+# Rendered into the probe as "1 means ...", "7 means ...", and into the lean
+# sentence in words. English in every arm, by design: they sit inside English
+# sentences, so translating them would code-mix the frame and leave the four
+# arms holding four subtly different instruments.
+stance_scale: [1, 2, 3, 4, 5, 6, 7]
+stance_low_label: fares should not be subsidised
+stance_high_label: fares should stay subsidised
+
+# Full history, with nothing ever dropped. A window bounds the effect the
+# experiment can measure, because an agent cannot be moved by an argument
+# that has fallen out of its prompt.
+memory_rounds: null
+# A hard ceiling on the prompt length the provider reports. Exceeding it ends
+# the run, naming the agent and the round -- nothing is truncated silently,
+# because a run whose Hinglish arm lost the front of its history and whose
+# English arm did not is confounded exactly where RQ1 measures. Set a little
+# under the served model's context window.
+max_prompt_tokens: 28000   # PLACEHOLDER: for a 32k-context model
+
+# --- backend -------------------------------------------------------------
+# Must match what the server is serving. The bare last segment
+# ("Qwen2.5-7B-Instruct") is the pricing_table.yaml key.
+model_backend_id: hosted_vllm/Qwen/Qwen2.5-7B-Instruct   # PLACEHOLDER
+api_base: http://localhost:8000/v1                       # PLACEHOLDER
+
+persona_pool_id: pool_20   # PLACEHOLDER: 20 personas, so M=100 shares each by five
+
+# Unused in the bank regime, and left disabled.
+meme_injection:
+  enabled: false
+
+seed: 1000                 # overwritten: base_seed + seed index
+temperature: 0.7           # replies only; the probe is always at 0
+
+# Empty on purpose: let all M agents dispatch concurrently so vLLM can batch.
+rate_limits: {}
+
+# Set this to the server's batch size (vLLM's --max-num-seqs). A bank round
+# dispatches M calls twice, so M=100 is 200 connections per round; everything
+# past the batch size sits open waiting and accumulates across rounds until
+# the run dies with "Server disconnected" while the server is healthy.
+max_concurrency: 32        # PLACEHOLDER: match --max-num-seqs
+
+checkpoint_every_n_turns: 1
