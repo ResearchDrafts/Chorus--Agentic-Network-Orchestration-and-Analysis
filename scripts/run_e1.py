@@ -58,6 +58,7 @@ from sandbox.single_exposure import (
     TrialStore,
     add_common_args,
     apply_limit,
+    apply_sample,
     chunked,
     gather_all,
     gather_in_chunks,
@@ -236,9 +237,11 @@ async def run_language(
     store: TrialStore,
     limit: int | None,
     with_reply: bool,
+    sample: int | None = None,
 ) -> int:
     all_trials = apply_limit(
-        trial_grid(bank.all_item_ids(), len(personas), leans), limit
+        apply_sample(trial_grid(bank.all_item_ids(), len(personas), leans), sample),
+        limit,
     )
     done = store.completed()
     pending = [
@@ -334,6 +337,7 @@ async def main_async(args: argparse.Namespace) -> int:
             store,
             args.limit,
             args.with_reply,
+            args.sample,
         )
 
     summarize(load_trials(store.path))

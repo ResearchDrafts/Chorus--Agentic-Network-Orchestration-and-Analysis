@@ -672,7 +672,48 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=None,
         help="run only the first N trials of each arm, for a smoke test",
     )
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        help="run a fixed random sample of N trials of each arm, spread over "
+             "the whole grid (items, personas, leans). Unlike --limit, which "
+             "takes the first N and so covers only the first item or persona",
+    )
     return parser
+
+
+# Fixed, and not the run's seed: the sample names which trials are run, and
+# must name the same ones in all four arms and on every pass. A sample that
+# moved with the seed would give each language a different subset of items.
+SAMPLE_SEED = 20261114
+
+
+def apply_sample(trials: list, sample: int | None) -> list:
+    """A fixed random `sample` of the trials, in their original order.
+
+    `--limit` takes the first N trials, which is what a plumbing check wants
+    and is useless for anything read as a number: with items outermost the
+    first 120 E1 trials are two items, and with personas outermost the first
+    120 calibration trials are one persona. A sample spreads the same budget
+    over the whole grid.
+
+    Random rather than every k-th, because a stride aliases with the inner
+    loops -- a stride equal to the number of personas picks persona 0 every
+    time. The draw depends only on the grid's length, so the four language
+    arms, whose grids are identical, get the same trials, and a second pass
+    names the same ones and resumes rather than widening.
+    """
+    if sample is None:
+        return trials
+    if sample < 1:
+        raise ValueError(f"--sample must be >= 1, got {sample}")
+    if sample >= len(trials):
+        return trials
+    import random
+
+    chosen = sorted(random.Random(SAMPLE_SEED).sample(range(len(trials)), sample))
+    return [trials[i] for i in chosen]
 
 
 def apply_limit(trials: list, limit: int | None) -> list:

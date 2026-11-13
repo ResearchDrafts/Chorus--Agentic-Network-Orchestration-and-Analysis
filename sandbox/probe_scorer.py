@@ -103,7 +103,14 @@ def score(top_logprobs: list[tuple[str, float]], mass_floor: float) -> ProbeScor
         probability = math.exp(logprob)
         total_seen += probability
         stripped = token.strip()
-        if len(stripped) == 1 and stripped.isdigit():
+        # isdecimal, not isdigit: isdigit is also true for superscript and
+        # subscript digits ("\u00b9", "\u2081"), which int() cannot convert, and one
+        # of those merely appearing in the top-k crashed a live run. isdecimal
+        # is true exactly for the characters int() accepts. That includes
+        # digits of other scripts, so a Devanagari "\u096a" counts as 4 -- kept
+        # deliberately: dropping it would lower the probe mass in the Hindi
+        # arm only, which is a per-arm difference in the instrument.
+        if len(stripped) == 1 and stripped.isdecimal():
             point = int(stripped)
             if point in on_scale:
                 on_scale[point] += probability

@@ -101,6 +101,10 @@ class Fit:
     converged: bool
     design_info: patsy.DesignInfo
     note: str
+    # False when the model's standard errors cannot be trusted at all (the
+    # cluster-robust fallback on too few item clusters). The point estimates
+    # are still reported; se, CI and p are written as NaN and nothing rejects.
+    inference_ok: bool = True
 
 
 def load_e1(path: Path) -> pd.DataFrame:
@@ -177,6 +181,24 @@ def fit_e1(frame: pd.DataFrame) -> Fit:
     fallback = smf.ols(E1_FORMULA, frame).fit(
         cov_type="cluster", cov_kwds={"groups": frame["item_id"]}
     )
+    n_clusters = int(frame["item_id"].nunique())
+    if n_clusters < MIN_CLUSTERS_FOR_INFERENCE:
+        return Fit(
+            result=fallback,
+            kind=f"OLS (point estimates only: {n_clusters} item clusters)",
+            converged=False,
+            design_info=design.design_info,
+            inference_ok=False,
+            note=(
+                "THE MIXED MODEL DID NOT CONVERGE and is not reported. The "
+                f"fallback clusters on item, and this sweep has {n_clusters} "
+                f"item(s), fewer than the {MIN_CLUSTERS_FOR_INFERENCE} needed "
+                "for a cluster-robust standard error to mean anything. ONLY "
+                "POINT ESTIMATES ARE REPORTED: se, CI and p are NaN and no "
+                "contrast rejects. Run the sweep over more items."
+                + ("  Warnings during fitting: " + " | ".join(messages) if messages else "")
+            ),
+        )
     return Fit(
         result=fallback,
         kind="OLS (cluster-robust, clustered on item_id)",
@@ -224,9 +246,24 @@ def _average_over_strength(
     return np.mean(rows, axis=0)
 
 
+# Below this many item clusters the cluster-robust fallback reports no
+# inference at all. Its variance estimate is a sum over clusters; with two it
+# collapsed to a standard error of exactly 0 on a live smoke run and every
+# contrast came out as p = 0, "reject". Ten is a floor for refusing outright,
+# not a claim that ten is enough: cluster-robust errors are known to be too
+# small with few clusters, so read anything under about thirty with care.
+MIN_CLUSTERS_FOR_INFERENCE = 10
+
+
 def _contrast(fit: Fit, vector: np.ndarray) -> dict:
     test = fit.result.t_test(np.asarray(vector, dtype=float).reshape(1, -1))
     low, high = np.ravel(test.conf_int())
+    if not fit.inference_ok:
+        nan = float("nan")
+        return {
+            "estimate": float(np.ravel(test.effect)[0]),
+            "se": nan, "statistic": nan, "p_raw": nan, "ci_low": nan, "ci_high": nan,
+        }
     return {
         "estimate": float(np.ravel(test.effect)[0]),
         "se": float(np.ravel(test.sd)[0]),
@@ -331,6 +368,14 @@ def holm_within_families(rows: list[dict], key: str = "family") -> list[dict]:
     out = list(rows)
     for family in sorted({row[key] for row in out}):
         members = [row for row in out if row[key] == family]
+        if any(np.isnan(row["p_raw"]) for row in members):
+            # No inference was possible for this family (see Fit.inference_ok).
+            # Holm over NaN would return NaN flags; say "no rejection" outright.
+            for row in members:
+                row["p_holm"] = float("nan")
+                row["reject_at_05"] = False
+                row["family_size"] = len(members)
+            continue
         reject, adjusted, _, _ = multipletests(
             [row["p_raw"] for row in members], method=HOLM
         )
@@ -597,7 +642,10 @@ def main(argv: list[str] | None = None) -> int:
         rows = e1_contrasts(fit, frame)
         write_e1_model(args.out / "e1_model.txt", fit, frame, rows)
         print(f"\n  {args.out / 'e1_model.txt'}   {fit.kind}")
-        if not fit.converged:
+        if not fit.inference_ok:
+            print("  WARNING: too few items for any inference. Point estimates "
+                  "only; se, CI and p are NaN. Run E1 over more items.")
+        elif not fit.converged:
             print("  WARNING: the mixed model did not converge; "
                   "cluster-robust OLS reported instead")
         write_table(args.out / "e1_contrasts.csv", rows, E1_CONTRAST_COLUMNS)

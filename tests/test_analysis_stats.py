@@ -503,3 +503,89 @@ def test_skip_e1_reports_only_the_network_contrasts(tmp_path):
 def test_a_missing_run_metrics_names_the_stage_that_writes_it(tmp_path):
     with pytest.raises(FileNotFoundError, match="analysis.metrics"):
         st.load_run_metrics(tmp_path)
+
+
+# --- too few item clusters ------------------------------------------------
+
+
+def _force_fallback(monkeypatch):
+    import statsmodels.formula.api as smf
+
+    real_mixedlm = smf.mixedlm
+
+    class NonConverging:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def fit(self, *a, **k):
+            result = self._inner.fit(*a, **k)
+            result.converged = False
+            return result
+
+    monkeypatch.setattr(
+        st.smf, "mixedlm", lambda *a, **k: NonConverging(real_mixedlm(*a, **k))
+    )
+
+
+def test_the_fallback_on_two_items_reports_no_inference(e1_path, monkeypatch):
+    """A live smoke run had two items. The cluster-robust standard error came
+    out as exactly 0, so every contrast was p = 0 and "reject". Point
+    estimates only: nothing here may read as a result."""
+    _force_fallback(monkeypatch)
+    frame = st.load_e1(e1_path(_e1_rows(n_items=2)))
+
+    fit = st.fit_e1(frame)
+    rows = st.e1_contrasts(fit, frame)
+
+    assert fit.inference_ok is False
+    assert "point estimates only" in fit.kind
+    assert "2 item" in fit.note
+    for row in rows:
+        assert np.isfinite(row["estimate"])
+        for column in ("se", "statistic", "p_raw", "p_holm", "ci_low", "ci_high"):
+            assert np.isnan(row[column]), column
+        assert row["reject_at_05"] is False
+        assert row["model"] == fit.kind
+
+
+def test_the_fallback_at_the_cluster_floor_still_reports_inference(
+    e1_path, monkeypatch
+):
+    _force_fallback(monkeypatch)
+    frame = st.load_e1(
+        e1_path(_e1_rows(n_items=st.MIN_CLUSTERS_FOR_INFERENCE))
+    )
+
+    fit = st.fit_e1(frame)
+    rows = st.e1_contrasts(fit, frame)
+
+    assert fit.inference_ok is True
+    assert fit.kind.startswith("OLS (cluster-robust")
+    assert all(np.isfinite(row["p_raw"]) for row in rows)
+
+
+def test_main_survives_a_sweep_with_too_few_items(tmp_path, e1_path, monkeypatch, capsys):
+    """The model file and the console line both format p and the interval;
+    NaN must print rather than raise."""
+    _force_fallback(monkeypatch)
+    results = tmp_path / "results"
+    results.mkdir()
+    _run_metrics(
+        [
+            {"experiment": e, "language": lang, "seed": seed, "final_var_x": 0.1 * seed}
+            for e in ("e3", "e4")
+            for lang in ("english", "hindi")
+            for seed in (1, 2)
+        ]
+    ).to_csv(results / "run_metrics.csv", index=False)
+
+    code = st.main(
+        ["--e1", str(e1_path(_e1_rows(n_items=2))), "--results", str(results),
+         "--out", str(results)]
+    )
+
+    assert code == 0
+    assert "too few items" in capsys.readouterr().out
+    contrasts = pd.read_csv(results / "e1_contrasts.csv")
+    assert contrasts.p_raw.isna().all()
+    assert not contrasts.reject_at_05.any()

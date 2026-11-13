@@ -431,3 +431,19 @@ def test_make_backend_response_is_still_the_reply_shape_these_tests_assume():
     with no STANCE line, or the no-number audit above fails against the
     fixture rather than against the script."""
     assert "STANCE" not in make_backend_response(text="prose only").text
+
+
+def test_a_sampled_calibration_is_marked_as_a_smoke_file(
+    tmp_path, single_configs, harness_gateway
+):
+    """A sample is not the full sweep, so its thresholds are not a calibration
+    either -- the same flag --limit sets."""
+    config_dir = single_configs(("english",))
+    runs_dir = tmp_path / "out"
+
+    assert _run(config_dir, runs_dir, "--leans", "4", "--sample", "3",
+                "--min-ok-trials", "1") == 0
+
+    assert len(_rows(runs_dir)) == 3
+    tau = json.loads((runs_dir / "calibration" / "tau.json").read_text())
+    assert tau["smoke"] is True

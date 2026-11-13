@@ -69,6 +69,7 @@ from sandbox.single_exposure import (
     TrialStore,
     add_common_args,
     apply_limit,
+    apply_sample,
     chunked,
     gather_all,
     gather_in_chunks,
@@ -241,10 +242,13 @@ async def calibrate_language(
     neutral_bank: NeutralBank,
     store,
     limit: int | None,
+    sample: int | None = None,
 ) -> int:
     """Runs one arm's pending trials. Returns how many it ran."""
     neutral_ids = neutral_bank.ids()
-    all_trials = apply_limit(trial_keys(personas, leans, neutral_ids), limit)
+    all_trials = apply_limit(
+        apply_sample(trial_keys(personas, leans, neutral_ids), sample), limit
+    )
     done = store.completed()
     pending = [
         t
@@ -397,6 +401,7 @@ async def main_async(args: argparse.Namespace) -> int:
             NeutralBank(run.neutral_bank_path),
             store,
             args.limit,
+            args.sample,
         )
 
     # Summarized over every language the FILE holds, not only the arms this
@@ -414,7 +419,11 @@ async def main_async(args: argparse.Namespace) -> int:
         pct=args.percentile,
         min_ok=args.min_ok_trials,
         git_commit_hash=next(iter(runs.values())).git_commit_hash,
-        smoke=args.limit is not None or args.min_ok_trials < MIN_OK_TRIALS,
+        smoke=(
+            args.limit is not None
+            or args.sample is not None
+            or args.min_ok_trials < MIN_OK_TRIALS
+        ),
     )
 
     print(f"\n  {tau_path}")

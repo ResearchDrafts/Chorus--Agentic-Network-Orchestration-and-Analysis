@@ -309,3 +309,57 @@ def test_arg_id_of_names_the_argument_not_the_row():
 def test_arg_id_of_raises_for_an_unknown_item():
     with pytest.raises(KeyError, match="unknown bank item"):
         BANK.arg_id_of("bank_nope")
+
+
+# --- --sample -------------------------------------------------------------
+
+
+def test_apply_sample_is_spread_fixed_and_ordered():
+    from sandbox.single_exposure import apply_limit, apply_sample
+
+    grid = [(item, persona, lean) for item in range(40) for persona in range(20)
+            for lean in (2, 4, 6)]
+
+    first = apply_sample(grid, 120)
+    again = apply_sample(grid, 120)
+
+    assert first == again                      # same trials on every pass
+    assert len(first) == 120 and len(set(first)) == 120
+    assert first == sorted(first)              # original order kept
+    # The point of it: --limit 120 covers two items, a sample nearly all.
+    assert len({t[0] for t in apply_limit(grid, 120)}) == 2
+    assert len({t[0] for t in first}) > 30
+    assert len({t[1] for t in first}) == 20
+    assert {t[2] for t in first} == {2, 4, 6}
+
+
+def test_apply_sample_passes_through_when_not_smaller():
+    from sandbox.single_exposure import apply_sample
+
+    grid = list(range(10))
+    assert apply_sample(grid, None) is grid
+    assert apply_sample(grid, 10) is grid
+    assert apply_sample(grid, 99) is grid
+    with pytest.raises(ValueError, match="--sample"):
+        apply_sample(grid, 0)
+
+
+def test_sample_gives_every_arm_the_same_trials(
+    tmp_path, single_configs, harness_gateway
+):
+    """Otherwise the four arms would be compared on different items."""
+    config_dir = single_configs(("english", "hindi"))
+    runs_dir = tmp_path / "out"
+
+    assert _run(config_dir, runs_dir, "--leans", "2", "4", "6", "--sample", "5") == 0
+
+    rows = _rows(runs_dir)
+    by_arm = {
+        language: sorted(
+            (r["item_id"], r["persona_index"], r["lean"])
+            for r in rows if r["language"] == language
+        )
+        for language in ("english", "hindi")
+    }
+    assert len(by_arm["english"]) == 5
+    assert by_arm["english"] == by_arm["hindi"]

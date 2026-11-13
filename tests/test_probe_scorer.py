@@ -207,3 +207,36 @@ def test_mass_is_the_raw_share_not_the_renormalized_one():
     assert confident.mean == marginal.mean == pytest.approx(5.0)
     assert confident.mass == pytest.approx(0.95)
     assert marginal.mass == pytest.approx(0.51)
+
+
+# --- digits int() cannot read --------------------------------------------
+
+
+def test_a_subscript_or_superscript_digit_in_the_top_k_is_ignored():
+    """A live run crashed on this. "₁" and "¹" satisfy str.isdigit but
+    int() cannot convert them, and the model does not have to answer one --
+    it only has to appear somewhere in the top-k with a sliver of probability.
+    They are off-scale tokens like any other, and count against the mass."""
+    result = score(
+        _logprobs({"5": 0.9, "₁": 0.04, "¹": 0.03, "⑦": 0.03}),
+        mass_floor=0.5,
+    )
+
+    assert result.mass == pytest.approx(0.9)
+    assert result.mean == pytest.approx(5.0)
+
+
+def test_a_devanagari_digit_counts_as_its_scale_point():
+    """Deliberate. A Hindi-arm answer of "४" is an answer of 4; dropping
+    it would lower the probe mass in that arm only, which is a difference in
+    the instrument between arms."""
+    result = score(_logprobs({"४": 0.6, "4": 0.2, "6": 0.2}), mass_floor=0.5)
+
+    assert result.mass == pytest.approx(1.0)
+    assert result.dist[SCALE_POINTS.index(4)] == pytest.approx(0.8)
+
+
+def test_a_devanagari_digit_off_the_scale_is_ignored():
+    result = score(_logprobs({"९": 0.3, "2": 0.7}), mass_floor=0.5)  # nine
+
+    assert result.mass == pytest.approx(0.7)
