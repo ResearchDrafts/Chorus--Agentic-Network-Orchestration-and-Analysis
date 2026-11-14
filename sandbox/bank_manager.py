@@ -51,6 +51,55 @@ NEUTRAL_PREFIX = "neutral_"
 NEUTRAL_REQUIRED_COLUMNS = ("neutral_id", *LANGUAGE_CONDITIONS)
 
 
+# How many starter posts on each side an agent at each initial_stance is
+# given under start_mode="posts", as (con, pro). Con is the low end of the
+# scale. More posts, all on one side, the further the lean is from 4; the
+# middle gets one of each, so an undecided agent has still said something on
+# the topic and its probe prompt has the same shape as everyone else's.
+STARTER_COUNTS: dict[int, tuple[int, int]] = {
+    1: (3, 0),
+    2: (2, 0),
+    3: (1, 0),
+    4: (1, 1),
+    5: (0, 1),
+    6: (0, 2),
+    7: (0, 3),
+}
+
+
+def starter_items(bank: "BankManager", seed: int, key: str, lean: float) -> list[str]:
+    """The starter bank items an agent at `lean` is shown as its own posts.
+
+    A pure function of (seed, key, lean) and the bank's contents. No
+    language: the four arms of a matched set share the seed, and the reader
+    or agent key does not mention a language, so every arm shows the same
+    items, each rendered in its own language. Drawn without replacement
+    within a side, and shuffled together, so the order says nothing about
+    the side.
+    """
+    point = int(lean)
+    if point != lean or point not in STARTER_COUNTS:
+        raise ValueError(
+            f"no starter composition for initial_stance {lean!r}: expected a "
+            f"whole number in {sorted(STARTER_COUNTS)}"
+        )
+    n_con, n_pro = STARTER_COUNTS[point]
+    rng = random.Random(f"{seed}|starter|{key}|{point}")
+    con = bank.items_for_side("con")
+    pro = bank.items_for_side("pro")
+    if len(con) < n_con or len(pro) < n_pro:
+        raise ValueError(
+            f"starter bank has {len(con)} con and {len(pro)} pro items; lean "
+            f"{point} needs {n_con} con and {n_pro} pro"
+        )
+    chosen = rng.sample(con, n_con) + rng.sample(pro, n_pro)
+    rng.shuffle(chosen)
+    return chosen
+
+
+STARTER_MIN_PER_SIDE = max(max(c, p) for c, p in STARTER_COUNTS.values())
+
+
 class BankValidationError(Exception):
     """Raised for any problem with a bank file, listing every problem found.
 

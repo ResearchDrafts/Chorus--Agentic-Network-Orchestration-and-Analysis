@@ -59,12 +59,15 @@ from sandbox.single_exposure import (
     add_common_args,
     apply_limit,
     apply_sample,
+    check_one_start_mode,
     chunked,
     gather_all,
     gather_in_chunks,
     load_base_configs,
     load_trials,
     personas_for,
+    start_key_for,
+    with_start_mode,
 )
 
 DEFAULT_LEANS = (2, 4, 6)
@@ -121,7 +124,10 @@ async def measure_baselines(
     combinations: list[tuple[int, int]],
 ) -> dict[tuple[int, int], Reading | None]:
     agents = [
-        harness.reader(f"e1|p{index:03d}|lean{lean}", personas[index], lean)
+        harness.reader(
+            f"e1|p{index:03d}|lean{lean}", personas[index], lean,
+            start_key=start_key_for(index, lean),
+        )
         for index, lean in combinations
     ]
     readings = await gather_in_chunks(
@@ -160,13 +166,15 @@ async def run_trial(
         "persona_index": persona_index,
         "lean": lean,
         "with_reply": with_reply,
+        "start_mode": harness.run.start_mode,
     }
     if baseline is None:
         return _row(row, None, None, side, None)
 
     item_text = bank.text(item_id, harness.language)
     agent = harness.reader(
-        f"e1|{item_id}|p{persona_index:03d}|lean{lean}", persona, lean
+        f"e1|{item_id}|p{persona_index:03d}|lean{lean}", persona, lean,
+        start_key=start_key_for(persona_index, lean),
     )
 
     seed = None
@@ -317,8 +325,11 @@ async def main_async(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     store = TrialStore(out_dir / "trials.jsonl")
 
-    runs = load_base_configs(args.languages, args.configs)
+    runs = with_start_mode(load_base_configs(args.languages, args.configs), args.start_mode)
+    start_mode = next(iter(runs.values())).start_mode
+    check_one_start_mode(load_trials(store.path), start_mode, store.path)
     print(f"\nE1 single exposure -> {out_dir}/")
+    print(f"  start mode    {start_mode}")
     print(f"  leans         {args.leans}")
     print(f"  reply         {'yes, seeded' if args.with_reply else 'no: read only'}")
 

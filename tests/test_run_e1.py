@@ -363,3 +363,68 @@ def test_sample_gives_every_arm_the_same_trials(
     }
     assert len(by_arm["english"]) == 5
     assert by_arm["english"] == by_arm["hindi"]
+
+
+# --- start_mode -------------------------------------------------------------
+
+
+def _prompts(runs_dir, subdir="e1") -> list[dict]:
+    return [
+        json.loads(line)
+        for line in (runs_dir / subdir / "prompts.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def test_start_mode_none_shows_no_lean_and_is_recorded(
+    tmp_path, single_configs, harness_gateway
+):
+    config_dir = single_configs(("english",))
+    runs_dir = tmp_path / "out"
+
+    assert _run(config_dir, runs_dir, "--leans", "4", "--start-mode", "none") == 0
+
+    rows = _rows(runs_dir)
+    assert rows and all(r["start_mode"] == "none" for r in rows)
+    for record in _prompts(runs_dir):
+        assert "lean towards" not in record["prompt_text"]
+        assert "You hold the view" not in record["prompt_text"]
+        assert "undecided" not in record["prompt_text"]
+
+
+def test_start_mode_posts_shows_the_same_starters_before_and_after(
+    tmp_path, single_configs, harness_gateway
+):
+    """The baseline and the exposed probe of a reader must differ only in the
+    item it read. Their agent ids differ (the trial is in one), so the starter
+    posts have to follow the reader's start_key."""
+    config_dir = single_configs(
+        ("english",), starter_bank_path="data/bank/test_starter.csv"
+    )
+    runs_dir = tmp_path / "out"
+
+    assert _run(config_dir, runs_dir, "--leans", "2", "--start-mode", "posts",
+                "--limit", "1") == 0
+
+    probes = [r["prompt_text"] for r in _prompts(runs_dir) if "single digit" in r["prompt_text"]]
+    baseline = [p for p in probes if MEMORY_MARKER not in p]
+    exposed = [p for p in probes if MEMORY_MARKER in p]
+    assert len(baseline) == 1 and len(exposed) == 1
+
+    def starters(prompt):
+        block = prompt.split("Before this discussion, you had written these posts:\n")[1]
+        return block.split("\n\n")[0]
+
+    assert starters(baseline[0]) == starters(exposed[0])
+    assert starters(baseline[0]).count("You posted:") == 2  # lean 2: two con posts
+
+
+def test_a_second_sweep_under_another_start_mode_is_refused(
+    tmp_path, single_configs, harness_gateway
+):
+    config_dir = single_configs(("english",))
+    runs_dir = tmp_path / "out"
+    assert _run(config_dir, runs_dir, "--leans", "4", "--limit", "1", "--start-mode", "none") == 0
+
+    with pytest.raises(ValueError, match="different --runs-dir"):
+        _run(config_dir, runs_dir, "--leans", "4", "--limit", "1")

@@ -2301,3 +2301,37 @@ async def test_a_delivery_on_run_cannot_rebuild_a_delivery_off_log(
     on = build_orchestrator(_bank_run(K=2), bank_gateway, runs_dir=tmp_path)
     with pytest.raises(ValueError, match="neutral bank"):
         on._restore_bank_state(2)
+
+
+# --- start_mode="posts" in a network run ----------------------------------
+
+
+async def test_a_posts_run_shows_each_agent_the_same_starters_every_round(
+    tmp_path, bank_gateway
+):
+    """Every prompt an agent gets carries the same starter block, from its
+    round-0 probe to its last reply: the section is a trait, and a section
+    that changed between rounds would make the probe two instruments."""
+    from sandbox.bank_manager import BankManager, starter_items
+
+    run = _bank_run(start_mode="posts", starter_bank_path="data/bank/test_starter.csv")
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    starters = BankManager("data/bank/test_starter.csv")
+    agents = {
+        json.loads(line)["agent_id"]: json.loads(line)
+        for line in (tmp_path / "bank_run" / "agents_final.jsonl").read_text().splitlines()
+        if line.strip()
+    }
+    blocks: dict[str, set[str]] = {}
+    for record in _prompt_rows(tmp_path):
+        text = record.prompt_text
+        assert "Before this discussion, you had written these posts:" in text
+        block = text.split("Before this discussion, you had written these posts:\n")[1].split("\n\n")[0]
+        blocks.setdefault(record.agent_id, set()).add(block)
+    assert set(blocks) == set(agents)
+    for agent_id, seen in blocks.items():
+        assert len(seen) == 1, agent_id
+        expected = starter_items(starters, run.seed, agent_id, agents[agent_id]["initial_stance"])
+        for item in expected:
+            assert starters.text(item, "english") in next(iter(seen))

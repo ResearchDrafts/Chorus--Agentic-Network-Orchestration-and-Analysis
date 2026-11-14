@@ -190,7 +190,9 @@ class SingleReaderHarness:
     def concurrency(self) -> int:
         return self._run.max_concurrency or DEFAULT_CONCURRENCY
 
-    def reader(self, agent_id: str, persona: str, lean: float) -> Agent:
+    def reader(
+        self, agent_id: str, persona: str, lean: float, start_key: str | None = None
+    ) -> Agent:
         """One reader, built from the trial's own factors.
 
         `initial_stance` is the lean being tested, which is what
@@ -211,6 +213,7 @@ class SingleReaderHarness:
             language_condition=self._run.language_condition,
             model_backend_id=self._run.model_backend_id,
             initial_stance=float(lean),
+            start_key=start_key,
         )
 
     def reply_seed(self, trial_key: str) -> int:
@@ -456,6 +459,54 @@ def load_base_configs(languages: Sequence[str], config_dir: Path) -> dict[str, E
     return runs
 
 
+def with_start_mode(
+    runs: dict[str, ExperimentRun], start_mode: str | None
+) -> dict[str, ExperimentRun]:
+    """The base configs, with start_mode overridden when one was asked for.
+
+    E1 and the τ calibration read the same single_<language>.yaml, but need
+    not use the same starting position: E1 asks how far one argument moves a
+    reader and is cleanest with none, while τ must match the network runs it
+    is the threshold for. Re-validated through the model, so "posts" without a
+    starter bank fails here rather than on the first trial.
+    """
+    if start_mode is None:
+        return runs
+    out = {}
+    for language, run in runs.items():
+        data = run.model_dump()
+        data["start_mode"] = start_mode
+        out[language] = ExperimentRun.model_validate(data)
+    return out
+
+
+def check_one_start_mode(rows: Iterable[dict], start_mode: str, path: Path) -> None:
+    """Refuses to add trials under one start_mode to a file holding another.
+
+    The trial key does not include the mode, so a second pass under a
+    different mode would see every trial as already done and silently
+    report the first mode's numbers as the second's. Rows written before this
+    column existed were all run under "sentence".
+    """
+    found = {row.get("start_mode", "sentence") for row in rows}
+    if found and found != {start_mode}:
+        raise ValueError(
+            f"{path} holds trials run with start_mode {sorted(found)}, and this "
+            f"sweep uses {start_mode!r}. Write to a different --runs-dir: the "
+            "trial key does not include the mode, so they would be mixed."
+        )
+
+
+def start_key_for(persona_index: int, lean: int) -> str:
+    """The reader, without the trial: what its starter posts are drawn from.
+
+    Shared by E1 and τ, so the same persona at the same lean is shown the
+    same starter posts in both, and by the baseline and the exposed probe of
+    one trial, which must differ in the trial's own content alone.
+    """
+    return f"p{persona_index:03d}|lean{lean}"
+
+
 def personas_for(run: ExperimentRun) -> list[str]:
     """The run's persona pool, indexed the way the trial rows index it.
 
@@ -671,6 +722,13 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="run only the first N trials of each arm, for a smoke test",
+    )
+    parser.add_argument(
+        "--start-mode",
+        choices=("sentence", "none", "posts"),
+        default=None,
+        help="override the base configs' start_mode for this sweep: how the "
+             "reader's starting position is set (see ExperimentRun.start_mode)",
     )
     parser.add_argument(
         "--sample",

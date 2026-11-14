@@ -70,6 +70,7 @@ from sandbox.single_exposure import (
     add_common_args,
     apply_limit,
     apply_sample,
+    check_one_start_mode,
     chunked,
     gather_all,
     gather_in_chunks,
@@ -77,6 +78,8 @@ from sandbox.single_exposure import (
     load_trials,
     percentile,
     personas_for,
+    start_key_for,
+    with_start_mode,
 )
 
 DEFAULT_LEANS = (1, 2, 3, 4, 5, 6, 7)
@@ -148,7 +151,10 @@ async def measure_baselines(
     reply call on a trial whose difference could never be computed.
     """
     agents = [
-        harness.reader(baseline_agent_id(index, lean), personas[index], lean)
+        harness.reader(
+            baseline_agent_id(index, lean), personas[index], lean,
+            start_key=start_key_for(index, lean),
+        )
         for index, lean in combinations
     ]
     readings = await gather_in_chunks(
@@ -182,12 +188,14 @@ async def run_trial(
         "persona_index": persona_index,
         "lean": lean,
         "neutral_id": neutral_id,
+        "start_mode": harness.run.start_mode,
     }
     if baseline is None:
         return _row(row, None, None, None)
 
     agent = harness.reader(
-        f"cal|p{persona_index:03d}|lean{lean}|{neutral_id}", persona, lean
+        f"cal|p{persona_index:03d}|lean{lean}|{neutral_id}", persona, lean,
+        start_key=start_key_for(persona_index, lean),
     )
     seed = harness.reply_seed(reader_key(persona_index, lean, neutral_id))
     reply_text = await harness.reply(
@@ -345,6 +353,7 @@ def write_tau(
     min_ok: int,
     git_commit_hash: str,
     smoke: bool,
+    start_mode: str = "sentence",
 ) -> None:
     """tau.json, with enough provenance to tell two of them apart.
 
@@ -364,6 +373,10 @@ def write_tau(
                 # a file produced for a plumbing check cannot be mistaken for
                 # a calibration. analysis/metrics.py prints the flag.
                 "smoke": smoke,
+                # The start mode the readers were calibrated under. τ is the
+                # noise of THAT instrument; analysis/metrics.py warns when a
+                # run was made under another.
+                "start_mode": start_mode,
                 "languages": summary,
             },
             indent=2,
@@ -379,8 +392,11 @@ async def main_async(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     store = TrialStore(out_dir / "trials.jsonl")
 
-    runs = load_base_configs(args.languages, args.configs)
+    runs = with_start_mode(load_base_configs(args.languages, args.configs), args.start_mode)
+    start_mode = next(iter(runs.values())).start_mode
+    check_one_start_mode(load_trials(store.path), start_mode, store.path)
     print(f"\nτ calibration -> {out_dir}/")
+    print(f"  start mode    {start_mode}")
     print(f"  leans         {args.leans}")
     print(f"  percentile    {args.percentile}")
 
@@ -424,6 +440,7 @@ async def main_async(args: argparse.Namespace) -> int:
             or args.sample is not None
             or args.min_ok_trials < MIN_OK_TRIALS
         ),
+        start_mode=start_mode,
     )
 
     print(f"\n  {tau_path}")

@@ -57,6 +57,14 @@ class Agent(BaseModel):
     stance_history: list[StanceRecord] = Field(default_factory=list)
     memory_window: list[str] = Field(default_factory=list, max_length=5)
     created_at_turn: int = 0
+    # What the starter posts are drawn from under start_mode="posts" (see
+    # bank_manager.starter_items). None means agent_id, which is right for a
+    # population agent. The single-exposure scripts set it explicitly, because
+    # their agent_id names the TRIAL (it contains the item or neutral message)
+    # while the starter posts must belong to the READER: the baseline probe
+    # and the exposed probe of one trial have to show the same starter posts,
+    # or the difference between them measures a change of starter posts.
+    start_key: str | None = None
 
     def current_stance(self) -> float:
         """Last stance_history entry's value, or initial_stance if empty."""
@@ -375,6 +383,30 @@ class ExperimentRun(BaseModel):
     # every treatment effect is measured against.
     neutral_bank_path: str | None = None
 
+    # How an agent's starting position is set, bank regime only.
+    #
+    #   sentence  a lean sentence, rendered from initial_stance and the anchor
+    #             labels, in every reply and probe prompt. The original design.
+    #             A live run showed the probe reads it back: lean 6 gave 7.0
+    #             for every persona (sd 0.03), so readers start pinned at the
+    #             ends of the scale and an argument has nowhere to move them.
+    #   none      no starting position at all. The reader starts from its
+    #             persona and the model's own view. For E1, where the question
+    #             is how far ONE argument moves a reader, and a reader with
+    #             room on both sides is the cleanest place to ask it.
+    #   posts     the agent is shown posts it "wrote before this discussion",
+    #             drawn from starter_bank_path, more of them and more one-sided
+    #             the further initial_stance is from 4. The position is carried
+    #             by arguments, not by a statement, so later arguments compete
+    #             with it on the same footing. For the network runs.
+    #
+    # Default "sentence", so every existing config means what it meant.
+    start_mode: str = Field(default="sentence", pattern="^(sentence|none|posts)$")
+    # Same CSV format as bank_path. Required by start_mode="posts" and must
+    # share no item_id with the argument bank: an agent shown an argument it
+    # had already "posted" would be reading itself.
+    starter_bank_path: str | None = None
+
     # Item IDs to drop from the argument bank, one per line (blank lines and
     # "#" comments skipped). What the comprehension check writes to
     # comprehension/failed_items.txt, so the file it produces can be fed
@@ -538,6 +570,27 @@ class ExperimentRun(BaseModel):
         """
         if self.log_prompts is None:
             self.log_prompts = self.regime == "bank"
+        return self
+
+    @model_validator(mode="after")
+    def check_start_mode(self) -> "ExperimentRun":
+        """start_mode="posts" needs its starter bank; the other modes ignore it.
+
+        Only the bank regime renders a starting position this way, so a
+        generated-regime run asking for anything but the default is a
+        misconfiguration rather than a no-op.
+        """
+        if self.start_mode != "sentence" and self.regime != "bank":
+            raise ValueError(
+                f"start_mode={self.start_mode!r} applies to regime='bank' only"
+            )
+        if self.start_mode == "posts" and (
+            self.starter_bank_path is None or not self.starter_bank_path.strip()
+        ):
+            raise ValueError(
+                "start_mode='posts' requires a starter_bank_path: the posts each "
+                "agent wrote before the discussion are drawn from it"
+            )
         return self
 
     @model_validator(mode="after")

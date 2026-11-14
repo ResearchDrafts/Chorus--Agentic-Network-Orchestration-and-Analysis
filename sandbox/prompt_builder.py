@@ -166,6 +166,14 @@ class PromptBuilder:
         self._meme_lookup = meme_lookup
         self._low = min(run.stance_scale)
         self._high = max(run.stance_scale)
+        # Loaded once, for start_mode="posts" only. Imported here for
+        # config_loader's reason: prompt_builder must not depend on
+        # bank_manager at module scope for the generated regime's sake.
+        self._starters = None
+        if run.regime == "bank" and run.start_mode == "posts":
+            from sandbox.bank_manager import BankManager
+
+            self._starters = BankManager(run.starter_bank_path)
 
     def build_discussion_prompt(
         self,
@@ -275,8 +283,10 @@ class PromptBuilder:
         sections = [
             f"You are: {agent.persona}",
             f"You are taking part in an ongoing discussion about: {self._run.topic}",
-            self._lean_section(agent),
         ]
+        start = self._lean_section(agent)
+        if start:
+            sections.append(start)
         memory = self._bank_memory_section(history_rounds)
         if memory:
             sections.append(memory)
@@ -320,8 +330,10 @@ class PromptBuilder:
         sections = [
             f"You are: {agent.persona}",
             f"You are taking part in an ongoing discussion about: {self._run.topic}",
-            self._lean_section(agent),
         ]
+        start = self._lean_section(agent)
+        if start:
+            sections.append(start)
         memory = self._bank_memory_section(history_rounds or [])
         if memory:
             sections.append(memory)
@@ -351,6 +363,43 @@ class PromptBuilder:
         return self._run.probe_question
 
     def _lean_section(self, agent: Agent) -> str:
+        """Where the agent started, as run.start_mode says. Every prompt shows it.
+
+        `none` returns "" and the caller leaves the section out. `posts`
+        returns the agent's starter posts. `sentence`, described below, is the
+        original lean sentence.
+
+        The section is the same in every prompt an agent gets, whatever the
+        mode, for the reason the lean sentence is permanent: a section that
+        changed between round 0 and round 1 would make the round-0 probe and
+        every later probe two different instruments.
+        """
+        mode = self._run.start_mode
+        if mode == "none":
+            return ""
+        if mode == "posts":
+            return self._starter_section(agent)
+        return self._lean_sentence(agent)
+
+    def _starter_section(self, agent: Agent) -> str:
+        """The posts this agent wrote before the discussion, in this run's language.
+
+        Phrased as the agent's OWN posts, not as something it read: a reader
+        infers its view from what it has argued, and an argument it merely
+        read barely moves it, which is the finding that made this mode
+        necessary. No count, no position, no digit.
+        """
+        from sandbox.bank_manager import starter_items
+
+        key = agent.start_key or agent.agent_id
+        items = starter_items(self._starters, self._run.seed, key, agent.initial_stance)
+        lines = [
+            f"  You posted: {self._starters.text(item, self._run.language_condition)}"
+            for item in items
+        ]
+        return "Before this discussion, you had written these posts:\n" + "\n".join(lines)
+
+    def _lean_sentence(self, agent: Agent) -> str:
         """Where the agent started, in words. Shown in every prompt it gets.
 
         Keyed by initial_stance as an integer. Raises for a stance with no

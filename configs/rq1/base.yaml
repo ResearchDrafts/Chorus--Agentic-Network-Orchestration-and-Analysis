@@ -51,6 +51,18 @@ delivery: "on"             # overwritten: e3_* gets "on", e4_* gets "off"
 # which never read it -- so an E3 run_config.json does not record a neutral
 # bank the run never opened.
 neutral_bank_path: data/bank/test_neutral.csv   # PLACEHOLDER (3-message fixture)
+
+# How each agent's starting position is set. "posts": it is shown posts it
+# wrote before the discussion, drawn from the starter bank, more of them and
+# more one-sided the further its initial_stance is from 4. Not "sentence",
+# the original lean sentence: a live run showed the probe reads that sentence
+# back (lean 6 gave 7.0 for every persona), pinning agents at the ends of the
+# scale. The single-reader scripts override this with --start-mode (E1 runs
+# with "none"). See ExperimentRun.start_mode.
+start_mode: posts
+# Same CSV format as the argument bank, at least 3 items per side, and no
+# item_id shared with it.
+starter_bank_path: data/bank/test_starter.csv   # PLACEHOLDER (6-item fixture)
 # Item IDs to drop, one per line -- what scripts/check_comprehension.py
 # writes to comprehension/failed_items.txt. Null means drop nothing; point it
 # at that file once the comprehension check has run, so no arm is measured on

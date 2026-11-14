@@ -680,6 +680,15 @@ def compute(
             continue
         config = json.loads((run_dir / "run_config.json").read_text(encoding="utf-8"))
         arm_tau, arm_tau_conf = tau_for(tau, config["language_condition"], tau_path)
+        run_mode = config.get("start_mode", "sentence")
+        tau_mode = tau.get("start_mode", "sentence")
+        if run_mode != tau_mode:
+            print(
+                f"  WARNING: {run_dir.name} ran with start_mode={run_mode!r} but "
+                f"{tau_path} was calibrated with {tau_mode!r}. τ is the noise of "
+                "one instrument; its flips and hardenings here are judged "
+                "against another's."
+            )
 
         run_probes = probe_rows(frame, config, arm_tau, arm_tau_conf)
         if not run_probes:

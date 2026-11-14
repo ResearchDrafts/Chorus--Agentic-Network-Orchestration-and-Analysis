@@ -39,6 +39,8 @@ stance_scale:
 - 5
 - 6
 - 7
+start_mode: posts
+starter_bank_path: data/bank/test_starter.csv
 temperature: 0.7
 topic: whether city bus fares should stay subsidised
 trial_number: 3

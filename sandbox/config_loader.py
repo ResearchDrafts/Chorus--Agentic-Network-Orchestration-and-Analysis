@@ -171,6 +171,54 @@ def _bank_errors(raw: dict) -> list[str]:
     return []
 
 
+def _starter_bank_errors(raw: dict) -> list[str]:
+    """Validates start_mode="posts"'s starter bank at config-load time.
+
+    Loaded in full for _bank_errors' reason. Two checks beyond the file's own
+    validity: each side holds enough items for the most one-sided lean, and no
+    item_id is shared with the argument bank. An agent whose starter post is
+    the very argument it is later shown would be reading itself, and the two
+    files would then disagree about which one the ID's text comes from.
+    """
+    if raw.get("regime") != "bank" or raw.get("start_mode") != "posts":
+        return []
+    starter_path = raw.get("starter_bank_path")
+    if not isinstance(starter_path, str) or not starter_path.strip():
+        return []  # the schema's own validator reports the missing path
+    path = Path(starter_path)
+    if not path.exists():
+        return [f"starter_bank_path '{starter_path}' not found at {path}"]
+
+    from sandbox.bank_manager import (
+        STARTER_MIN_PER_SIDE,
+        BankManager,
+        BankValidationError,
+    )
+
+    try:
+        starters = BankManager(path)
+    except BankValidationError as e:
+        return [f"starter bank {starter_path}: {problem}" for problem in e.errors]
+    errors = [
+        f"starter bank {starter_path}: {len(starters.items_for_side(side))} {side} "
+        f"item(s), needs at least {STARTER_MIN_PER_SIDE}"
+        for side in ("con", "pro")
+        if len(starters.items_for_side(side)) < STARTER_MIN_PER_SIDE
+    ]
+    bank_path = raw.get("bank_path")
+    if isinstance(bank_path, str) and Path(bank_path).exists():
+        try:
+            shared = set(starters.all_item_ids()) & set(BankManager(Path(bank_path)).all_item_ids())
+        except BankValidationError:
+            shared = set()  # _bank_errors reports the bank's own problems
+        if shared:
+            errors.append(
+                f"starter bank {starter_path} shares item_id(s) with the argument "
+                f"bank: {sorted(shared)}"
+            )
+    return errors
+
+
 def _neutral_bank_errors(raw: dict) -> list[str]:
     """Validates a delivery-off control's neutral bank at config-load time.
 
@@ -240,6 +288,7 @@ def _referenced_asset_errors(raw: dict) -> list[str]:
     errors: list[str] = []
     errors.extend(_bank_errors(raw))
     errors.extend(_neutral_bank_errors(raw))
+    errors.extend(_starter_bank_errors(raw))
 
     meme_injection = raw.get("meme_injection")
     if isinstance(meme_injection, dict) and meme_injection.get("enabled") is True:

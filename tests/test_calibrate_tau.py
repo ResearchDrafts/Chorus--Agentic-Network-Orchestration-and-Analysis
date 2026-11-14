@@ -447,3 +447,19 @@ def test_a_sampled_calibration_is_marked_as_a_smoke_file(
     assert len(_rows(runs_dir)) == 3
     tau = json.loads((runs_dir / "calibration" / "tau.json").read_text())
     assert tau["smoke"] is True
+
+
+def test_tau_records_the_start_mode_it_was_calibrated_under(
+    tmp_path, single_configs, harness_gateway
+):
+    config_dir = single_configs(
+        ("english",), starter_bank_path="data/bank/test_starter.csv"
+    )
+    runs_dir = tmp_path / "out"
+
+    assert _run(config_dir, runs_dir, "--leans", "4", "--limit", "3",
+                "--min-ok-trials", "1", "--start-mode", "posts") == 0
+
+    tau = json.loads((runs_dir / "calibration" / "tau.json").read_text())
+    assert tau["start_mode"] == "posts"
+    assert all(r["start_mode"] == "posts" for r in _rows(runs_dir))
