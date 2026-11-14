@@ -58,3 +58,46 @@ def test_write_run_config_against_nonexistent_run_dir_raises_file_not_found(tmp_
 
     with pytest.raises(FileNotFoundError):
         writer.write_run_config(_make_run())
+
+
+async def test_concurrent_write_prompt_produces_n_valid_untorn_lines(tmp_path):
+    """prompts.jsonl is appended from the same concurrent dispatch tasks as
+    interactions.jsonl, and shares its lock."""
+    from sandbox.models import PromptRecord
+
+    writer = LoggingWriter(tmp_path)
+    n = 50
+    records = [
+        PromptRecord(
+            run_id="test_run",
+            turn=1,
+            agent_id=f"agent_{i:04d}",
+            call="probe" if i % 2 else "reply",
+            prompt_text=f"prompt {i}\nwith a newline in it",
+            response_text=f"response {i}",
+            top_logprobs=[("5", -0.1)] if i % 2 else None,
+        )
+        for i in range(n)
+    ]
+
+    await asyncio.gather(*(writer.write_prompt(r) for r in records))
+
+    lines = (tmp_path / "prompts.jsonl").read_text().splitlines()
+    assert len(lines) == n  # a newline inside a prompt must not split a line
+    parsed = [PromptRecord.model_validate_json(line) for line in lines]
+    assert {p.agent_id for p in parsed} == {r.agent_id for r in records}
+    assert all(p.top_logprobs is None for p in parsed if p.call == "reply")
+
+
+async def test_interactions_and_prompts_are_separate_files(tmp_path):
+    from sandbox.models import PromptRecord
+
+    writer = LoggingWriter(tmp_path)
+    await writer.write_interaction(_make_interaction())
+    await writer.write_prompt(
+        PromptRecord(run_id="r", turn=1, agent_id="agent_0000", call="reply",
+                     prompt_text="p")
+    )
+
+    assert len((tmp_path / "interactions.jsonl").read_text().splitlines()) == 1
+    assert len((tmp_path / "prompts.jsonl").read_text().splitlines()) == 1

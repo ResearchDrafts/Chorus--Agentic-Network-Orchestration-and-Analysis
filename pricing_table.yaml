@@ -47,6 +47,12 @@ hosted_vllm:
   # weights alone and wants --max-model-len trimmed or a larger device.
   Qwen2.5-3B-Instruct:
     text: {prompt_per_1k: 0.0, completion_per_1k: 0.0}
+  # The RQ1 bank-regime default. The text entry covers BOTH calls a bank
+  # round makes: score_next_token records modality="text" like generate(),
+  # since a probe never carries an image. CostTracker raises on a missing
+  # entry after the call completes, so a gap here would kill a run having
+  # already spent the compute -- and would do it on the first probe, not the
+  # first reply.
   Qwen2.5-7B-Instruct:
     text: {prompt_per_1k: 0.0, completion_per_1k: 0.0}
   Qwen2.5-14B-Instruct:

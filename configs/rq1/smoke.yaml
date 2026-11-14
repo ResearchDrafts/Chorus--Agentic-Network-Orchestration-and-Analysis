@@ -1,0 +1,98 @@
+# RQ1 bank-regime smoke test: 8 agents, 3 rounds, English.
+#
+# The cheapest run that exercises every piece of the bank regime: the
+# Watts-Strogatz graph, the argument bank, the round-0 probe, both phases of
+# a round, and the logprob probe. Run this before any real campaign.
+#
+#   vllm serve Qwen/Qwen2.5-7B-Instruct --dtype half --port 8000
+#   python run_simulation.py configs/rq1/smoke.yaml --dry-run   # validate only
+#   python run_simulation.py configs/rq1/smoke.yaml
+#
+# Expect runs/rq1_smoke_english/ to hold:
+#   interactions.jsonl   32 rows: 8 agents x (3 rounds + the round-0 probe)
+#   graph_edges.csv      16 edges: M x graph_degree / 2
+#
+# Calls: 8 x 3 = 24 replies, plus 8 x 4 = 32 probes.
+
+run_id: rq1_smoke_english
+rq_target: RQ1_RQ2
+topic: whether city bus fares should stay subsidised
+
+# --- who reads whom ------------------------------------------------------
+# A fixed social graph, not stance-based sampling. Under alpha sampling who
+# an agent reads depends on where it already stands, so a stance effect and
+# a selection effect cannot be separated afterwards.
+neighbor_strategy: graph
+graph_degree: 4      # must be even and < M; every node starts with this many
+graph_rewire_p: 0.1  # Watts-Strogatz: 0 is a ring, 1 is random
+N: 3                 # neighbours read per round; must be <= graph_degree
+
+# alpha is unused under the graph strategy but still required by the schema.
+alpha: 0.5
+
+M: 8
+K: 3
+trial_number: 1
+
+# --- what agents post ----------------------------------------------------
+# Posts come from the bank, so the argument is identical across the four
+# language arms and only its rendering differs. No LLM writes a post.
+regime: bank
+bank_path: data/bank/test_bank.csv
+# Quoted, and it must be: YAML 1.1 reads bare on/off/yes/no as booleans, so
+# `delivery: off` arrives as False and the schema rejects it. The quotes are
+# what make this a string.
+delivery: "on"       # "off" is the E4 control: read N side-free messages
+                     # (neutral_bank_path) instead of the bank items, one
+                     # standing in for each, and still be probed
+
+language_condition: english
+
+# --- how stance is measured ---------------------------------------------
+# A separate call per agent per round, in a context the agent's history
+# never sees. The question must be written in THIS RUN's language: there is
+# no default, deliberately, because an English fallback would silently probe
+# every arm in English.
+probe_question: Should city bus fares stay subsidised?
+probe_top_logprobs: 20   # all seven digits must be reachable within this many
+probe_mass_floor: 0.5    # below this the read is refused, never renormalised
+
+# Rendered into the probe as "1 means ...", "7 means ...", and into round 1's
+# lean sentence in words.
+stance_scale: [1, 2, 3, 4, 5, 6, 7]
+stance_low_label: fares should not be subsidised
+stance_high_label: fares should stay subsidised
+
+# How many past rounds of reading and replies appear in a prompt. null means
+# the full history, with nothing ever dropped, and that is the default: a
+# window bounds the effect the experiment can measure, because an agent
+# cannot be moved by an argument that has fallen out of its prompt. Set an
+# integer >= 1 only for a run that deliberately wants a window.
+memory_rounds: null
+# A hard ceiling on the prompt length the provider reports. Exceeding it ends
+# the run, naming the agent and the round -- nothing is ever truncated
+# silently, because a run whose Hinglish arm lost the front of its history
+# and whose English arm did not is confounded where RQ1 measures. null is no
+# ceiling; set it a little under the served model's context window.
+max_prompt_tokens: null
+
+# --- backend -------------------------------------------------------------
+# Must match what the server is serving. The bare last segment
+# ("Qwen2.5-7B-Instruct") is the pricing_table.yaml key.
+model_backend_id: hosted_vllm/Qwen/Qwen2.5-7B-Instruct
+api_base: http://localhost:8000/v1
+
+persona_pool_id: pool_20
+
+# Unused in the bank regime, and left disabled. A bank round replaces the
+# content mechanism memes replace, so the two are alternatives.
+meme_injection:
+  enabled: false
+
+seed: 42
+temperature: 0.7   # replies only; the probe is always at 0
+
+# Empty on purpose: let all M agents dispatch concurrently so vLLM can batch.
+rate_limits: {}
+
+checkpoint_every_n_turns: 1

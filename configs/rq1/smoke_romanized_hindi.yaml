@@ -1,0 +1,62 @@
+# RQ1 bank-regime smoke test: the romanized Hindi arm of configs/rq1/smoke.yaml.
+#
+# Identical to smoke.yaml except for three things, which are the ONLY three
+# things that may vary across the four arms:
+#
+#   language_condition   selects the bank column and the directive line
+#   probe_question       the survey question, written in this arm's language
+#   (the bank text itself, which follows from language_condition)
+#
+# Everything else about the instrument is byte-identical across arms. In
+# particular the two anchor labels stay ENGLISH here: they are rendered
+# inside English sentences (the probe's "1 means ..., and 7 means ..." line,
+# and the lean sentence "You hold the view that ..."), so translating them
+# would code-mix the frame and change the instrument at the same time. An
+# instrument that differs between arms cannot attribute a difference between
+# arms to the manipulation.
+#
+# The seed is deliberately unchanged: that is what makes this a matched set.
+# Same seed means the same graph, the same neighbour draws and the same bank
+# item for the same sender on the same side.
+#
+#   python run_simulation.py configs/rq1/smoke_romanized_hindi.yaml
+
+K: 3
+M: 8
+N: 3
+alpha: 0.5
+api_base: http://localhost:8000/v1
+bank_path: data/bank/test_bank.csv
+checkpoint_every_n_turns: 1
+delivery: 'on'
+graph_degree: 4
+graph_rewire_p: 0.1
+language_condition: romanized_hindi
+max_prompt_tokens: null
+meme_injection:
+  enabled: false
+memory_rounds: null
+model_backend_id: hosted_vllm/Qwen/Qwen2.5-7B-Instruct
+neighbor_strategy: graph
+persona_pool_id: pool_20
+probe_mass_floor: 0.5
+probe_question: Kya shahar ki bus kiraya subsidy jaari rehni chahiye?
+probe_top_logprobs: 20
+rate_limits: {}
+regime: bank
+rq_target: RQ1_RQ2
+run_id: rq1_smoke_romanized_hindi
+seed: 42
+stance_high_label: fares should stay subsidised
+stance_low_label: fares should not be subsidised
+stance_scale:
+- 1
+- 2
+- 3
+- 4
+- 5
+- 6
+- 7
+temperature: 0.7
+topic: whether city bus fares should stay subsidised
+trial_number: 1

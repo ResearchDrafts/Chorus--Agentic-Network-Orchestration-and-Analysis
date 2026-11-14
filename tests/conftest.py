@@ -4,7 +4,7 @@ import pytest
 import yaml
 
 from sandbox.model_gateway import ModelGateway
-from tests.factories import make_backend_response
+from tests.factories import make_backend_response, make_logprob_response
 
 
 def _base_config_dict() -> dict:
@@ -66,6 +66,18 @@ def mock_gateway():
     """
     gateway = create_autospec(ModelGateway, instance=True)
     gateway.generate.return_value = make_backend_response()
+    # The bank regime's second call. autospec already produced an AsyncMock
+    # for it, for the same reason it did for generate(), so only the return
+    # value is set here.
+    #
+    # The default read is all mass on 5, so probe_mean is 5.0 for every agent
+    # on every round. Constant on purpose: the orchestrator assigns sides from
+    # probe_mean, so a constant read gives every test a known, identical side
+    # assignment in every language arm, which is what the matched-set
+    # comparison needs. Tests that want movement or a side split override:
+    #     mock_gateway.score_next_token.return_value = make_logprob_response(mean=2.0)
+    #     mock_gateway.score_next_token.side_effect = [...]
+    gateway.score_next_token.return_value = make_logprob_response(mean=5.0)
     gateway.model_backend_id = "gpt-4o"
     gateway.supports_vision = True
     return gateway
@@ -77,3 +89,68 @@ def text_only_gateway(mock_gateway):
     mock_gateway.supports_vision = False
     mock_gateway.model_backend_id = "gpt-3.5-turbo"
     return mock_gateway
+
+
+@pytest.fixture
+def bank_gateway(mock_gateway):
+    """A gateway whose replies look like bank-regime replies.
+
+    mock_gateway's default reply is "STANCE: 5.0\nmy neighbours shifted me",
+    which is the shape the generated regime's parser needs. A bank reply is
+    parsed for nothing and is simply prose, and the difference is not
+    cosmetic: the orchestrator writes the reply verbatim into the agent's
+    memory, so a mock emitting a STANCE line puts the literal word STANCE into
+    later prompts and makes the "no prompt mentions STANCE" audit fail against
+    the fixture rather than against the production code.
+
+    The probe read stays mock_gateway's constant 5.0.
+    """
+    mock_gateway.generate.return_value = make_backend_response(
+        text="The cost point is the one that lands for me."
+    )
+    return mock_gateway
+
+
+# --- RQ1 single-exposure scripts ------------------------------------------
+
+
+# The per-language base config the three single-reader scripts read, as
+# scripts/make_rq1_configs.py writes it. Built from the shipped smoke config
+# rather than a handwritten dict, so a schema change breaks these tests
+# instead of leaving them testing a config shape nothing produces.
+SINGLE_PROBE_QUESTIONS = {
+    "english": "Should city bus fares stay subsidised?",
+    "hinglish": "Kya city bus fares subsidised rehne chahiye?",
+    "romanized_hindi": "Kya shahar ki bus kiraya subsidy jaari rehni chahiye?",
+    "hindi": "क्या शहर की बस किराया सब्सिडी जारी रहनी चाहिए?",
+}
+
+
+@pytest.fixture
+def single_configs(tmp_path):
+    """Writes single_<language>.yaml for the arms a test asks for.
+
+    Points at the 4-entry persona pool and the fixture banks, so a whole
+    sweep is a handful of trials and a test can assert an exact count.
+    """
+
+    def _write(languages=("english",), **overrides):
+        from pathlib import Path
+
+        raw = yaml.safe_load(Path("configs/rq1/smoke.yaml").read_text())
+        raw["persona_pool_id"] = "test_pool"
+        raw["neutral_bank_path"] = "data/bank/test_neutral.csv"
+        raw.update(overrides)
+        config_dir = tmp_path / "configs"
+        config_dir.mkdir(exist_ok=True)
+        for language in languages:
+            arm = dict(raw)
+            arm["run_id"] = f"single_{language}"
+            arm["language_condition"] = language
+            arm["probe_question"] = SINGLE_PROBE_QUESTIONS[language]
+            (config_dir / f"single_{language}.yaml").write_text(
+                yaml.safe_dump(arm, allow_unicode=True), encoding="utf-8"
+            )
+        return config_dir
+
+    return _write

@@ -7,9 +7,14 @@ dependencies = [
     "pydantic>=2.6",
     "pyyaml>=6.0",
     "litellm>=1.40",
+    "networkx>=3.0",
     "tenacity>=8.2",
     "pandas>=2.2",
     "statsmodels>=0.14",
+    # The analysis/ package. scipy for the Wilcoxon signed-rank test,
+    # matplotlib for the figures -- both offline, neither touched by a run.
+    "scipy>=1.11",
+    "matplotlib>=3.8",
 ]
 
 [project.optional-dependencies]
@@ -23,7 +28,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["sandbox*"]
+include = ["sandbox*", "analysis*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

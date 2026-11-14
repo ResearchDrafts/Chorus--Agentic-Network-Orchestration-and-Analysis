@@ -31,10 +31,11 @@ from sandbox.simulation_orchestrator import build_orchestrator
 
 def describe(run: ExperimentRun, runs_dir: Path) -> None:
     """What this run will do, before it does it."""
-    generated = run.M * run.K
     print(f"  run_id        {run.run_id}")
     print(f"  topic         {run.topic}")
-    print(f"  population    M={run.M}  N={run.N}  K={run.K}  alpha={run.alpha}")
+    print(f"  population    M={run.M}  N={run.N}  K={run.K}")
+    print(f"  neighbours    {_describe_neighbours(run)}")
+    print(f"  regime        {_describe_regime(run)}")
     print(f"  language      {run.language_condition}")
     print(f"  model         {run.model_backend_id}")
     print(f"  api_base      {run.api_base or '(hosted provider)'}")
@@ -42,18 +43,163 @@ def describe(run: ExperimentRun, runs_dir: Path) -> None:
     print(f"  seed          {run.seed}")
     print(f"  output        {runs_dir / run.run_id}/")
     print()
-    print(f"  at most {generated} LLM calls (M x K), fewer if memes replace turns")
+    for line in _describe_calls(run):
+        print(f"  {line}")
 
-    if run.api_base is None and run.model_backend_id.startswith("hosted_vllm/"):
+    if run.regime == "bank":
         print()
-        print("  WARNING: model_backend_id is hosted_vllm/* but api_base is unset.")
-        print("           litellm will route on the prefix and never reach your server.")
+        print(f"  probe         {run.probe_question!r}")
+        print(f"                top_logprobs={run.probe_top_logprobs}  "
+              f"mass_floor={run.probe_mass_floor}")
+        print(f"  anchors       1 = {run.stance_low_label}")
+        print(f"                7 = {run.stance_high_label}")
+        print(f"  memory        {_describe_memory(run)}")
+        if run.delivery == "off":
+            print(f"  neutral       {run.neutral_bank_path}  {_neutral_bank_size(run)}")
+        print(
+            "  prompts       "
+            + (
+                "every call logged verbatim to prompts.jsonl"
+                if run.log_prompts
+                else "NOT logged (log_prompts is off)"
+            )
+        )
+        for problem in _probe_language_warnings(run):
+            print()
+            print(f"  WARNING: {problem}")
 
-    checkpoint = runs_dir / run.run_id / "checkpoints" / "latest.json"
-    if checkpoint.exists():
-        print()
-        print("  NOTE: a checkpoint exists, so this RESUMES rather than starting over.")
-        print(f"        Delete {runs_dir / run.run_id}/ or change run_id to start fresh.")
+
+def _describe_memory(run: ExperimentRun) -> str:
+    """What an agent carries from round to round.
+
+    None is the default and prints as what it means rather than as "None
+    rounds": a window bounds the effect the experiment can measure, so which
+    of the two a run is using is worth reading at a glance.
+    """
+    if run.memory_rounds is None:
+        ceiling = (
+            f", capped at {run.max_prompt_tokens} prompt tokens"
+            if run.max_prompt_tokens
+            else ", with no prompt-length ceiling set"
+        )
+        return "full history of reading and replies" + ceiling
+    return f"the last {run.memory_rounds} rounds of reading and replies"
+
+
+def _neutral_bank_size(run: ExperimentRun) -> str:
+    """How many side-free messages the control has to draw stand-ins from.
+
+    Printed because it is the one number about the control a reviewer cannot
+    get from anywhere else in the plan, and because a neutral bank smaller
+    than the argument bank means several arguments share a stand-in -- which
+    is allowed, and worth seeing before the run rather than after.
+
+    Reported rather than raised on: the file has already been validated at
+    config load, so anything wrong here is a file that changed underneath a
+    loaded config, and the plan should still print.
+    """
+    from sandbox.bank_manager import BankValidationError, NeutralBank
+
+    try:
+        return f"({len(NeutralBank(run.neutral_bank_path).ids())} messages)"
+    except BankValidationError as e:
+        return f"(UNREADABLE: {e})"
+
+def _describe_neighbours(run: ExperimentRun) -> str:
+
+
+    if run.neighbor_strategy == "graph":
+        return (
+            f"graph  WS(M={run.M}, degree={run.graph_degree}, p={run.graph_rewire_p})"
+            f"  reading {run.N} of each neighbourhood"
+        )
+    return f"alpha  alpha={run.alpha}  sampling {run.N} from the whole population"
+
+
+def _describe_regime(run: ExperimentRun) -> str:
+    if run.regime != "bank":
+        return "generated  agents write their own posts, stance self-reported"
+    delivery = (
+        "delivery ON"
+        if run.delivery == "on"
+        else f"delivery OFF (E4 control: reads {run.N} side-free messages per round)"
+    )
+    return f"bank  posts from {run.bank_path}, stance by probe  [{delivery}]"
+
+
+def _describe_calls(run: ExperimentRun) -> list[str]:
+    """What this run will cost in calls, counted per regime.
+
+    A bank round is two calls per agent, not one, plus one probe each for
+    round 0 -- so a bank run of the same M and K is about twice the traffic of
+    a generated one, which is worth seeing before starting rather than after.
+
+    The delivery-off control costs the same as a treatment arm: it reads N
+    neutral messages and replies to them, so it makes M x K reply calls too.
+    That is the point of it -- the two arms differ in the persuasive content
+    of what agents read, not in how much work they do.
+    """
+    if run.regime != "bank":
+        return [f"at most {run.M * run.K} LLM calls (M x K), fewer if memes replace turns"]
+
+    replies = run.M * run.K
+    probes = run.M * (run.K + 1)  # +1 for the round-0 probe
+    return [
+        f"{replies} reply calls  (M x K"
+        + (
+            "; the control replies to its neutral messages)"
+            if run.delivery == "off"
+            else ")"
+        ),
+        f"{probes} probe calls  (M x (K+1), including the round-0 probe)",
+        f"{replies + probes} LLM calls in total",
+    ]
+
+
+def _probe_language_warnings(run: ExperimentRun) -> list[str]:
+    """Warns when the probe question is visibly in the wrong script.
+
+    The probe question has to be written in the run's own language -- there is
+    no default, deliberately, because an English fallback would probe every
+    arm in English and leave no trace of it in the output. But a config copied
+    from another arm can still carry the wrong arm's question, and the run
+    would look perfectly valid.
+
+    **The two anchor labels are deliberately NOT checked.** They are English
+    in every arm, because they sit inside English sentences: the probe's scale
+    line ("1 means ..., and 7 means ...") and the lean sentence ("You hold the
+    view that ..."). Only three things vary by language condition -- the bank
+    text, the probe question, and the one directive line -- and everything
+    else about the instrument is held byte-identical across arms, which is
+    what makes a difference between arms attributable to the manipulation.
+    Translating a clause inside an English sentence would change the
+    instrument and code-mix the frame at the same time. Warning about them
+    would be warning about the design.
+
+    Only the Devanagari arm is checkable. english, hinglish and
+    romanized_hindi are all Roman script, so nothing short of language
+    identification could tell a Hinglish question from an English one, and a
+    heuristic that guessed would cry wolf on every Hinglish config -- which is
+    worse than silence, because a warning nobody believes is a warning nobody
+    reads. For those three arms this says nothing, and the reviewer has to
+    read the question, which describe() prints in full for that reason.
+    """
+    if run.language_condition != "hindi":
+        return []
+    if _has_devanagari(run.probe_question):
+        return []
+    return [
+        "language_condition is hindi but probe_question contains no "
+        "Devanagari. Every arm must be probed in its own language, or the "
+        "comparison between arms is lost. (The anchor labels are English in "
+        "every arm by design: they sit inside English sentences.)"
+    ]
+
+
+def _has_devanagari(text: str | None) -> bool:
+    """Any character in the Devanagari block."""
+    return bool(text) and any("\u0900" <= ch <= "\u097f" for ch in text)
+
 
 
 def check_server(run: ExperimentRun) -> str | None:
@@ -117,6 +263,14 @@ async def launch(run: ExperimentRun, runs_dir: Path) -> None:
         RateLimiter(run.rate_limits),
         tracker,
         api_base=run.api_base,
+        # Both were settable on the gateway and configurable on the run, and
+        # neither was passed: a config that asked for 5 top logprobs got the
+        # gateway's default of 20, and max_concurrency was unreachable
+        # outside the notebook. A setting the schema accepts and the launcher
+        # drops is worse than one that does not exist, because
+        # run_config.json records the value the run did not use.
+        max_concurrency=run.max_concurrency,
+        top_logprobs=run.probe_top_logprobs,
     )
     await build_orchestrator(
         run, gateway, cost_tracker=tracker, runs_dir=runs_dir
@@ -126,6 +280,8 @@ async def launch(run: ExperimentRun, runs_dir: Path) -> None:
     rows = (run_dir / "interactions.jsonl").read_text().splitlines()
     print(f"\ndone. {len(rows)} interactions -> {run_dir}/")
     print("  interactions.jsonl   the dataset every analysis reads")
+    if run.log_prompts:
+        print("  prompts.jsonl        every call's prompt, response and logprobs")
     print("  agents_final.jsonl   per-agent state, including stance_history")
     print("  run_config.json      the exact config used, with git_commit_hash")
     print("  checkpoints/         resume point")

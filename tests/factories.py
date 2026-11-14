@@ -113,6 +113,62 @@ def make_stance_text(stance: float = 5.0, reason: str = "my neighbours shifted m
     return f"STANCE: {stance}\n{reason}"
 
 
+def make_logprob_response(
+    mean: float | None = 5.0,
+    probabilities: dict[int, float] | None = None,
+    off_scale: float = 0.0,
+    prompt_tokens: int = 8,
+    completion_tokens: int = 1,
+    latency_ms: int = 20,
+    top_logprobs: list[tuple[str, float]] | None = None,
+) -> BackendResponse:
+    """What a mocked ModelGateway.score_next_token() should return.
+
+    Three ways to specify the distribution, in order of precedence:
+
+        top_logprobs=[("5", -0.1), ...]   the raw pairs, for parser tests
+        probabilities={5: 0.7, 6: 0.3}    a distribution, for a split read
+        mean=5.0                          all mass on one scale point
+
+    `mean` is the usual one, and it is what lets a test drive the probe: the
+    orchestrator's side assignment reads probe_mean, so mean=6.0 makes every
+    agent "pro" and mean=2.0 makes every agent "con", deterministically.
+
+    off_scale adds probability on a non-digit token, for exercising the mass
+    floor: off_scale=0.8 leaves 0.2 on the scale and fails a 0.5 floor.
+    """
+    import math
+
+    if top_logprobs is None:
+        if probabilities is None:
+            if mean is None:
+                raise ValueError("pass one of top_logprobs, probabilities or mean")
+            if float(mean) != int(mean) or not (1 <= int(mean) <= 7):
+                raise ValueError(
+                    f"mean={mean} is not a scale point; pass `probabilities` for a "
+                    "fractional mean so the test states the distribution it wants"
+                )
+            probabilities = {int(mean): 1.0}
+        on_scale_total = sum(probabilities.values())
+        scale = (1.0 - off_scale) / on_scale_total if on_scale_total else 0.0
+        top_logprobs = [
+            (str(point), math.log(probability * scale))
+            for point, probability in sorted(probabilities.items())
+            if probability * scale > 0.0
+        ]
+        if off_scale > 0.0:
+            top_logprobs.append((" I", math.log(off_scale)))
+
+    return BackendResponse(
+        text=top_logprobs[0][0] if top_logprobs else "",
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        latency_ms=latency_ms,
+        raw_provider_response={"mocked_probe": True},
+        top_logprobs=top_logprobs,
+    )
+
+
 def make_backend_response(
     stance: float = 5.0,
     reason: str = "my neighbours shifted me",

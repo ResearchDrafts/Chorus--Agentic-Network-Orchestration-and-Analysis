@@ -1,0 +1,25 @@
+# The 7-point survey question, one per language condition.
+#
+# Read by scripts/make_rq1_configs.py, which writes one into each generated
+# config. It is the ONE piece of prompt text that is translated, and there is
+# no default anywhere in the codebase: a generic English fallback would
+# silently probe every arm in English and leave no trace of it in the output,
+# which is the single most destructive thing that could happen to RQ1.
+#
+# All four keys are required. The generator fails if any is missing rather
+# than falling back to English or skipping that arm.
+#
+# The two anchor labels are NOT translated and are not here: they live in
+# base.yaml and are English in every arm, because they are rendered inside
+# English sentences (the probe's "1 means ..., and 7 means ..." line, and the
+# lean sentence). Translating a clause inside an English sentence would change
+# the instrument and code-mix the frame at the same time.
+#
+# Keep them the same question. The arms differ in rendering, not in what is
+# asked -- a Hindi arm asked a subtly broader question is not a translation
+# of the English arm, it is a different measurement.
+
+english: Should city bus fares stay subsidised?
+hinglish: Kya city bus fares subsidised rehne chahiye?
+romanized_hindi: Kya shahar ki bus kiraya subsidy jaari rehni chahiye?
+hindi: क्या शहर की बस किराया सब्सिडी जारी रहनी चाहिए?

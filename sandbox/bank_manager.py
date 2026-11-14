@@ -1,0 +1,591 @@
+"""The argument bank (RQ1, bank regime).
+
+RQ1 asks whether the language or script of a post changes how much it moves
+an LLM reader, *with the argument held identical*. That last clause is the
+whole experiment, and it is not something agents writing their own posts can
+provide: an English agent and a Hindi agent asked to argue the same side will
+produce different arguments, and any difference in how far their readers move
+is then a difference in content as much as in language.
+
+So posts come from here instead. The bank is a CSV of arguments, each
+pre-translated into all four conditions, and an agent "posting" means
+selecting a bank item for its current side and rendering it in its run's
+language. No LLM writes a post.
+
+**The draw must not depend on language.** This module's one hard property is
+that `pick` is a pure function of (seed, sender_id, side, how many items this
+sender has already posted on that side). Nothing about the rendering, the
+turn, or the condition enters it. That is what makes a matched set matched: if
+agent_0007 is on the pro side in its third round in all four language arms, it
+posts the same argument in all four, and the arms differ in exactly one thing.
+
+The derivation is documented on `pick` itself, since it is the part a reader
+has to be able to check rather than trust.
+"""
+
+from __future__ import annotations
+
+import csv
+import random
+from pathlib import Path
+
+# The language columns, and the values they must be keyed by: these are
+# language_condition values, so a bank whose header says "romanised_hindi"
+# cannot be rendered for a run whose condition is "romanized_hindi".
+from sandbox.models import LANGUAGE_CONDITIONS
+
+SIDES = ("pro", "con")
+STRENGTHS = ("strong", "weak")
+REQUIRED_COLUMNS = ("item_id", "arg_id", "strength", "side", *LANGUAGE_CONDITIONS)
+
+# Every ID in the neutral bank starts with this, and no argument-bank item
+# may. The two files are read back through one column -- items_read holds
+# whichever the agent was shown -- so the prefix is what lets a reader, and
+# _remembered_text on the resume path, tell which file to look an ID up in
+# without a second column saying so. A bank item under this prefix would be
+# rendered from the neutral file rather than from its own row, so the
+# argument in the CSV would silently never be read. Checked at load, so the
+# collision is a config error rather than a silent one.
+NEUTRAL_PREFIX = "neutral_"
+
+NEUTRAL_REQUIRED_COLUMNS = ("neutral_id", *LANGUAGE_CONDITIONS)
+
+
+# How many starter posts on each side an agent at each initial_stance is
+# given under start_mode="posts", as (con, pro). Con is the low end of the
+# scale. More posts, all on one side, the further the lean is from 4; the
+# middle gets one of each, so an undecided agent has still said something on
+# the topic and its probe prompt has the same shape as everyone else's.
+STARTER_COUNTS: dict[int, tuple[int, int]] = {
+    1: (3, 0),
+    2: (2, 0),
+    3: (1, 0),
+    4: (1, 1),
+    5: (0, 1),
+    6: (0, 2),
+    7: (0, 3),
+}
+
+
+def starter_items(bank: "BankManager", seed: int, key: str, lean: float) -> list[str]:
+    """The starter bank items an agent at `lean` is shown as its own posts.
+
+    A pure function of (seed, key, lean) and the bank's contents. No
+    language: the four arms of a matched set share the seed, and the reader
+    or agent key does not mention a language, so every arm shows the same
+    items, each rendered in its own language. Drawn without replacement
+    within a side, and shuffled together, so the order says nothing about
+    the side.
+    """
+    point = int(lean)
+    if point != lean or point not in STARTER_COUNTS:
+        raise ValueError(
+            f"no starter composition for initial_stance {lean!r}: expected a "
+            f"whole number in {sorted(STARTER_COUNTS)}"
+        )
+    n_con, n_pro = STARTER_COUNTS[point]
+    rng = random.Random(f"{seed}|starter|{key}|{point}")
+    con = bank.items_for_side("con")
+    pro = bank.items_for_side("pro")
+    if len(con) < n_con or len(pro) < n_pro:
+        raise ValueError(
+            f"starter bank has {len(con)} con and {len(pro)} pro items; lean "
+            f"{point} needs {n_con} con and {n_pro} pro"
+        )
+    chosen = rng.sample(con, n_con) + rng.sample(pro, n_pro)
+    rng.shuffle(chosen)
+    return chosen
+
+
+STARTER_MIN_PER_SIDE = max(max(c, p) for c, p in STARTER_COUNTS.values())
+
+
+class BankValidationError(Exception):
+    """Raised for any problem with a bank file, listing every problem found.
+
+    Accumulated rather than fail-fast, for the reason config_loader gives: a
+    hand-maintained data file with three mistakes in it should take one run to
+    fix, not three.
+    """
+
+    def __init__(self, path: Path, errors: list[str]):
+        self.path = path
+        self.errors = errors
+        super().__init__(f"Invalid argument bank at {path}: {'; '.join(errors)}")
+
+
+class BankManager:
+    """Loads and serves one argument bank.
+
+    Stateful in exactly one respect: it counts how many items each sender has
+    posted on each side, which is what drives the no-repeat cycle. Those
+    counts are the only thing here that a resume has to restore, and
+    `restore_post_counts` rebuilds them from interactions.jsonl rather than
+    from the checkpoint, the same way the orchestrator rebuilds last posts --
+    the log is complete through the last completed turn and is already the
+    authority on what was actually posted.
+    """
+
+    def __init__(self, path: str | Path, exclude_items_path: str | Path | None = None):
+        self._path = Path(path)
+        self._items = _load_and_validate(self._path)
+        if exclude_items_path is not None:
+            self._items = _without_excluded(
+                self._items, Path(exclude_items_path)
+            )
+        self._by_side: dict[str, list[str]] = {
+            side: sorted(
+                item_id for item_id, row in self._items.items() if row["side"] == side
+            )
+            for side in SIDES
+        }
+        # (sender_id, side) -> how many items this sender has posted on that
+        # side. Not a per-sender RNG state: see pick's docstring.
+        self._post_counts: dict[tuple[str, str], int] = {}
+
+    # --- reading the bank -------------------------------------------------
+
+    def items_for_side(self, side: str) -> list[str]:
+        """The item IDs on `side`, sorted.
+
+        Sorted, not in file order: the permutation `pick` derives is a
+        function of this sequence, so it has to be a function of the bank's
+        contents rather than of how someone happened to order the rows.
+        Re-sorting the CSV must not change which argument an agent posts.
+        """
+        self._require_side(side)
+        return list(self._by_side[side])
+
+    def all_item_ids(self) -> list[str]:
+        """Every item ID in the bank, sorted, both sides together.
+
+        Sorted for items_for_side's reason: NeutralBank.stand_in_for indexes
+        into this sequence, so it has to be a function of the bank's contents
+        rather than of how someone happened to order the rows.
+        """
+        return sorted(self._items)
+
+    def text(self, item_id: str, language: str) -> str:
+        """The item's rendering in one language condition.
+
+        Raises for an unknown item or an unknown language rather than falling
+        back to English, which would silently turn one arm of a matched set
+        into a second copy of another.
+        """
+        if item_id not in self._items:
+            raise KeyError(f"unknown bank item: {item_id!r}")
+        if language not in LANGUAGE_CONDITIONS:
+            raise ValueError(
+                f"unknown language condition {language!r}, expected one of {list(LANGUAGE_CONDITIONS)}"
+            )
+        return self._items[item_id][language]
+
+    def side_of(self, item_id: str) -> str:
+        if item_id not in self._items:
+            raise KeyError(f"unknown bank item: {item_id!r}")
+        return self._items[item_id]["side"]
+
+    def strength_of(self, item_id: str) -> str:
+        if item_id not in self._items:
+            raise KeyError(f"unknown bank item: {item_id!r}")
+        return self._items[item_id]["strength"]
+
+    def arg_id_of(self, item_id: str) -> str:
+        """The argument this item is a rendering of.
+
+        Distinct from item_id, and the distinction is what E1's model is
+        specified against: item_id names one row, arg_id names the argument
+        that row renders. The mixed model fits a random intercept per item so
+        that "this particular argument is more persuasive than average" is
+        absorbed rather than attributed to a language, and arg_id is the
+        column that says which arguments are the same argument.
+
+        Raises for an unknown item, like the two above: a fabricated arg_id
+        would silently merge two arguments into one group.
+        """
+        if item_id not in self._items:
+            raise KeyError(f"unknown bank item: {item_id!r}")
+        return self._items[item_id]["arg_id"]
+
+    # --- picking ----------------------------------------------------------
+
+    def pick(self, sender_id: str, turn: int, side: str, rng: random.Random) -> str:
+        """The item `sender_id` posts on `side`, with no repeats within a cycle.
+
+        A sender works through every item on a side before any item on that
+        side comes round again, in an order that differs per sender. So two
+        agents on the same side do not post the argument in lockstep, and no
+        agent repeats itself while it still has something new to say.
+
+        **The derivation, which is the part that matters.** Let
+
+            items  = items_for_side(side)            (sorted, so bank order is irrelevant)
+            count  = how many items this sender has already posted on this side
+            cycle  = count // len(items)
+            index  = count %  len(items)
+
+        then the order for this (sender, side, cycle) is
+
+            random.Random(f"{base}|{side}|{cycle}").shuffle(items)
+
+        and the answer is `items[index]`, where `base` is read out of `rng`'s
+        *current state without advancing it*. The orchestrator hands in
+        `SeedManager.sender_rng("argument", sender_id)`, which is a fresh
+        stream derived from (seed, purpose, sender) and nothing else, so
+        `base` is a pure function of (seed, sender_id).
+
+        Three consequences, each of them a requirement rather than a
+        side-effect:
+
+        * `turn` does not appear. It is accepted (callers have it, and a
+          future variant may want it) and deliberately unused: a per-turn
+          derivation would reshuffle the order every round, and "no repeat
+          until the side is exhausted" would quietly stop being true.
+        * Language does not appear. Two runs differing only in
+          language_condition give the same sender the same item sequence on
+          the same side, which is what a matched set means.
+        * No RNG state is stored, so a resume needs only the counts, which
+          `restore_post_counts` rebuilds from the log. Reading `rng`'s state
+          without consuming it is what makes the call idempotent: picking
+          twice for the same (sender, side, count) returns the same item, so a
+          retry or a re-derivation after a crash cannot drift.
+
+        `pick` does not itself advance the count. The orchestrator calls
+        `record_post` after the round is written, so a round that was computed
+        but never logged leaves no trace -- which is what keeps a resumed run
+        identical to an uninterrupted one.
+        """
+        self._require_side(side)
+        if not sender_id:
+            raise ValueError("sender_id must be a non-empty string")
+
+        items = self._by_side[side]
+        count = self._post_counts.get((sender_id, side), 0)
+        cycle, index = divmod(count, len(items))
+
+        order = list(items)
+        _cycle_rng(rng, side, cycle).shuffle(order)
+        return order[index]
+
+    def record_post(self, sender_id: str, side: str) -> None:
+        """Marks one item as spent for (sender, side), advancing the cycle."""
+        self._require_side(side)
+        self._post_counts[(sender_id, side)] = self._post_counts.get((sender_id, side), 0) + 1
+
+    def post_counts(self) -> dict[tuple[str, str], int]:
+        """A copy, for assertions and for checkpoint inspection."""
+        return dict(self._post_counts)
+
+    def restore_post_counts(self, counts: dict[tuple[str, str], int]) -> None:
+        """Replaces the counts wholesale, for a resume."""
+        for (sender_id, side), count in counts.items():
+            self._require_side(side)
+            if count < 0:
+                raise ValueError(f"post count for {sender_id}/{side} is negative: {count}")
+        self._post_counts = dict(counts)
+
+    # --- internals --------------------------------------------------------
+
+    def _require_side(self, side: str) -> None:
+        if side not in SIDES:
+            raise ValueError(f"unknown side {side!r}, expected one of {list(SIDES)}")
+
+
+class NeutralBank:
+    """The side-free messages the `delivery: off` control reads.
+
+    The control exists to measure how much stance drifts from taking part at
+    all -- reading something, writing something, being asked -- so it has to
+    do the same amount of the same activity a treatment arm does, differing
+    only in whether what it reads argues anything. One fixed message per
+    round was not that: a treatment agent reads N posts a round, with a
+    pattern of repeats that follows from who its neighbours are, so the two
+    arms differed in how much was read and in how often something was read
+    twice, as well as in persuasive content.
+
+    So the control reads N of these a round, one standing in for each bank
+    item it would have been delivered, chosen by `stand_in_for`. Same count,
+    same repeat structure, no argument.
+
+    Validated like the argument bank and for the same reason: an empty Hindi
+    cell here would give one arm's control a blank post every round, which is
+    indistinguishable in the output from a message nobody moved for.
+    """
+
+    def __init__(self, path: str | Path):
+        self._path = Path(path)
+        self._messages = _load_and_validate_neutral(self._path)
+        self._ids = sorted(self._messages)
+
+    def ids(self) -> list[str]:
+        """The neutral IDs, sorted. Sorted for items_for_side's reason: what
+        `stand_in_for` returns must be a function of the file's contents and
+        not of its row order."""
+        return list(self._ids)
+
+    def text(self, neutral_id: str, language: str) -> str:
+        """The message's rendering in one language condition.
+
+        Raises for an unknown ID or language rather than falling back, for
+        BankManager.text's reason: a fallback to English would quietly turn
+        one arm's control into a second copy of another's.
+        """
+        if neutral_id not in self._messages:
+            raise KeyError(f"unknown neutral message: {neutral_id!r}")
+        if language not in LANGUAGE_CONDITIONS:
+            raise ValueError(
+                f"unknown language condition {language!r}, "
+                f"expected one of {list(LANGUAGE_CONDITIONS)}"
+            )
+        return self._messages[neutral_id][language]
+
+    def stand_in_for(self, item_id: str, all_item_ids: list[str]) -> str:
+        """The neutral message that takes the place of one bank item.
+
+        A pure function of the two files' contents:
+
+            ids()[sorted(all_item_ids).index(item_id) % len(ids())]
+
+        No seed, no turn, no agent, no language. That is the whole point. The
+        control's feed has to mirror the treatment's *shape* -- N posts, with
+        the same two-of-them-are-the-same pattern whenever the treatment would
+        have delivered one item twice -- and a stand-in drawn from a stream
+        would reproduce the count but not the repeats, while one that varied
+        by language would give the four arms' controls different feeds.
+
+        Being a function of the bank rather than of the round also means the
+        mapping survives a resume with nothing to restore: round 3 rebuilt
+        from the log maps the same item to the same message it did live.
+
+        The two files need not be the same size. A neutral bank smaller than
+        the argument bank wraps, so several items share a message, and the
+        mirror property still holds: equal items map to equal messages, which
+        is what makes the repeat structure match.
+        """
+        if item_id not in all_item_ids:
+            raise KeyError(
+                f"{item_id!r} is not in the argument bank, so it has no stand-in"
+            )
+        return self._ids[sorted(all_item_ids).index(item_id) % len(self._ids)]
+
+
+def read_exclusions(path: Path) -> list[str]:
+    """The item IDs in an exclusion file, in file order, duplicates kept.
+
+    One ID per line; blank lines and "#" comments are skipped, so the file the
+    comprehension check writes -- which carries a comment header saying what
+    failed and why -- can be fed straight back into `exclude_items_path`.
+
+    Duplicates are not collapsed here, deliberately: the caller reports them
+    as a problem rather than silently accepting a list that says the same
+    thing twice, which is usually a sign that two files were concatenated.
+    """
+    if not path.exists():
+        raise BankValidationError(path, [f"exclusion file not found: {path}"])
+    out: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.split("#", 1)[0].strip()
+        if stripped:
+            out.append(stripped)
+    return out
+
+
+def _without_excluded(
+    items: dict[str, dict[str, str]], exclude_path: Path
+) -> dict[str, dict[str, str]]:
+    """`items` minus the IDs in `exclude_path`, or a listed set of problems.
+
+    Three ways this raises, all of them for the same reason -- an exclusion
+    that did not do what the config asked must not pass silently:
+
+    * an unknown ID. A typo'd exclusion leaves the item in the bank, which is
+      the opposite of what was asked and leaves no trace in the output.
+    * a duplicate. Usually two concatenated lists, and worth seeing.
+    * an empty side. `pick` raises for a side with no items the first time an
+      agent lands on it, which is mid-run and per-agent; a bank that cannot
+      represent one side of the argument is a config error, and the whole
+      point of excluding incomprehensible items is to be left with a bank the
+      experiment can still run on.
+
+    Every problem is reported at once, like the rest of this module.
+    """
+    wanted = read_exclusions(exclude_path)
+    errors: list[str] = []
+    for item_id in sorted(set(wanted)):
+        if item_id not in items:
+            errors.append(f"unknown item_id {item_id!r}: not in the argument bank")
+    for item_id in sorted({i for i in wanted if wanted.count(i) > 1}):
+        errors.append(f"duplicate item_id {item_id!r} in the exclusion list")
+
+    kept = {k: v for k, v in items.items() if k not in set(wanted)}
+    for side in SIDES:
+        if not any(row["side"] == side for row in kept.values()):
+            errors.append(
+                f"excluding these items leaves no {side!r} items: a bank that "
+                "cannot represent one side of the argument cannot run"
+            )
+
+    if errors:
+        raise BankValidationError(exclude_path, errors)
+    return kept
+
+
+def _load_and_validate_neutral(path: Path) -> dict[str, dict[str, str]]:
+    """Reads the neutral CSV and reports every problem at once.
+
+    Same contract as _load_and_validate, minus side and strength, which a
+    message that takes no side has neither of.
+    """
+    if not path.exists():
+        raise BankValidationError(path, [f"file not found: {path}"])
+
+    with path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames or []
+        missing_columns = [c for c in NEUTRAL_REQUIRED_COLUMNS if c not in fieldnames]
+        if missing_columns:
+            raise BankValidationError(
+                path, [f"missing required column(s): {', '.join(missing_columns)}"]
+            )
+        rows = list(reader)
+
+    if not rows:
+        raise BankValidationError(
+            path, ["neutral bank is empty: no rows after the header"]
+        )
+
+    errors: list[str] = []
+    messages: dict[str, dict[str, str]] = {}
+
+    for line_no, row in enumerate(rows, start=2):  # start=2: line 1 is the header
+        neutral_id = (row.get("neutral_id") or "").strip()
+        if not neutral_id:
+            errors.append(f"line {line_no}: empty neutral_id")
+            continue
+        if neutral_id in messages:
+            errors.append(f"line {line_no}: duplicate neutral_id {neutral_id!r}")
+            continue
+        if not neutral_id.startswith(NEUTRAL_PREFIX):
+            errors.append(
+                f"line {line_no}: neutral_id {neutral_id!r} must start with "
+                f"{NEUTRAL_PREFIX!r}, which is how a logged ID is told apart "
+                "from an argument-bank item"
+            )
+            continue
+
+        renderings = {}
+        for language in LANGUAGE_CONDITIONS:
+            text = (row.get(language) or "").strip()
+            if not text:
+                errors.append(f"line {line_no} ({neutral_id}): empty {language} text")
+            renderings[language] = text
+        messages[neutral_id] = {"neutral_id": neutral_id, **renderings}
+
+    if errors:
+        raise BankValidationError(path, errors)
+    return messages
+
+def _cycle_rng(rng: random.Random, side: str, cycle: int) -> random.Random:
+
+
+    """A generator for one (sender, side, cycle), derived without consuming rng.
+
+    `rng` carries the (seed, sender) part of the derivation. Its state is
+    copied into a throwaway generator and read there, so the caller's stream
+    is left exactly where it was found and `pick` stays idempotent -- calling
+    it twice for the same count cannot return two different items.
+
+    The cycle key is a string rather than arithmetic: random.Random seeds a
+    string through SHA-512, which is stable across processes and
+    collision-free, where `hash((side, cycle))` is neither.
+    """
+    probe = random.Random()
+    probe.setstate(rng.getstate())
+    base = probe.getrandbits(64)
+    return random.Random(f"{base}|{side}|{cycle}")
+
+
+def _load_and_validate(path: Path) -> dict[str, dict[str, str]]:
+    """Reads the CSV and reports every problem at once.
+
+    Validation is strict for the same reason the rest of this codebase is: a
+    bank with one empty Hindi cell would otherwise run to completion and
+    produce a Hindi arm in which one argument was silently blank, which is
+    indistinguishable in the output from an argument that failed to persuade.
+    """
+    if not path.exists():
+        raise BankValidationError(path, [f"file not found: {path}"])
+
+    with path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames or []
+        missing_columns = [c for c in REQUIRED_COLUMNS if c not in fieldnames]
+        if missing_columns:
+            # Nothing further can be checked without the columns, and every
+            # per-row error would be a restatement of this one.
+            raise BankValidationError(
+                path, [f"missing required column(s): {', '.join(missing_columns)}"]
+            )
+        rows = list(reader)
+
+    errors: list[str] = []
+    items: dict[str, dict[str, str]] = {}
+    seen_sides: set[str] = set()
+
+    if not rows:
+        raise BankValidationError(path, ["bank is empty: no rows after the header"])
+
+    for line_no, row in enumerate(rows, start=2):  # start=2: line 1 is the header
+        item_id = (row.get("item_id") or "").strip()
+        if not item_id:
+            errors.append(f"line {line_no}: empty item_id")
+            continue
+        if item_id in items:
+            errors.append(f"line {line_no}: duplicate item_id {item_id!r}")
+            continue
+        if item_id.startswith(NEUTRAL_PREFIX):
+            # Reserved for the neutral bank. See NEUTRAL_PREFIX: an item
+            # under this prefix would be looked up in the neutral file, so
+            # the argument in this row would silently never be read.
+            errors.append(
+                f"line {line_no}: item_id {item_id!r} starts with the reserved prefix "
+                f"{NEUTRAL_PREFIX!r}, which names the neutral bank's messages"
+            )
+            continue
+
+        side = (row.get("side") or "").strip()
+        if side not in SIDES:
+            errors.append(
+                f"line {line_no} ({item_id}): side must be one of {list(SIDES)}, got {side!r}"
+            )
+        else:
+            seen_sides.add(side)
+
+        strength = (row.get("strength") or "").strip()
+        if strength not in STRENGTHS:
+            errors.append(
+                f"line {line_no} ({item_id}): strength must be one of {list(STRENGTHS)}, "
+                f"got {strength!r}"
+            )
+
+        arg_id = (row.get("arg_id") or "").strip()
+        if not arg_id:
+            errors.append(f"line {line_no} ({item_id}): empty arg_id")
+
+        renderings = {}
+        for language in LANGUAGE_CONDITIONS:
+            text = (row.get(language) or "").strip()
+            if not text:
+                errors.append(f"line {line_no} ({item_id}): empty {language} text")
+            renderings[language] = text
+
+        items[item_id] = {"item_id": item_id, "arg_id": arg_id, "side": side,
+                          "strength": strength, **renderings}
+
+    for side in SIDES:
+        if side not in seen_sides:
+            errors.append(f"no items on the {side!r} side: every side must be representable")
+
+    if errors:
+        raise BankValidationError(path, errors)
+    return items

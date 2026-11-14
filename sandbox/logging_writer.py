@@ -1,7 +1,7 @@
 """Append-only persistence (full_design_doc.md Sec 3.8).
 
 One run = one directory, containing run_config.json, interactions.jsonl,
-and agents_final.jsonl. Disk-write failures (OSError, e.g. disk full)
+agents_final.jsonl and -- when the run asks for it -- prompts.jsonl. Disk-write failures (OSError, e.g. disk full)
 propagate uncaught -- treated as fatal, since silently losing an
 Interaction record would corrupt the run's data integrity in a way no
 downstream analysis could detect.
@@ -20,13 +20,14 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from sandbox.models import Agent, ExperimentRun, Interaction
+from sandbox.models import Agent, ExperimentRun, Interaction, PromptRecord
 
 
 class LoggingWriter:
     def __init__(self, run_dir: Path):
         self._run_dir = run_dir
         self._interactions_path = run_dir / "interactions.jsonl"
+        self._prompts_path = run_dir / "prompts.jsonl"
         self._lock = asyncio.Lock()  # serializes concurrent appends from dispatch tasks
 
     async def write_interaction(self, interaction: Interaction) -> None:
@@ -40,6 +41,28 @@ class LoggingWriter:
         line = interaction.model_dump_json() + "\n"
         async with self._lock:
             with open(self._interactions_path, "a", encoding="utf-8") as f:
+                f.write(line)
+
+    async def write_prompt(self, record: PromptRecord) -> None:
+        """Appends one line to prompts.jsonl: one LLM call, verbatim.
+
+        Shares `_lock` with write_interaction rather than taking one of its
+        own. The two files are written from the same concurrent dispatch
+        tasks, the lock is held only across a single small append, and one
+        lock is one fewer ordering to reason about -- while two independent
+        locks would let a task holding one wait on the other for no benefit.
+
+        **Duplicate lines are possible, and acceptable.** A resumed run
+        re-runs the round its checkpoint does not cover, so that round's
+        prompts are appended a second time. Key on (turn, agent_id, call)
+        with the last write winning, exactly as export_csv.py does for
+        interactions.jsonl; the later copy is the call whose result the
+        resumed run actually used. Deduplicating here would mean reading the
+        whole file back on every append.
+        """
+        line = record.model_dump_json() + "\n"
+        async with self._lock:
+            with open(self._prompts_path, "a", encoding="utf-8") as f:
                 f.write(line)
 
     def write_run_config(self, run: ExperimentRun) -> None:

@@ -121,7 +121,142 @@ def _format_validation_errors(e: ValidationError) -> list[str]:
     return out
 
 
+def _bank_errors(raw: dict) -> list[str]:
+    """Validates a bank-regime run's argument bank at config-load time.
+
+    The bank is loaded here in full, not merely stat()ed, and every problem
+    it reports is folded into this config's error list. A bank with an empty
+    Hindi cell is a config error in exactly the sense the rest of this module
+    means: the run would start, complete, cost its GPU hours, and produce a
+    Hindi arm in which one argument was silently blank -- which is
+    indistinguishable in the output from an argument that failed to persuade.
+    Feature 1's whole premise is that such a thing is caught before anything
+    is spent.
+
+    Reads `regime` from the raw dict for the same reason the rest of this
+    function does: it has to run whether or not Pydantic validation
+    succeeded, so a config with both a bad alpha and a broken bank reports
+    both.
+    """
+    if raw.get("regime") != "bank":
+        return []
+
+    bank_path = raw.get("bank_path")
+    if not isinstance(bank_path, str) or not bank_path.strip():
+        # ExperimentRun's own validator reports the missing field; repeating
+        # it here would put the same problem in the list twice.
+        return []
+
+    path = Path(bank_path)
+    if not path.exists():
+        return [f"bank_path '{bank_path}' not found at {path}"]
+
+    # Imported here rather than at module scope: config_loader is Tier 0 and
+    # bank_manager is Tier 1, so a module-level import would invert the
+    # dependency direction the whole architecture is built on.
+    from sandbox.bank_manager import BankManager, BankValidationError
+
+    # The exclusion list is applied here too, so a typo'd or bank-emptying
+    # exclusion is a config error rather than something discovered on the
+    # first round of a paid run.
+    exclude = raw.get("exclude_items_path")
+    exclude_path = (
+        Path(exclude) if isinstance(exclude, str) and exclude.strip() else None
+    )
+    try:
+        BankManager(path, exclude_items_path=exclude_path)
+    except BankValidationError as e:
+        label = f"bank {bank_path}" if e.path == path else f"exclusions {exclude}"
+        return [f"{label}: {problem}" for problem in e.errors]
+    return []
+
+
+def _starter_bank_errors(raw: dict) -> list[str]:
+    """Validates start_mode="posts"'s starter bank at config-load time.
+
+    Loaded in full for _bank_errors' reason. Two checks beyond the file's own
+    validity: each side holds enough items for the most one-sided lean, and no
+    item_id is shared with the argument bank. An agent whose starter post is
+    the very argument it is later shown would be reading itself, and the two
+    files would then disagree about which one the ID's text comes from.
+    """
+    if raw.get("regime") != "bank" or raw.get("start_mode") != "posts":
+        return []
+    starter_path = raw.get("starter_bank_path")
+    if not isinstance(starter_path, str) or not starter_path.strip():
+        return []  # the schema's own validator reports the missing path
+    path = Path(starter_path)
+    if not path.exists():
+        return [f"starter_bank_path '{starter_path}' not found at {path}"]
+
+    from sandbox.bank_manager import (
+        STARTER_MIN_PER_SIDE,
+        BankManager,
+        BankValidationError,
+    )
+
+    try:
+        starters = BankManager(path)
+    except BankValidationError as e:
+        return [f"starter bank {starter_path}: {problem}" for problem in e.errors]
+    errors = [
+        f"starter bank {starter_path}: {len(starters.items_for_side(side))} {side} "
+        f"item(s), needs at least {STARTER_MIN_PER_SIDE}"
+        for side in ("con", "pro")
+        if len(starters.items_for_side(side)) < STARTER_MIN_PER_SIDE
+    ]
+    bank_path = raw.get("bank_path")
+    if isinstance(bank_path, str) and Path(bank_path).exists():
+        try:
+            shared = set(starters.all_item_ids()) & set(BankManager(Path(bank_path)).all_item_ids())
+        except BankValidationError:
+            shared = set()  # _bank_errors reports the bank's own problems
+        if shared:
+            errors.append(
+                f"starter bank {starter_path} shares item_id(s) with the argument "
+                f"bank: {sorted(shared)}"
+            )
+    return errors
+
+
+def _neutral_bank_errors(raw: dict) -> list[str]:
+    """Validates a delivery-off control's neutral bank at config-load time.
+
+    Loaded in full, for _bank_errors' reason: an empty Hindi cell here gives
+    that arm's control a blank post every round, and a blank post is
+    indistinguishable in the output from a message nobody moved for. The
+    control is what every treatment effect is measured against, so a quietly
+    broken one invalidates the arms it is the baseline for, not just itself.
+
+    Reads regime and delivery from the raw dict so this runs whether or not
+    Pydantic validation succeeded.
+    """
+    if raw.get("regime") != "bank" or raw.get("delivery") != "off":
+        return []
+
+    neutral_bank_path = raw.get("neutral_bank_path")
+    if not isinstance(neutral_bank_path, str) or not neutral_bank_path.strip():
+        # ExperimentRun's own validator reports the missing field; repeating
+        # it here would put the same problem in the list twice.
+        return []
+
+    path = Path(neutral_bank_path)
+    if not path.exists():
+        return [f"neutral_bank_path '{neutral_bank_path}' not found at {path}"]
+
+    # Imported inside the function for _bank_errors' reason: config_loader is
+    # Tier 0 and bank_manager is Tier 1.
+    from sandbox.bank_manager import BankValidationError, NeutralBank
+
+    try:
+        NeutralBank(path)
+    except BankValidationError as e:
+        return [f"neutral bank {neutral_bank_path}: {problem}" for problem in e.errors]
+    return []
+
 def _resolve_git_commit_hash() -> str:
+
+
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -140,8 +275,10 @@ def _resolve_git_commit_hash() -> str:
 def _referenced_asset_errors(raw: dict) -> list[str]:
     """
     Checks that meme_pool_id (if meme_injection.enabled) resolves to an
-    actual dataset file, and that the persona pool referenced by the run
-    exists. Returns ALL missing-asset errors found, not just the first.
+    actual dataset file, that the persona pool referenced by the run
+    exists, that a bank-regime run's bank loads and validates, and that a
+    delivery-off control's neutral bank does too. Returns ALL missing-asset
+    errors found, not just the first.
 
     Reads directly from the raw (possibly Pydantic-invalid) dict rather
     than a validated ExperimentRun, so this check runs independently of
@@ -149,6 +286,9 @@ def _referenced_asset_errors(raw: dict) -> list[str]:
     note in load_run_config().
     """
     errors: list[str] = []
+    errors.extend(_bank_errors(raw))
+    errors.extend(_neutral_bank_errors(raw))
+    errors.extend(_starter_bank_errors(raw))
 
     meme_injection = raw.get("meme_injection")
     if isinstance(meme_injection, dict) and meme_injection.get("enabled") is True:
