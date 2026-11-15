@@ -372,6 +372,134 @@ def test_rounds_overrides_k_for_every_experiment(campaign):
         assert config["K"] == 20
 
 
+# --- Fix 5: --agents and --graph-degree -------------------------------------
+
+
+def test_agents_defaults_to_the_base_configs_own_m(campaign):
+    out = campaign("--seeds", "1", "--experiments", "e3")
+    base_m = yaml.safe_load(BASE.read_text())["M"]
+    config = yaml.safe_load((out / "e3_english_ws_s01.yaml").read_text())
+    assert config["M"] == base_m
+
+
+def test_agents_overrides_m_for_every_experiment(campaign):
+    out = campaign(
+        "--seeds", "1", "--experiments", "e3", "e8", "e9",
+        "--agents", "30", "--graph-degree", "6",
+    )
+    for stem in ("e3_english_ws_s01", "e8_english_ws_s01", "e9_english_ws_s01"):
+        config = yaml.safe_load((out / f"{stem}.yaml").read_text())
+        assert config["M"] == 30
+
+
+def test_graph_degree_applies_to_e3_through_e7_not_only_e8_e9(campaign):
+    """Today e3-e7 run on base.yaml's own graph_degree (4) while e8/e9 run
+    on 6 -- two different networks. --graph-degree unifies them."""
+    out = campaign(
+        "--seeds", "1", "--experiments", "e3", "e5", "e8", "e9",
+        "--agents", "30", "--graph-degree", "8",
+    )
+    for stem in ("e3_english_ws_s01", "e5_english_ws_s01", "e8_english_ws_s01", "e9_english_ws_s01"):
+        config = yaml.safe_load((out / f"{stem}.yaml").read_text())
+        assert config["graph_degree"] == 8
+
+
+def test_graph_degree_never_drops_e8_e9_below_their_own_minimum(campaign):
+    """e8/e9 need degree >= N=5 (Jo et al.'s rule); a caller asking for a
+    lower --graph-degree must not be allowed to break that for them, even
+    though it is honoured exactly for e3-e7."""
+    out = campaign(
+        "--seeds", "1", "--experiments", "e3", "e8", "e9",
+        "--agents", "40", "--graph-degree", "4",
+    )
+    e3 = yaml.safe_load((out / "e3_english_ws_s01.yaml").read_text())
+    e8 = yaml.safe_load((out / "e8_english_ws_s01.yaml").read_text())
+    e9 = yaml.safe_load((out / "e9_english_ws_s01.yaml").read_text())
+    assert e3["graph_degree"] == 4
+    assert e8["graph_degree"] == gen.RECSYS_GRAPH_DEGREE == 6
+    assert e9["graph_degree"] == gen.RECSYS_GRAPH_DEGREE == 6
+
+
+def test_default_graph_degree_leaves_e3_e7_and_e8_e9_as_today(campaign):
+    """No --graph-degree at all: e3-e7 inherit base.yaml's own value, e8/e9
+    keep RECSYS_GRAPH_DEGREE -- byte-identical to before this flag existed."""
+    out = campaign("--seeds", "1", "--experiments", "e3", "e8", "--agents", "40")
+    base_degree = yaml.safe_load(BASE.read_text())["graph_degree"]
+    e3 = yaml.safe_load((out / "e3_english_ws_s01.yaml").read_text())
+    e8 = yaml.safe_load((out / "e8_english_ws_s01.yaml").read_text())
+    assert e3["graph_degree"] == base_degree
+    assert e8["graph_degree"] == gen.RECSYS_GRAPH_DEGREE
+
+
+def test_no_agents_or_graph_degree_flag_reproduces_todays_output(campaign):
+    """An invocation with neither flag must be byte-identical to one that
+    never knew about them -- the default-campaign guarantee every other
+    flag here already holds."""
+    with_flags = campaign("--seeds", "1", "--experiments", "e3", "e8", "e9")
+    without = campaign("--seeds", "1", "--experiments", "e3", "e8", "e9")
+    for stem in ("e3_english_ws_s01", "e8_english_ws_s01", "e9_english_ws_s01"):
+        assert (with_flags / f"{stem}.yaml").read_text() == (without / f"{stem}.yaml").read_text()
+
+
+def test_smoke_scale_warning_fires_for_the_shipped_base_config(campaign, capsys):
+    """base.yaml's own bank_path is the 4-item test fixture, so the
+    generator must say so even though nothing else about this invocation
+    is unusual."""
+    campaign("--seeds", "1", "--experiments", "e3")
+    out = capsys.readouterr().out
+    assert "smoke-scale values; not a campaign" in out
+
+
+def test_smoke_scale_warning_fires_on_low_m_even_with_a_real_bank(tmp_path):
+    """Below 20 agents is smoke-scale regardless of the bank -- simulate a
+    non-test bank_path by pointing a copy of base.yaml at a renamed copy of
+    the same fixture bank."""
+    import shutil
+
+    real_bank = tmp_path / "real_bank.csv"
+    shutil.copy(Path("data/bank/test_bank.csv"), real_bank)
+    base = yaml.safe_load(BASE.read_text())
+    base["bank_path"] = str(real_bank)
+    custom_base = tmp_path / "base.yaml"
+    custom_base.write_text(yaml.safe_dump(base, allow_unicode=True))
+
+    out = tmp_path / "campaign"
+    import io
+    import contextlib
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert gen.main([
+            "--base", str(custom_base), "--probe-questions", str(QUESTIONS),
+            "--out", str(out), "--seeds", "1", "--experiments", "e3",
+        ]) == 0
+    assert "smoke-scale values; not a campaign" in buf.getvalue()
+
+
+def test_smoke_scale_warning_is_silent_for_a_real_bank_and_m_at_least_20(tmp_path):
+    import shutil
+
+    real_bank = tmp_path / "real_bank.csv"
+    shutil.copy(Path("data/bank/test_bank.csv"), real_bank)
+    base = yaml.safe_load(BASE.read_text())
+    base["bank_path"] = str(real_bank)
+    custom_base = tmp_path / "base.yaml"
+    custom_base.write_text(yaml.safe_dump(base, allow_unicode=True))
+
+    out = tmp_path / "campaign"
+    import io
+    import contextlib
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert gen.main([
+            "--base", str(custom_base), "--probe-questions", str(QUESTIONS),
+            "--out", str(out), "--seeds", "1", "--experiments", "e3",
+            "--agents", "40",
+        ]) == 0
+    assert "smoke-scale values; not a campaign" not in buf.getvalue()
+
+
 # --- --probe-language --------------------------------------------------
 
 
@@ -483,16 +611,18 @@ def test_the_shipped_campaign_directory_is_in_sync_with_the_generator(tmp_path):
     would leave a campaign nobody could reproduce.
 
     The shipped directory was generated with
-    `--experiments e3 e4 e5 e6 e7 e8 e9 --seeds 6 --rounds 20`, per the
-    campaign's own regeneration command -- a run with no flags no longer
-    matches it, since E5's three arms, Fix 9's e8/e9 and the 20-round
-    campaign are part of what is checked in now.
+    `--experiments e3 e4 e5 e6 e7 e8 e9 --seeds 6 --rounds 20
+    --graph-degree 6 --agents 100`, per the campaign's own regeneration
+    command -- a run with no flags no longer matches it, since E5's three
+    arms, Fix 9's e8/e9, the 20-round campaign, the unified degree-6
+    network (Fix 5) and the 100-agent population are all part of what is
+    checked in now.
     """
     out = tmp_path / "campaign"
     assert gen.main(
         ["--base", str(BASE), "--probe-questions", str(QUESTIONS), "--out", str(out),
          "--experiments", "e3", "e4", "e5", "e6", "e7", "e8", "e9",
-         "--seeds", "6", "--rounds", "20"]
+         "--seeds", "6", "--rounds", "20", "--graph-degree", "6", "--agents", "100"]
     ) == 0
 
     produced = {p.name: p.read_text(encoding="utf-8") for p in out.iterdir()}

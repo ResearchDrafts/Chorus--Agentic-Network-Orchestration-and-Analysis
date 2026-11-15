@@ -2,7 +2,7 @@
 # Do not edit: re-run the generator instead, or the arms of a matched set
 # will stop being matched. Seed 1004 is shared by all four languages and by every experiment in this campaign (e3, e4, e5, e6, e7, e8, e9).
 K: 20
-M: 8
+M: 100
 N: 5
 allow_short_feed: true
 alpha: 0.5

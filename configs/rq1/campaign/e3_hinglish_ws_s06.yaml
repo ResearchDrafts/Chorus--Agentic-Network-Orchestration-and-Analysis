@@ -2,7 +2,7 @@
 # Do not edit: re-run the generator instead, or the arms of a matched set
 # will stop being matched. Seed 1006 is shared by all four languages and by every experiment in this campaign (e3, e4, e5, e6, e7, e8, e9).
 K: 20
-M: 8
+M: 100
 N: 3
 alpha: 0.5
 api_base: http://localhost:8000/v1
@@ -10,7 +10,7 @@ bank_path: data/bank/test_bank.csv
 checkpoint_every_n_turns: 1
 delivery: 'on'
 exclude_items_path: null
-graph_degree: 4
+graph_degree: 6
 graph_rewire_p: 0.1
 language_condition: hinglish
 lean_assignment: random

@@ -300,6 +300,8 @@ def build_config(
     recsys_threshold: float = DEFAULT_RECSYS_THRESHOLD,
     rounds: int | None = None,
     probe_language: str | None = None,
+    agents: int | None = None,
+    graph_degree: int | None = None,
 ) -> dict:
     """One campaign config: the base, with the generated fields set.
 
@@ -316,6 +318,17 @@ def build_config(
     one. probe_language, when given, is passed straight through to
     run_id_for; the caller is responsible for resolving probe_question to
     that language's question (see generate()).
+
+    Fix 5: agents and graph_degree, when given, apply to EVERY experiment
+    (unlike RECSYS_GRAPH_DEGREE, which only ever touched e8/e9) -- today
+    e3 through e7 run on base.yaml's own graph_degree=4 while e8/e9 run on
+    6, two different networks for what is meant to be one campaign.
+    agents overrides M outright; graph_degree overrides it outright for
+    e3-e7, but for e8/e9 only raises it (`max(graph_degree, their own
+    override)`), since Jo et al.'s rule needs degree >= N=5 regardless of
+    what a caller asks for elsewhere. Neither is set at all when None, so
+    an invocation with no `--agents`/`--graph-degree` reproduces today's
+    output byte for byte.
     """
     config = dict(base)
     overrides = EXPERIMENTS[experiment]
@@ -339,10 +352,18 @@ def build_config(
         config["neighbor_strategy"] = overrides["neighbor_strategy"]
     if "N" in overrides:
         config["N"] = overrides["N"]
-    if "graph_degree" in overrides:
+    if graph_degree is not None:
+        config["graph_degree"] = (
+            max(graph_degree, overrides["graph_degree"])
+            if "graph_degree" in overrides
+            else graph_degree
+        )
+    elif "graph_degree" in overrides:
         config["graph_degree"] = overrides["graph_degree"]
     if "allow_short_feed" in overrides:
         config["allow_short_feed"] = overrides["allow_short_feed"]
+    if agents is not None:
+        config["M"] = agents
     if experiment in RECSYS_EXPERIMENTS:
         config["recsys_threshold"] = recsys_threshold
     if experiment in BALANCED_LEAN_EXPERIMENTS:
@@ -422,6 +443,8 @@ def generate(
     recsys_threshold: float = DEFAULT_RECSYS_THRESHOLD,
     rounds: int | None = None,
     probe_language: str | None = None,
+    agents: int | None = None,
+    graph_degree: int | None = None,
 ) -> list[dict]:
     """Writes every config, validates each, and returns the manifest rows.
 
@@ -443,6 +466,10 @@ def generate(
     one language's question (an E1 control: posts stay in the arm's own
     language, the opinion question does not) and is folded into every
     run_id so the campaign directory cannot confuse it with the default.
+
+    `agents`/`graph_degree` (Fix 5), when given, apply to every experiment
+    generated -- see build_config's own docstring for graph_degree's
+    e8/e9 "at least 6" rule.
     """
     if seeds < 1:
         raise ValueError(f"--seeds must be >= 1, got {seeds}")
@@ -453,6 +480,18 @@ def generate(
             f"{list(EXPERIMENTS)}"
         )
     base = load_base(base_path)
+    # Fix 5: a reminder that this invocation's OWN inputs, not the override
+    # flags above, are smoke-scale -- base.yaml's bank is the 4-item test
+    # fixture, and/or the effective M (agents, when given, else base.yaml's
+    # own) is below 20. Printed once per generate() call, not per config,
+    # since it is a property of the base inputs rather than of any one file.
+    effective_m = agents if agents is not None else int(base["M"])
+    bank_path = str(base.get("bank_path") or "")
+    if bank_path.startswith("data/bank/test_") or effective_m < 20:
+        print(
+            "  WARNING: smoke-scale values; not a campaign "
+            f"(bank_path={bank_path!r}, M={effective_m})"
+        )
     # probe_language may name a language outside `languages` (an English
     # probe over a Hindi-only generation, say), so its question is loaded
     # even when that language's own arm is not being generated.
@@ -485,6 +524,8 @@ def generate(
                     recsys_threshold=recsys_threshold,
                     rounds=rounds,
                     probe_language=probe_language,
+                    agents=agents,
+                    graph_degree=graph_degree,
                 )
                 path = out_dir / f"{config['run_id']}.yaml"
                 write_config(
@@ -612,6 +653,19 @@ def build_parser() -> argparse.ArgumentParser:
              "(posts still render in each arm's own language). Adds "
              "'_probe-<lang>' to every run_id. For an E1 control arm.",
     )
+    parser.add_argument(
+        "--agents", type=int, default=None,
+        help="override M for every experiment generated (default: "
+             "base.yaml's own M). Fix 5.",
+    )
+    parser.add_argument(
+        "--graph-degree", type=int, default=None,
+        help="override graph_degree for every experiment generated "
+             f"(default: base.yaml's own for e3-e7, {RECSYS_GRAPH_DEGREE} for "
+             "e8/e9). e8/e9 use the larger of this value and their own "
+             f"minimum ({RECSYS_GRAPH_DEGREE}), since Jo et al.'s rule needs "
+             "degree >= N=5 regardless. Fix 5.",
+    )
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     return parser
 
@@ -630,6 +684,8 @@ def main(argv: list[str] | None = None) -> int:
         recsys_threshold=args.recsys_threshold,
         rounds=args.rounds,
         probe_language=args.probe_language,
+        agents=args.agents,
+        graph_degree=args.graph_degree,
     )
     manifest_path = args.out / "manifest.csv"
     write_manifest(manifest_path, manifest)
