@@ -75,9 +75,15 @@ EXPERIMENT_LABELS = {"e3": "E3 (delivery on)", "e4": "E4 (control)"}
 
 # E5's echo-chamber arms, in the same solid-treatment / dashed-control
 # convention: e5 is rewiring on, e6 is the shadow-item control that runs the
-# same rewiring rule without delivering anything persuasive.
-ECHO_EXPERIMENT_STYLES = {"e5": "-", "e6": "--"}
-ECHO_EXPERIMENT_LABELS = {"e5": "E5 (rewiring on)", "e6": "E6 (control)"}
+# same rewiring rule without delivering anything persuasive. e7 is dotted,
+# rather than a third dash style sharing a lane with e4's convention
+# elsewhere: it rewires without selecting a same-side neighbour, a control
+# for whether rewiring ALONE sorts anything, and drawing it the same as a
+# delivery-off control would misread it as one.
+ECHO_EXPERIMENT_STYLES = {"e5": "-", "e6": "--", "e7": ":"}
+ECHO_EXPERIMENT_LABELS = {
+    "e5": "E5 (rewiring on)", "e6": "E6 (control)", "e7": "E7 (random rewiring)",
+}
 
 # Side categories for the network-snapshot figure, by sign of x -- the same
 # three-way split cross_side_edge_share and minority_share use upstream in
@@ -352,6 +358,81 @@ def figure_cross_side_edge_share(rounds: pd.DataFrame, out_dir: Path) -> list[Pa
     )
 
 
+def figure_nci_excess(rounds: pd.DataFrame, out_dir: Path) -> list[Path]:
+    """nci_excess by round: the neighbour-correlation index above its own
+    permutation null, one line per language, E5/E6/E7 in the usual styles.
+
+    auc_nci_excess (its area under this curve) is the primary echo-chamber
+    outcome (see analysis/stats.py); this figure is what that number is
+    the area under.
+    """
+    return _line_by_round_figure(
+        rounds, "nci_excess",
+        "neighbour-correlation index − null mean\n(excess over random mixing)",
+        "Neighbour-correlation excess by language\n"
+        "band: range over seeds · solid: E5 · dashed: E6 · dotted: E7",
+        "nci_excess", out_dir,
+        ECHO_EXPERIMENT_STYLES, ECHO_EXPERIMENT_LABELS,
+    )
+
+
+def figure_disagreement_ratio(rounds: pd.DataFrame, out_dir: Path) -> list[Path]:
+    """disagreement_ratio by round: local (edge) disagreement over
+    pairwise (population-wide) disagreement, one line per language.
+
+    Below 1 means neighbours disagree less than two agents picked at
+    random would -- a falling line is the same sorting assort_excess and
+    cross_side_edge_share show, read in units of opinion distance instead
+    of a correlation or an edge share.
+    """
+    return _line_by_round_figure(
+        rounds, "disagreement_ratio",
+        "local / pairwise disagreement\n(below 1 = neighbours agree more than random)",
+        "Disagreement ratio by language\n"
+        "band: range over seeds · solid: E5 · dashed: E6 · dotted: E7",
+        "disagreement_ratio", out_dir,
+        ECHO_EXPERIMENT_STYLES, ECHO_EXPERIMENT_LABELS,
+    )
+
+
+def figure_minority_share(rounds: pd.DataFrame, out_dir: Path) -> list[Path]:
+    """minority_share by round: the smaller side's population share, one
+    line per language.
+
+    t_echo's own floor on this is what keeps a population that collapsed
+    onto one side (consensus) from being read as an echo chamber; this
+    figure shows the quantity that floor is checked against directly.
+    """
+    return _line_by_round_figure(
+        rounds, "minority_share",
+        "minority share\n(share of agents on the smaller side)",
+        "Minority share by language\n"
+        "band: range over seeds · solid: E5 · dashed: E6 · dotted: E7",
+        "minority_share", out_dir,
+        ECHO_EXPERIMENT_STYLES, ECHO_EXPERIMENT_LABELS,
+    )
+
+
+def figure_n_side_switches(rounds: pd.DataFrame, out_dir: Path) -> list[Path]:
+    """n_side_switches by round: how many agents changed which side of
+    the midpoint they are on, one line per language.
+
+    Read against n_rewires (round_metrics.csv's own column, not drawn a
+    second time here): a population can sort by converting agents to the
+    majority's side (switches) or by agents dropping an opposite-side
+    neighbour for a same-side one (rewires), and this is the conversion
+    half of that race.
+    """
+    return _line_by_round_figure(
+        rounds, "n_side_switches",
+        "side switches\n(agents whose side differs from the previous round)",
+        "Side switches by language -- read against n_rewires\n"
+        "band: range over seeds · solid: E5 · dashed: E6 · dotted: E7",
+        "n_side_switches", out_dir,
+        ECHO_EXPERIMENT_STYLES, ECHO_EXPERIMENT_LABELS,
+    )
+
+
 def figure_t_echo(runs: pd.DataFrame, out_dir: Path) -> list[Path]:
     """t_echo per language: one dot per seed, for every experiment present
     that has a t_echo column with values (e5, e6, e7, if present).
@@ -449,6 +530,8 @@ def figure_network_snapshots(
     probes: pd.DataFrame,
     run_graphs: dict[str, RunGraphs],
     out_dir: Path,
+    stem: str = "network_snapshots",
+    experiment_label: str | None = None,
 ) -> list[Path]:
     """One row per language, one column per snapshot round (0, K/2, K): the
     social graph laid out by spring_layout, nodes coloured by side.
@@ -463,6 +546,11 @@ def figure_network_snapshots(
     an echo chamber is a cluster that forms over rounds, and a layout fixed
     at round 0 would not show the separation that only exists in later
     rounds' edges.
+
+    `stem`/`experiment_label` let main() call this once per experiment
+    (e5, e6, e7) that has runs, each to its own file, rather than always
+    overwriting one "network_snapshots" figure with whichever experiment
+    ran last.
     """
     languages = [lang for lang in LANGUAGE_CONDITIONS if lang in run_graphs]
     if not languages:
@@ -483,20 +571,30 @@ def figure_network_snapshots(
                 axis.set_title(label)
             if col == 0:
                 axis.set_ylabel(language, rotation=0, ha="right", va="center")
+    title = "Network structure over rounds, one seed per language"
+    if experiment_label:
+        title += f" ({experiment_label})"
     fig.suptitle(
-        "Network structure over rounds, one seed per language\n"
-        "node colour: pro / undecided / against the midpoint",
+        f"{title}\nnode colour: pro / undecided / against the midpoint",
         x=0.02, ha="left", fontsize=11,
     )
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
-    return save(fig, out_dir, "network_snapshots")
+    return save(fig, out_dir, stem)
 
 
 def _draw_one_snapshot(axis, edges: list[tuple[str, str]], x_by_agent: dict[str, float]) -> None:
     graph = nx.Graph()
     graph.add_edges_from(edges)
     graph.add_nodes_from(x_by_agent)  # an isolate (no edges this round) still appears
-    layout = nx.spring_layout(graph, seed=FIGURE_LAYOUT_SEED)
+    # k = 1/sqrt(n) and 300 iterations: the default k (1/sqrt(n) is itself
+    # networkx's default, made explicit here) under-separates two camps
+    # that share only a few cross edges, since the spring layout settles
+    # into a single blob before the repulsive force has pulled same-side
+    # clusters apart; 300 iterations (up from the default 50) gives it
+    # room to actually reach that separated layout rather than stopping
+    # partway through converging to it.
+    k = 1.0 / (len(graph) ** 0.5) if len(graph) else None
+    layout = nx.spring_layout(graph, k=k, iterations=300, seed=FIGURE_LAYOUT_SEED)
     colors = [
         SIDE_COLORS["pro"] if x_by_agent.get(node, 0.0) > UNDECIDED_BAND
         else SIDE_COLORS["con"] if x_by_agent.get(node, 0.0) < -UNDECIDED_BAND
@@ -831,6 +929,14 @@ def main(argv: list[str] | None = None) -> int:
         written += figure_assort_excess(rounds, args.out)
     if "cross_side_edge_share" in rounds.columns:
         written += figure_cross_side_edge_share(rounds, args.out)
+    if "nci_excess" in rounds.columns:
+        written += figure_nci_excess(rounds, args.out)
+    if "disagreement_ratio" in rounds.columns:
+        written += figure_disagreement_ratio(rounds, args.out)
+    if "minority_share" in rounds.columns:
+        written += figure_minority_share(rounds, args.out)
+    if "n_side_switches" in rounds.columns:
+        written += figure_n_side_switches(rounds, args.out)
 
     run_metrics_path = args.results / "run_metrics.csv"
     runs = pd.read_csv(run_metrics_path) if run_metrics_path.exists() else None
@@ -838,9 +944,23 @@ def main(argv: list[str] | None = None) -> int:
         written += figure_t_echo(runs, args.out)
 
     if runs is not None and args.runs_dir is not None:
-        run_graphs = load_run_graphs(args.runs_dir, runs)
-        if run_graphs:
-            written += figure_network_snapshots(probes, run_graphs, args.out)
+        # One snapshot figure per echo-chamber experiment actually present,
+        # rather than always overwriting a single "network_snapshots" file
+        # with whichever of e5/e6/e7 happened to run last.
+        for experiment in ("e5", "e6", "e7"):
+            if not (runs.experiment == experiment).any():
+                continue
+            run_graphs = load_run_graphs(args.runs_dir, runs, experiment=experiment)
+            if not run_graphs:
+                continue
+            stem = (
+                "network_snapshots" if experiment == "e5"
+                else f"network_snapshots_{experiment}"
+            )
+            written += figure_network_snapshots(
+                probes, run_graphs, args.out, stem=stem,
+                experiment_label=ECHO_EXPERIMENT_LABELS.get(experiment, experiment.upper()),
+            )
 
     print(f"\n{args.out}/")
     for path in written:
