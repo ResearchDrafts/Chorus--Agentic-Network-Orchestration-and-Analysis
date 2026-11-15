@@ -254,6 +254,72 @@ def test_balanced_leans_still_shuffle_so_assignment_order_can_differ():
     assert first != second  # different seeds shuffle differently
 
 
+def test_balanced_two_camps_splits_evenly_and_excludes_the_midpoint():
+    run = make_run(M=20, persona_pool_id="pool_20", lean_assignment="balanced_two_camps")
+    leans = _population_leans(run, seed=7)
+    assert len(leans) == 20
+    assert 4.0 not in leans
+    con = [lean for lean in leans if lean < 4]
+    pro = [lean for lean in leans if lean > 4]
+    assert len(con) == 10 and len(pro) == 10
+    # Each camp of 10 over 3 points: one block of 3 (9) plus 1 more, so one
+    # point appears 4 times and the other two appear 3 times each.
+    assert sorted(con.count(p) for p in (1, 2, 3)) == [3, 3, 4]
+    assert sorted(pro.count(p) for p in (5, 6, 7)) == [3, 3, 4]
+
+
+def test_balanced_two_camps_gives_the_same_multiset_on_every_seed_for_even_m():
+    """Even M: camp sizes are fixed at M/2 each with no RNG involved, so the
+    multiset -- not just the shuffle -- must be identical across seeds."""
+    run = make_run(M=20, persona_pool_id="pool_20", lean_assignment="balanced_two_camps")
+    first = sorted(_population_leans(run, seed=1))
+    second = sorted(_population_leans(run, seed=99))
+    assert first == second
+
+
+def test_balanced_two_camps_still_shuffles_assignment_order():
+    run = make_run(M=20, persona_pool_id="pool_20", lean_assignment="balanced_two_camps")
+    first = _population_leans(run, seed=1)
+    second = _population_leans(run, seed=2)
+    assert sorted(first) == sorted(second)
+    assert first != second
+
+
+def test_balanced_two_camps_odd_m_still_splits_within_one_agent():
+    """Odd M: the camps cannot be exactly equal, and which camp gets the
+    extra agent is drawn from the RNG rather than fixed to either side."""
+    run = make_run(M=21, persona_pool_id="pool_20", lean_assignment="balanced_two_camps")
+    leans = _population_leans(run, seed=7)
+    assert len(leans) == 21
+    con = sum(1 for lean in leans if lean < 4)
+    pro = sum(1 for lean in leans if lean > 4)
+    assert {con, pro} == {10, 11}
+
+
+def test_balanced_two_camps_odd_m_extra_agents_side_depends_on_the_seed():
+    """Not hard-coded to one side: across enough seeds, both camps must
+    sometimes be the larger one."""
+    run = make_run(M=21, persona_pool_id="pool_20", lean_assignment="balanced_two_camps")
+    larger_camps = set()
+    for seed in range(1, 30):
+        leans = _population_leans(run, seed=seed)
+        con = sum(1 for lean in leans if lean < 4)
+        pro = sum(1 for lean in leans if lean > 4)
+        larger_camps.add("con" if con > pro else "pro")
+    assert larger_camps == {"con", "pro"}
+
+
+def test_balanced_two_camps_rejects_a_scale_with_no_room_on_one_side():
+    # sorted([3, 4]) has midpoint 4 (index len // 2 == 1): one point (3)
+    # below it and none above, so there is no pro camp to draw from.
+    run = make_run(
+        M=2, N=1, persona_pool_id="test_pool", lean_assignment="balanced_two_camps",
+        stance_scale=[3, 4],
+    )
+    with pytest.raises(ValueError, match="below and above the midpoint"):
+        _population_leans(run, seed=1)
+
+
 def test_random_lean_assignment_is_unchanged():
     """lean_assignment="random" (the default) must draw exactly the way
     _draw_initial_stance always has: explicitly passing it must equal

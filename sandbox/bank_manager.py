@@ -67,23 +67,34 @@ STARTER_COUNTS: dict[int, tuple[int, int]] = {
 }
 
 
-def starter_items(bank: "BankManager", seed: int, key: str, lean: float) -> list[str]:
+def starter_items(
+    bank: "BankManager",
+    seed: int,
+    key: str,
+    lean: float,
+    counts: dict[int, tuple[int, int]] | None = None,
+) -> list[str]:
     """The starter bank items an agent at `lean` is shown as its own posts.
 
-    A pure function of (seed, key, lean) and the bank's contents. No
-    language: the four arms of a matched set share the seed, and the reader
-    or agent key does not mention a language, so every arm shows the same
-    items, each rendered in its own language. Drawn without replacement
-    within a side, and shuffled together, so the order says nothing about
-    the side.
+    A pure function of (seed, key, lean) and the bank's contents -- plus
+    `counts`, when given. No language: the four arms of a matched set share
+    the seed, and the reader or agent key does not mention a language, so
+    every arm shows the same items, each rendered in its own language.
+    Drawn without replacement within a side, and shuffled together, so the
+    order says nothing about the side.
+
+    `counts` is ExperimentRun.starter_counts: None means the module's own
+    STARTER_COUNTS, so every caller that never set the field behaves exactly
+    as before this parameter existed.
     """
+    active = STARTER_COUNTS if counts is None else counts
     point = int(lean)
-    if point != lean or point not in STARTER_COUNTS:
+    if point != lean or point not in active:
         raise ValueError(
             f"no starter composition for initial_stance {lean!r}: expected a "
-            f"whole number in {sorted(STARTER_COUNTS)}"
+            f"whole number in {sorted(active)}"
         )
-    n_con, n_pro = STARTER_COUNTS[point]
+    n_con, n_pro = active[point]
     rng = random.Random(f"{seed}|starter|{key}|{point}")
     con = bank.items_for_side("con")
     pro = bank.items_for_side("pro")
@@ -97,7 +108,14 @@ def starter_items(bank: "BankManager", seed: int, key: str, lean: float) -> list
     return chosen
 
 
-STARTER_MIN_PER_SIDE = max(max(c, p) for c, p in STARTER_COUNTS.values())
+def min_per_side(counts: dict[int, tuple[int, int]]) -> int:
+    """The largest single-side count anywhere in a starter_counts mapping --
+    how many items the starter bank must hold on EACH side for every lean
+    the mapping covers to be satisfiable at all."""
+    return max(max(c, p) for c, p in counts.values())
+
+
+STARTER_MIN_PER_SIDE = min_per_side(STARTER_COUNTS)
 
 
 class BankValidationError(Exception):

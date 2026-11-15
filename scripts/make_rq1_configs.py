@@ -99,11 +99,16 @@ EXPERIMENTS: dict[str, dict] = {
 # the design holds rewiring absent from the pre-E5 arms.
 REWIRE_EXPERIMENTS = frozenset({"e5", "e6", "e7"})
 
-# Experiments whose starting leans are balanced across stance_scale rather
+# Experiments whose starting leans are balanced into two equal camps rather
 # than drawn uniformly at random (see ExperimentRun.lean_assignment): every
 # echo-chamber arm, so a population that happens to start lopsided toward
-# one pole does not confound "formed an echo chamber faster" with "started
-# closer to one already".
+# one pole -- or with a midpoint camp of its own tipping the count -- does
+# not confound "formed an echo chamber faster" with "started closer to one
+# already" or "one side started with more agents than the other".
+# "balanced_two_camps", not plain "balanced": M=20 over a 7-point scale
+# under "balanced" gives lean 4 three agents of its own and splits the
+# remaining 17 as 9 below and 8 above, a 9-vs-11 population a weaker camp
+# could be absorbed out of before it ever sorts.
 BALANCED_LEAN_EXPERIMENTS = frozenset({"e5", "e6", "e7"})
 
 # The default --experiments: unchanged from before E5 existed, so a
@@ -266,7 +271,7 @@ def build_config(
         config["rewire_rate"] = rewire_rate
         config["rewire_target"] = overrides["rewire_target"]
     if experiment in BALANCED_LEAN_EXPERIMENTS:
-        config["lean_assignment"] = "balanced"
+        config["lean_assignment"] = "balanced_two_camps"
     if rounds is not None:
         config["K"] = rounds
     if config["delivery"] == "on":

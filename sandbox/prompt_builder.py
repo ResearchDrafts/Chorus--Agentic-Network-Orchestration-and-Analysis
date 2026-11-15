@@ -392,7 +392,10 @@ class PromptBuilder:
         from sandbox.bank_manager import starter_items
 
         key = agent.start_key or agent.agent_id
-        items = starter_items(self._starters, self._run.seed, key, agent.initial_stance)
+        items = starter_items(
+            self._starters, self._run.seed, key, agent.initial_stance,
+            counts=self._run.starter_counts,
+        )
         lines = [
             f"  You posted: {self._starters.text(item, self._run.language_condition)}"
             for item in items

@@ -337,7 +337,19 @@ class ExperimentRun(BaseModel):
     # measures how fast a population sorts itself into camps, and a starting
     # population already lopsided toward one pole would sort faster for a
     # reason that has nothing to do with language or rewiring.
-    lean_assignment: str = Field(default="random", pattern="^(random|balanced)$")
+    # "balanced_two_camps" is "balanced" taken one step further: equal
+    # numbers of agents are drawn evenly from the scale points strictly
+    # below the midpoint and strictly above it, and none at all land on the
+    # midpoint itself. "balanced" alone can leave the midpoint's own agents
+    # (lean 4 of 1..7) tipping the population toward whichever side the
+    # midpoint's probe reading rounds to, and starts the two sides at
+    # different sizes whenever M is not a multiple of the scale's length --
+    # both of which an echo-chamber measurement that depends on two camps
+    # existing at all needs to rule out. See
+    # agent_manager._balanced_two_camps_leans.
+    lean_assignment: str = Field(
+        default="random", pattern="^(random|balanced|balanced_two_camps)$"
+    )
 
     # --- RQ1 bank regime --------------------------------------------------
     #
@@ -443,6 +455,25 @@ class ExperimentRun(BaseModel):
     # share no item_id with the argument bank: an agent shown an argument it
     # had already "posted" would be reading itself.
     starter_bank_path: str | None = None
+    # An optional override of bank_manager.STARTER_COUNTS: a mapping from a
+    # whole-number stance_scale point to [n_con, n_pro] starter posts under
+    # start_mode="posts". None (the default) means the module's own
+    # constant, calibrated for a balanced 7-point scale -- every existing
+    # config means what it meant.
+    #
+    # Exists because the module constant gives lean 4 one post per side and
+    # leans {1,2,3} three posts of con-weighted strength against leans
+    # {5,6,7}'s three pro-weighted ones, which is symmetric only when the
+    # population is too: under lean_assignment="balanced_two_camps" (see
+    # agent_manager._balanced_two_camps_leans) a con camp built from
+    # {1,2,3} and a pro camp from {5,6,7} start with matched starter
+    # strength already, and a run that instead wants an asymmetric starting
+    # strength -- e.g. to test whether one camp's weaker starters let it get
+    # absorbed faster -- needs a way to say so without editing the module.
+    #
+    # Round-trips through run_config.json as plain int keys: pydantic
+    # validates dict[int, ...] keys from JSON's string keys back to int.
+    starter_counts: dict[int, tuple[int, int]] | None = None
 
     # Item IDs to drop from the argument bank, one per line (blank lines and
     # "#" comments skipped). What the comprehension check writes to
@@ -636,6 +667,39 @@ class ExperimentRun(BaseModel):
             raise ValueError(
                 "start_mode='posts' requires a starter_bank_path: the posts each "
                 "agent wrote before the discussion are drawn from it"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_starter_counts(self) -> "ExperimentRun":
+        """starter_counts, when given, must cover every lean that can be
+        assigned and hold only non-negative counts.
+
+        Checked here, against stance_scale, rather than against
+        lean_assignment: "random" and "balanced" can place an agent at any
+        scale point, so an entry missing for one of them is a run that
+        would raise mid-population-build rather than at load time. Whether
+        the starter BANK actually holds enough items for the mapping's own
+        maximum is checked at config load (config_loader imports
+        bank_manager to read the file), not here -- this model is built in
+        tests and from a checkpoint too, and a file read does not belong in
+        schema validation.
+        """
+        if self.starter_counts is None:
+            return self
+        for point, counts in self.starter_counts.items():
+            if any(c < 0 for c in counts):
+                raise ValueError(
+                    f"starter_counts[{point}] = {tuple(counts)} must be non-negative"
+                )
+        assignable = {
+            int(point) for point in self.stance_scale if point == int(point)
+        }
+        missing = sorted(assignable - set(self.starter_counts))
+        if missing:
+            raise ValueError(
+                f"starter_counts is missing an entry for stance_scale point(s) "
+                f"{missing}"
             )
         return self
 

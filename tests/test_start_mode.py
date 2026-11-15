@@ -106,6 +106,28 @@ def test_starter_items_refuse_a_fractional_or_out_of_range_lean():
         starter_items(STARTERS, 1, "a", 8)
 
 
+# --- starter_counts override -------------------------------------------------
+
+
+def test_starter_counts_override_changes_the_composition():
+    custom = {1: (2, 0), 4: (1, 1), 7: (0, 2)}
+    items = starter_items(STARTERS, 1001, "agent_0003", 1, counts=custom)
+    sides = [STARTERS.side_of(item) for item in items]
+    assert sides.count("con") == 2 and sides.count("pro") == 0
+
+
+def test_starter_counts_override_rejects_a_lean_missing_from_it():
+    custom = {1: (2, 0)}
+    with pytest.raises(ValueError, match="starter composition"):
+        starter_items(STARTERS, 1001, "agent_0003", 4, counts=custom)
+
+
+def test_starter_counts_none_behaves_like_the_module_default():
+    assert starter_items(STARTERS, 1001, "agent_0003", 2) == starter_items(
+        STARTERS, 1001, "agent_0003", 2, counts=None
+    )
+
+
 # --- schema -----------------------------------------------------------------
 
 
@@ -121,6 +143,28 @@ def test_posts_needs_a_starter_bank():
 def test_an_unknown_mode_is_refused():
     with pytest.raises(ValueError):
         make_run(**BANK_RUN, start_mode="lean")
+
+
+def test_starter_counts_defaults_to_none():
+    assert make_run(**BANK_RUN).starter_counts is None
+
+
+def test_starter_counts_accepts_a_full_mapping():
+    full = {1: (2, 0), 2: (2, 0), 3: (1, 0), 4: (1, 1), 5: (0, 1), 6: (0, 2), 7: (0, 2)}
+    run = make_run(**BANK_RUN, starter_counts=full)
+    assert run.starter_counts[7] == (0, 2)
+
+
+def test_starter_counts_rejects_a_negative_count():
+    full = {1: (2, 0), 2: (2, 0), 3: (1, 0), 4: (1, 1), 5: (0, 1), 6: (0, 2), 7: (0, -1)}
+    with pytest.raises(ValueError, match="non-negative"):
+        make_run(**BANK_RUN, starter_counts=full)
+
+
+def test_starter_counts_rejects_a_mapping_missing_an_assignable_lean():
+    missing_four = {1: (2, 0), 2: (2, 0), 3: (1, 0), 5: (0, 1), 6: (0, 2), 7: (0, 2)}
+    with pytest.raises(ValueError, match=r"missing an entry.*\[4\]"):
+        make_run(**BANK_RUN, starter_counts=missing_four)
 
 
 def test_a_non_default_mode_needs_the_bank_regime():
@@ -241,6 +285,33 @@ def test_a_starter_bank_too_small_for_the_extreme_leans_is_refused(tmp_path):
     small.write_text("\n".join(rows[:-1]) + "\n", encoding="utf-8")  # drops one con
     with pytest.raises(ConfigLoadError, match=f"needs at least {STARTER_MIN_PER_SIDE}"):
         load_run_config(_config(tmp_path, start_mode="posts", starter_bank_path=str(small)))
+
+
+def test_starter_counts_can_demand_more_than_the_default_max(tmp_path):
+    """A mapping whose maximum exceeds STARTER_MIN_PER_SIDE must be checked
+    against ITS OWN maximum, not the module constant's -- the fixture bank
+    has exactly 3 per side, which the override here asks for 4 of."""
+    bigger = {1: [4, 0], 2: [2, 0], 3: [1, 0], 4: [1, 1], 5: [0, 1], 6: [0, 2], 7: [0, 4]}
+    with pytest.raises(ConfigLoadError, match="needs at least 4"):
+        load_run_config(_config(
+            tmp_path, start_mode="posts", starter_bank_path=STARTER_PATH,
+            starter_counts=bigger,
+        ))
+
+
+def test_starter_counts_can_tolerate_a_bank_smaller_than_the_default_max(tmp_path):
+    """A mapping whose maximum is below STARTER_MIN_PER_SIDE must load
+    against a bank too small for the module default, since the run never
+    reads that default."""
+    rows = open(STARTER_PATH, encoding="utf-8").read().splitlines()
+    small = tmp_path / "small.csv"
+    small.write_text("\n".join(rows[:-1]) + "\n", encoding="utf-8")  # 2 con, 3 pro
+    smaller = {1: [2, 0], 2: [2, 0], 3: [1, 0], 4: [1, 1], 5: [0, 1], 6: [0, 2], 7: [0, 2]}
+    run = load_run_config(_config(
+        tmp_path, start_mode="posts", starter_bank_path=str(small),
+        starter_counts=smaller,
+    ))
+    assert run.starter_counts[1] == (2, 0)
 
 
 # --- single-exposure helpers -----------------------------------------------

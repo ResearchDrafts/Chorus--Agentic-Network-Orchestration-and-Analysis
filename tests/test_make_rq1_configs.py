@@ -196,6 +196,18 @@ def test_e3_and_e4_differ_only_in_delivery_and_its_consequences(campaign):
     }
 
 
+def test_e5_e6_e7_use_balanced_two_camps(campaign):
+    """Not plain "balanced": a population needs two roughly matched camps,
+    not just an even scale, before an echo-chamber measurement means
+    anything."""
+    out = campaign("--seeds", "1", "--experiments", "e5", "e6", "e7")
+    for experiment in ("e5", "e6", "e7"):
+        config = yaml.safe_load(
+            (out / f"{experiment}_english_ws_s01.yaml").read_text()
+        )
+        assert config["lean_assignment"] == "balanced_two_camps"
+
+
 def test_the_single_reader_configs_keep_the_neutral_bank(campaign):
     """calibrate_tau reads the control's own side-free messages, so that τ is
     the baseline for what the control actually does."""

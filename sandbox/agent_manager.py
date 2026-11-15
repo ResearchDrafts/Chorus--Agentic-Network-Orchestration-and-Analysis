@@ -38,6 +38,20 @@ def load_persona_pool(persona_pool_id: str) -> list[str]:
     return [line.strip() for line in path.read_text().splitlines() if line.strip()]
 
 
+def _evenly_repeated(points: list[float], n: int) -> list[float]:
+    """`points` repeated whole as many times as it divides into n, plus the
+    first `remainder` points in `points`' own order.
+
+    Shared by _balanced_leans (over the whole scale) and
+    _balanced_two_camps_leans (over one camp's half of it): both need "as
+    even a multiset of n draws from this list as possible, with no
+    randomness in which points make up the remainder" and would otherwise
+    duplicate each other's arithmetic.
+    """
+    full_blocks, remainder = divmod(n, len(points))
+    return list(points) * full_blocks + list(points)[:remainder]
+
+
 def agent_id_for(index: int) -> str:
     """The canonical agent id for a population index.
 
@@ -73,11 +87,12 @@ class AgentManager:
         occupy (see _balanced_leans).
         """
         personas = self._load_persona_pool()
-        leans = (
-            self._balanced_leans()
-            if self._run.lean_assignment == "balanced"
-            else None
-        )
+        if self._run.lean_assignment == "balanced":
+            leans = self._balanced_leans()
+        elif self._run.lean_assignment == "balanced_two_camps":
+            leans = self._balanced_two_camps_leans()
+        else:
+            leans = None
         agents = []
         for i in range(self._run.M):
             persona = personas[i % len(personas)]  # cycle if M > pool size
@@ -132,9 +147,45 @@ class AgentManager:
         seed start from the same point in the stream; they just use what
         comes off it differently.
         """
-        scale = self._run.stance_scale
-        full_blocks, remainder = divmod(self._run.M, len(scale))
-        leans = list(scale) * full_blocks + list(scale)[:remainder]
+        leans = _evenly_repeated(self._run.stance_scale, self._run.M)
+        self._rng.shuffle(leans)
+        return leans
+
+    def _balanced_two_camps_leans(self) -> list[float]:
+        """M leans split into two equal-sized camps, one drawn evenly from
+        the scale points strictly below the midpoint and one strictly
+        above it, with nobody at the midpoint itself.
+
+        "balanced" alone can leave a population at 9 agents on one side and
+        11 on the other (M=20 over a 7-point scale gives lean 4, the
+        midpoint, 3 agents of its own, splitting the other 17 as 9 below
+        and 8 above) and that midpoint camp's own probe reading tips it
+        toward whichever side it is already closer to -- an echo-chamber
+        measurement that depends on two roughly matched camps existing at
+        all needs to rule both of those out before round 1.
+
+        Camp sizes are M // 2 each; for odd M, the RNG stream this method
+        itself shuffles with decides which camp gets the extra agent, which
+        means -- unlike "balanced"'s own deterministic remainder -- an odd
+        M's exact camp sizes are the one part of this multiset that is
+        allowed to depend on the seed. Within a camp, points are drawn
+        evenly the same way "balanced" draws from the whole scale.
+        """
+        scale = sorted(self._run.stance_scale)
+        midpoint = scale[len(scale) // 2]
+        below = [point for point in scale if point < midpoint]
+        above = [point for point in scale if point > midpoint]
+        if not below or not above:
+            raise ValueError(
+                "lean_assignment='balanced_two_camps' needs at least one "
+                f"stance_scale point below and above the midpoint {midpoint}, "
+                f"got {scale}"
+            )
+        half, remainder = divmod(self._run.M, 2)
+        leans = _evenly_repeated(below, half) + _evenly_repeated(above, half)
+        if remainder:
+            extra_side = below if self._rng.choice(["con", "pro"]) == "con" else above
+            leans += _evenly_repeated(extra_side, 1)
         self._rng.shuffle(leans)
         return leans
 

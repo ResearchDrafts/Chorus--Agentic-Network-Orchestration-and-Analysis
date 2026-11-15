@@ -190,20 +190,33 @@ def _starter_bank_errors(raw: dict) -> list[str]:
         return [f"starter_bank_path '{starter_path}' not found at {path}"]
 
     from sandbox.bank_manager import (
-        STARTER_MIN_PER_SIDE,
+        STARTER_COUNTS,
         BankManager,
         BankValidationError,
+        min_per_side,
     )
 
     try:
         starters = BankManager(path)
     except BankValidationError as e:
         return [f"starter bank {starter_path}: {problem}" for problem in e.errors]
+    # The active mapping's own maximum, not the module constant's: a run
+    # that overrides starter_counts with smaller per-side counts must not be
+    # rejected for a starter bank too small for STARTER_COUNTS's maximum,
+    # which it never reads; one with larger counts must be rejected for ITS
+    # maximum, which the module constant alone would miss.
+    raw_counts = raw.get("starter_counts")
+    active_counts = (
+        {int(k): tuple(v) for k, v in raw_counts.items()}
+        if raw_counts is not None
+        else STARTER_COUNTS
+    )
+    required = min_per_side(active_counts)
     errors = [
         f"starter bank {starter_path}: {len(starters.items_for_side(side))} {side} "
-        f"item(s), needs at least {STARTER_MIN_PER_SIDE}"
+        f"item(s), needs at least {required}"
         for side in ("con", "pro")
-        if len(starters.items_for_side(side)) < STARTER_MIN_PER_SIDE
+        if len(starters.items_for_side(side)) < required
     ]
     bank_path = raw.get("bank_path")
     if isinstance(bank_path, str) and Path(bank_path).exists():
