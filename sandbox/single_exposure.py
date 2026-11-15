@@ -297,6 +297,7 @@ class SingleReaderHarness:
                 image=None,
                 temperature=self._run.temperature,
                 seed=seed,
+                max_tokens=self._run.max_reply_tokens,
             )
         except FatalGatewayError:
             await self._log(turn, agent.agent_id, "reply", built.text, "", seed=seed)

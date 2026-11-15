@@ -2199,6 +2199,62 @@ async def test_a_failed_row_still_records_its_reply_seed(tmp_path, bank_gateway)
     assert all(isinstance(r.reply_seed, int) for r in failed)
 
 
+async def test_every_bank_reply_call_carries_max_reply_tokens(tmp_path, bank_gateway):
+    """Caps every reply call so a model that loops cannot freeze the run."""
+    run = _bank_run(K=2, max_reply_tokens=256)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    calls = bank_gateway.generate.await_args_list
+    assert len(calls) == run.M * run.K
+    assert all(c.kwargs.get("max_tokens") == 256 for c in calls)
+
+
+async def test_bank_probe_calls_never_carry_max_reply_tokens(tmp_path, bank_gateway):
+    """The probe is fixed at max_tokens=1 inside the gateway itself; the
+    reply cap has no bearing on it and never reaches score_next_token."""
+    run = _bank_run(K=2, max_reply_tokens=256)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    for call in bank_gateway.score_next_token.await_args_list:
+        assert "max_tokens" not in call.kwargs
+
+
+async def test_reply_truncated_is_flagged_when_completion_hits_the_cap(tmp_path, bank_gateway):
+    """completion_token_count >= max_reply_tokens means the provider was cut
+    off mid-generation, not that it chose to stop there."""
+    bank_gateway.generate.return_value = make_backend_response(
+        text="a reply", completion_tokens=256
+    )
+    run = _bank_run(M=4, N=1, K=1, graph_degree=2, max_reply_tokens=256)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    rows = [r for r in _bank_rows(tmp_path) if r.turn == 1]
+    assert rows
+    assert all(r.reply_truncated is True for r in rows)
+
+
+async def test_reply_truncated_is_false_under_the_cap(tmp_path, bank_gateway):
+    bank_gateway.generate.return_value = make_backend_response(
+        text="a short reply", completion_tokens=5
+    )
+    run = _bank_run(M=4, N=1, K=1, graph_degree=2, max_reply_tokens=256)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    rows = [r for r in _bank_rows(tmp_path) if r.turn == 1]
+    assert rows
+    assert all(r.reply_truncated is False for r in rows)
+
+
+async def test_round_zero_rows_carry_no_reply_truncated_flag(tmp_path, bank_gateway):
+    """Round 0 has no reply call to have been truncated."""
+    run = _bank_run(K=1)
+    await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()
+
+    for row in _bank_rows(tmp_path):
+        if row.turn == 0:
+            assert row.reply_truncated is None
+
+
 async def test_prompt_lines_carry_the_seed_on_replies_only(tmp_path, bank_gateway):
     run = _bank_run(M=4, N=1, K=2, graph_degree=2)
     await build_orchestrator(run, bank_gateway, runs_dir=tmp_path).run()

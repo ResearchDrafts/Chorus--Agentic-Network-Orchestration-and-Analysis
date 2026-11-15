@@ -205,6 +205,21 @@ def test_bank_regime_fields_default_to_the_previous_behaviour():
     assert run.memory_rounds is None
     assert run.max_prompt_tokens is None
     assert run.neutral_bank_path is None
+    assert run.max_reply_tokens == 512
+
+
+@pytest.mark.parametrize("value", [15, 0, -1])
+def test_max_reply_tokens_rejects_values_below_the_floor(value):
+    from sandbox.models import ExperimentRun
+
+    with pytest.raises(ValidationError):
+        ExperimentRun(**_run_kwargs(max_reply_tokens=value))
+
+
+def test_max_reply_tokens_is_configurable():
+    from sandbox.models import ExperimentRun
+
+    assert ExperimentRun(**_run_kwargs(max_reply_tokens=128)).max_reply_tokens == 128
 
 
 @pytest.mark.parametrize(
@@ -406,6 +421,16 @@ def test_bank_item_rows_are_accepted_and_default_their_probe_fields():
     assert row.reply_text == ""
     assert row.probe_mean is None and row.probe_dist is None
     assert row.probe_mass is None and row.side_conf is None
+    assert row.reply_truncated is None
+
+
+@pytest.mark.parametrize("value", [True, False, None])
+def test_reply_truncated_round_trips(value):
+    from sandbox.models import Interaction
+
+    row = Interaction(**_interaction_kwargs(content_type="bank_item", reply_truncated=value))
+    assert row.reply_truncated is value
+    assert Interaction.model_validate_json(row.model_dump_json()).reply_truncated is value
 
 
 def test_bank_item_row_rejects_a_meme_id():

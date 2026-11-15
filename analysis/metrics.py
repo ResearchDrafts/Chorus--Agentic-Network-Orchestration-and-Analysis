@@ -668,6 +668,24 @@ def _mean_or_none(series: pd.Series) -> float | None:
     return None if cleaned.empty else float(cleaned.mean())
 
 
+def reply_truncated_rate(frame: pd.DataFrame) -> float | None:
+    """Share of reply calls in this run that hit max_reply_tokens.
+
+    Over every row with a reply call, not just rows whose probe later
+    succeeded -- a reply can be truncated regardless of what the probe that
+    followed it read. None when the column is absent (a pre-Fix-1 dataset)
+    or every row's flag is null (no reply call ever happened, e.g. a run
+    with only a round-0 probe).
+    """
+    if "reply_truncated" not in frame.columns:
+        return None
+    col = frame["reply_truncated"]
+    valid = col[col.notna()]
+    if valid.empty:
+        return None
+    return float(valid.astype(bool).mean())
+
+
 # --- run_metrics.csv ------------------------------------------------------
 
 
@@ -680,6 +698,7 @@ RUN_COLUMNS = (
     "auc_assort_excess", "t_echo", "echo_censored",
     "d_var_x", "d_extremity",
     *(f"rate_{name}" for name in OUTCOMES),
+    "rate_reply_truncated",
     "mean_n_repeat_reads",
     "t_stationary", "stationary",
     "n_valid_total", "n_failed_total",
@@ -692,6 +711,7 @@ def run_row(
     probes: list[dict],
     config: dict,
     epsilon: dict[str, float],
+    rate_reply_truncated: float | None = None,
 ) -> dict:
     """One row per run: the final state, the change, and the rates.
 
@@ -750,6 +770,7 @@ def run_row(
         "mean_probe_prompt_tokens": _mean_of(
             [r["mean_probe_prompt_tokens"] for r in ordered]
         ),
+        "rate_reply_truncated": rate_reply_truncated,
     }
     for name in OUTCOMES:
         row[f"rate_{name}"] = (
@@ -953,7 +974,7 @@ def compute(
     tau = load_tau(tau_path)
     probes: list[dict] = []
     rounds: list[dict] = []
-    per_run: list[tuple[list[dict], list[dict], dict]] = []
+    per_run: list[tuple[list[dict], list[dict], dict, float | None]] = []
 
     for run_dir in discover_runs(runs_dir):
         frame = load_run_frame(run_dir)
@@ -984,7 +1005,7 @@ def compute(
 
         probes.extend(run_probes)
         rounds.extend(run_rounds)
-        per_run.append((run_rounds, run_probes, config))
+        per_run.append((run_rounds, run_probes, config, reply_truncated_rate(frame)))
 
     if from_e4:
         epsilon = epsilon_from_e4(rounds)
@@ -992,7 +1013,7 @@ def compute(
             f"{k}={v:.5f}" for k, v in epsilon.items()
         ))
 
-    runs = [run_row(r, p, c, epsilon) for r, p, c in per_run]
+    runs = [run_row(r, p, c, epsilon, rt) for r, p, c, rt in per_run]
     return probes, rounds, runs
 
 

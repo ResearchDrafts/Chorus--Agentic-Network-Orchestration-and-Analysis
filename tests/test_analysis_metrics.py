@@ -490,3 +490,31 @@ def test_run_row_reports_the_change_from_round_zero():
     # Two rounds of changes is fewer than the three-round window, so it
     # cannot have been shown stationary.
     assert row["stationary"] is False and row["t_stationary"] == CONFIG["K"]
+
+
+def test_run_row_carries_the_reply_truncated_rate_through():
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 0, "x": 0.0},
+        {"speaker_agent_id": "a", "turn": 1, "x": 0.5},
+    ])
+    probes = m.probe_rows(frame, CONFIG, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, CONFIG, None)
+    row = m.run_row(rounds, probes, CONFIG, EPSILON, rate_reply_truncated=0.25)
+    assert row["rate_reply_truncated"] == pytest.approx(0.25)
+
+    row_default = m.run_row(rounds, probes, CONFIG, EPSILON)
+    assert row_default["rate_reply_truncated"] is None
+
+
+def test_reply_truncated_rate_counts_only_rows_with_a_reply_call():
+    frame = pd.DataFrame([
+        {"reply_truncated": True},
+        {"reply_truncated": False},
+        {"reply_truncated": False},
+        {"reply_truncated": None},  # round 0: no reply call happened
+    ])
+    assert m.reply_truncated_rate(frame) == pytest.approx(1 / 3)
+
+
+def test_reply_truncated_rate_is_none_without_the_column():
+    assert m.reply_truncated_rate(pd.DataFrame([{"x": 1.0}])) is None

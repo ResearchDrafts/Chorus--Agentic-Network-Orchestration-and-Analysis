@@ -171,6 +171,12 @@ class Interaction(BaseModel):
     probe_dist: list[float] | None = None
     probe_mass: float | None = None
     side_conf: float | None = None
+    # True when this row's reply call hit max_reply_tokens: the provider's
+    # completion was cut off mid-generation rather than ending on its own.
+    # None when no reply call happened for this row (round 0, a generated-
+    # regime row that sent no cap, or a row whose reply call failed before a
+    # completion token count was ever reported).
+    reply_truncated: bool | None = None
 
     @model_validator(mode="after")
     def check_meme_id_consistency(self) -> "Interaction":
@@ -497,6 +503,15 @@ class ExperimentRun(BaseModel):
     # A run where one language arm's agents lose the front of their history is
     # confounded exactly where RQ1 is measuring.
     max_prompt_tokens: int | None = Field(default=None, ge=1)
+    # Hard cap on completion_tokens for a reply call, sent to the provider as
+    # max_tokens. Without one, a reply call has no ceiling at all: a live run
+    # saw one Hindi reply loop until litellm's 600s timeout and stopped the
+    # whole campaign. 512 is generous for a single-round reply; raising it
+    # does not change any existing config's behaviour, since every config
+    # written before this field existed now gets 512 where it previously
+    # sent no max_tokens key at all -- a behaviour change only a live run
+    # could have hit, not one any test fixture depends on.
+    max_reply_tokens: int = Field(default=512, ge=16)
 
     # Whether to write prompts.jsonl: one line per LLM call, with the exact
     # prompt text, the response and (for probes) the raw top logprobs.

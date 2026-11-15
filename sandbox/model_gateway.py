@@ -157,6 +157,7 @@ class ModelGateway:
         temperature: float = 0.7,
         *,
         seed: int | None = None,
+        max_tokens: int | None = None,
     ) -> BackendResponse:
         """
         Normalizes a call to self.model_backend_id via LiteLLM. If image
@@ -172,6 +173,10 @@ class ModelGateway:
         to what it was before this parameter existed, since a provider that
         treats an absent seed and a null seed differently would make the two
         regimes' traffic differ for no reason either of them chose.
+
+        `max_tokens` follows the same not-sent-when-None rule as `seed`, for
+        the same reason: a call that never passes it must stay byte-identical
+        to what it sent before this parameter existed.
         """
         provider = self._provider_name()
         # The semaphore is held across the whole call, retries included, so an
@@ -181,7 +186,7 @@ class ModelGateway:
             await self._rate_limiter.acquire(provider)
             try:
                 response = await self._call_with_retry(
-                    prompt_text, image, temperature, seed
+                    prompt_text, image, temperature, seed, max_tokens
                 )
             finally:
                 self._rate_limiter.release(provider)
@@ -296,13 +301,17 @@ class ModelGateway:
         image: bytes | None,
         temperature: float,
         seed: int | None = None,
+        max_tokens: int | None = None,
     ) -> BackendResponse:
         started = time.monotonic()
-        # Built rather than passed inline so an absent seed sends no key.
-        # A retry re-enters this method with the same argument, so the second
-        # attempt is the same request: a retry that re-sampled would hand back
-        # a different reply for a failure the agent had no part in.
+        # Built rather than passed inline so an absent seed/max_tokens sends
+        # no key. A retry re-enters this method with the same arguments, so
+        # the second attempt is the same request: a retry that re-sampled or
+        # changed the cap would hand back a different reply for a failure the
+        # agent had no part in.
         extra = {} if seed is None else {"seed": seed}
+        if max_tokens is not None:
+            extra["max_tokens"] = max_tokens
         try:
             raw = await litellm.acompletion(
                 model=self.model_backend_id,

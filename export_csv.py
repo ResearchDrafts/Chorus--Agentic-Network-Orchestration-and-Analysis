@@ -11,8 +11,8 @@ Produces three files:
                     probe_mean, x (the stance rescaled to [-1, 1] about the
                     midpoint), probe_mass, side_conf, items_read,
                     n_items_read, posted_item_id, shadow_items,
-                    is_round_zero, reply_seed, the two per-call prompt
-                    lengths and the three exposure counts
+                    is_round_zero, reply_seed, reply_truncated, the two
+                    per-call prompt lengths and the three exposure counts
                     (n_repeat_reads, max_prior_exposures,
                     n_distinct_items_read_so_far); these are present but
                     empty for generated-regime rows, so a campaign mixing
@@ -220,6 +220,11 @@ def _derive_bank_columns(df: pd.DataFrame) -> pd.DataFrame:
     # which an int column cannot hold. Empty at round 0 and on a generated
     # row, neither of which sends a seed.
     df["reply_seed"] = _column(df, "reply_seed", float)
+    # Whether the reply call hit max_reply_tokens. Object dtype, like the
+    # other optional bank columns above, so True/False/None (no reply call
+    # happened) are all preserved rather than None collapsing to NaN under a
+    # bool dtype.
+    df["reply_truncated"] = _column(df, "reply_truncated", object)
     return _derive_exposure_columns(df, items)
 
 

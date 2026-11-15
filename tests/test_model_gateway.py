@@ -860,6 +860,51 @@ async def test_a_transient_retry_reuses_the_same_seed(rate_limiter, cost_tracker
     assert [c.kwargs["seed"] for c in mock_completion.await_args_list] == [777, 777]
 
 
+async def test_max_reply_tokens_reaches_the_provider(rate_limiter, cost_tracker):
+    """The cap exists to stop a reply looping until litellm's own timeout --
+    it has to actually reach the server, not just be accepted as a kwarg."""
+    gateway = ModelGateway("gpt-4o", rate_limiter, cost_tracker)
+    mock_completion = AsyncMock(return_value=_make_raw_response())
+
+    with patch("litellm.acompletion", mock_completion):
+        await gateway.generate("p", max_tokens=512)
+
+    assert mock_completion.await_args.kwargs["max_tokens"] == 512
+
+
+async def test_a_transient_retry_resends_the_same_max_tokens(rate_limiter, cost_tracker):
+    """A retry is the same request, including its cap, not a new one with a
+    different ceiling."""
+    gateway = ModelGateway("gpt-4o", rate_limiter, cost_tracker)
+    mock_completion = AsyncMock(
+        side_effect=[
+            litellm.exceptions.RateLimitError(
+                message="rate limited", llm_provider="openai", model="gpt-4o"
+            ),
+            _make_raw_response(text="after the retry"),
+        ]
+    )
+
+    with patch("litellm.acompletion", mock_completion):
+        response = await gateway.generate("p", max_tokens=256)
+
+    assert response.text == "after the retry"
+    assert [c.kwargs["max_tokens"] for c in mock_completion.await_args_list] == [256, 256]
+
+
+async def test_the_probe_call_always_sends_max_tokens_one(rate_limiter, cost_tracker):
+    """score_next_token has no max_tokens parameter at all -- it is a
+    measurement, not a generation, and 1 is fixed regardless of what the
+    reply cap is set to."""
+    gateway = ModelGateway("gpt-4o", rate_limiter, cost_tracker)
+    mock_completion = AsyncMock(return_value=_make_probe_response())
+
+    with patch("litellm.acompletion", mock_completion):
+        await gateway.score_next_token("p")
+
+    assert mock_completion.await_args.kwargs["max_tokens"] == 1
+
+
 async def test_the_probe_call_is_never_seeded(rate_limiter, cost_tracker):
     """score_next_token runs at temperature 0 and samples nothing worth
     pinning; a seed there would suggest the measurement had a draw in it."""

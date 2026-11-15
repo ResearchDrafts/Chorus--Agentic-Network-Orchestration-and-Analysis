@@ -946,6 +946,7 @@ class SimulationOrchestrator:
                 image=None,
                 temperature=self._run.temperature,
                 seed=seed,
+                max_tokens=self._run.max_reply_tokens,
             )
         except FatalGatewayError:
             await self._log_prompt(
@@ -1101,6 +1102,14 @@ class SimulationOrchestrator:
             (reply.completion_tokens if reply else 0) + (probe[0].completion_tokens if probe else 0)
         )
         latency_ms = (reply.latency_ms if reply else 0) + (probe[0].latency_ms if probe else 0)
+        # Only the reply call is capped by max_reply_tokens, so truncation is
+        # judged on reply.completion_tokens alone, never the summed
+        # completion_token_count the probe's single token also feeds into.
+        # None when no reply call happened at all (round 0, or a failed
+        # dispatch that never reached a response).
+        reply_truncated = (
+            None if reply is None else reply.completion_tokens >= self._run.max_reply_tokens
+        )
 
         if failed:
             return Interaction(
@@ -1126,6 +1135,7 @@ class SimulationOrchestrator:
                 reply_prompt_tokens=reply_prompt_tokens,
                 probe_prompt_tokens=probe_prompt_tokens,
                 reply_seed=reply_seed,
+                reply_truncated=reply_truncated,
                 prompt_token_count=prompt_tokens,
                 completion_token_count=completion_tokens,
                 model_backend_id=self._run.model_backend_id,
@@ -1160,6 +1170,7 @@ class SimulationOrchestrator:
             reply_prompt_tokens=reply_prompt_tokens,
             probe_prompt_tokens=probe_prompt_tokens,
             reply_seed=reply_seed,
+            reply_truncated=reply_truncated,
             prompt_token_count=prompt_tokens,
             completion_token_count=completion_tokens,
             model_backend_id=self._run.model_backend_id,
