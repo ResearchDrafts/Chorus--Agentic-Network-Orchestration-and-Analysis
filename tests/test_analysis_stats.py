@@ -189,6 +189,7 @@ def test_main_runs_one_echo_contrast_per_swept_rewire_rate(tmp_path):
          "auc_nci_excess": 0.1, "final_nci_excess": 0.1,
          "final_disagreement_ratio": 0.9, "final_global_disagreement": 0.3,
          "final_bimodality": 0.5, "final_mean_belief_shift": 0.2,
+         "final_neighbor_corr": 0.15, "final_mean_abs_individual_shift": 0.25,
          "total_side_switches": 3}
         for e in ("e5", "e6")
         for lang in ("english", "hindi")
@@ -223,6 +224,7 @@ def _echo_run(experiment, language, seed, *, rewire_rate=0.3, t_echo=5,
         "auc_nci_excess": 0.1, "final_nci_excess": 0.1,
         "final_disagreement_ratio": 0.9, "final_global_disagreement": 0.3,
         "final_bimodality": 0.5, "final_mean_belief_shift": 0.2,
+        "final_neighbor_corr": 0.15, "final_mean_abs_individual_shift": 0.25,
         "total_side_switches": 3,
     }
     row.update(extra)
@@ -865,9 +867,10 @@ def _recsys_run(experiment, language, seed, *, recsys_threshold=1.0, **extra) ->
     row = {
         "experiment": experiment, "language": language, "seed": seed,
         "recsys_threshold": recsys_threshold,
-        "auc_nci_excess": 0.1, "final_nci": 0.2,
+        "auc_nci_excess": 0.1, "final_nci": 0.2, "final_neighbor_corr": 0.15,
         "final_global_disagreement": 0.3, "final_polarization_index": 0.4,
-        "final_mean_belief_shift": 0.1, "final_minority_share": 0.4,
+        "final_mean_belief_shift": 0.1, "final_mean_abs_individual_shift": 0.2,
+        "final_minority_share": 0.4,
     }
     row.update(extra)
     return row

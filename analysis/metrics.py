@@ -436,8 +436,10 @@ ROUND_COLUMNS = (
     "cross_side_edge_share", "minority_share",
     "polarization_index", "global_disagreement",
     "pairwise_disagreement", "local_disagreement", "disagreement_ratio",
-    "nci", "nci_null_mean", "nci_null_hi", "nci_excess", "bimodality",
-    "mean_belief_shift", "mean_signed_shift",
+    "nci", "nci_null_mean", "nci_null_hi", "nci_excess",
+    "neighbor_corr", "neighbor_corr_null_mean", "neighbor_corr_null_hi",
+    "neighbor_corr_excess", "bimodality",
+    "mean_belief_shift", "mean_belief_shift_from_r1", "mean_abs_individual_shift",
     "n_rewires", "n_side_switches",
     # Fix 9: the similarity recommender's own round shape. All None for a
     # round with no feed_size column at all (every pre-Fix-9 run, and every
@@ -489,11 +491,15 @@ def round_rows(
     experiment = experiment_of(config["run_id"])
     last_known: dict[str, float] = {}
     out: list[dict] = []
-    # Round 0's own readings, never carried forward: mean_belief_shift and
-    # mean_signed_shift compare a round's own valid reading against the
-    # agent's ACTUAL round-0 probe, not against whatever was last known --
-    # an agent whose round 0 failed contributes no shift at any later round.
+    # Round 0's and round 1's own readings, never carried forward:
+    # mean_belief_shift and mean_belief_shift_from_r1 compare a round's own
+    # valid reading against the agent's ACTUAL round-0 (or round-1) probe,
+    # not against whatever was last known -- an agent whose baseline round
+    # failed contributes no shift at any later round. Jo et al. use round 1
+    # as their own baseline; round0_x exists because this codebase also has
+    # a pre-interaction round 0 probe they do not.
     round0_x = {r["agent_id"]: r["x"] for r in by_turn.get(0, [])}
+    round1_x = {r["agent_id"]: r["x"] for r in by_turn.get(1, [])}
 
     for turn in sorted(by_turn):
         rows = by_turn[turn]
@@ -524,13 +530,34 @@ def round_rows(
             None if nci_value is None or nci_null_mean is None
             else nci_value - nci_null_mean
         )
+        neighbor_corr_value = neighbor_corr(round_graph, known)
+        neighbor_corr_null_mean, neighbor_corr_null_hi = neighbor_corr_null(
+            round_graph, known, f"{config['seed']}|{turn}|neighbor_corr_null"
+        )
+        neighbor_corr_excess = (
+            None if neighbor_corr_value is None or neighbor_corr_null_mean is None
+            else neighbor_corr_value - neighbor_corr_null_mean
+        )
         local_dis = local_disagreement(round_graph, known)
         pairwise_dis = pairwise_disagreement(known)
+        mean_neighbor_gap_x = _mean_abs_diff_over_known_edges(round_graph, known)
 
-        shifts = [
-            row["x"] - round0_x[row["agent_id"]]
+        # Fix 2: v = 2x, Jo et al.'s own [-2, 2] scale. shifts_v is the
+        # individual per-agent change since round 0, on v, restricted to
+        # agents with a valid reading at both ends -- mean_abs_individual_shift
+        # is the mean of |shifts_v|, and mean_belief_shift (the group-level,
+        # signed quantity) is the mean of shifts_v itself, which is
+        # algebraically the difference of the two rounds' group means over
+        # this SAME paired set.
+        shifts_v = [
+            2.0 * (row["x"] - round0_x[row["agent_id"]])
             for row in rows
             if row["agent_id"] in round0_x
+        ]
+        shifts_v_from_r1 = [
+            2.0 * (row["x"] - round1_x[row["agent_id"]])
+            for row in rows
+            if row["agent_id"] in round1_x
         ]
 
         if turn == 0:
@@ -563,12 +590,13 @@ def round_rows(
             "assort_excess": assort_excess,
             "cross_side_edge_share": cross_side_edge_share(round_graph, known),
             "minority_share": minority_share(known),
-            # Equal to var_x: both are (1/n) * sum((x - mean)^2) over this
-            # round's valid readings. Kept as two columns because Wang et
-            # al. name it Pz and report it on their own [-2, 2] scale,
-            # where it reads 4x ours for the same underlying state.
-            "polarization_index": population_variance(xs),
-            "global_disagreement": global_disagreement(round_graph, known, population),
+            # Fix 2: Pz in Jo et al. (Eq. 1), on v = 2x -- equal to
+            # 4 * var_x when computed on the same agents. Reported over
+            # THIS round's own valid readings (xs), not the carried-forward
+            # `known` nci/global_disagreement share -- see those two for
+            # the agent set they use instead, and why.
+            "polarization_index": 4.0 * population_variance(xs),
+            "global_disagreement": global_disagreement(round_graph, known),
             "pairwise_disagreement": pairwise_dis,
             "local_disagreement": local_dis,
             "disagreement_ratio": disagreement_ratio(local_dis, pairwise_dis),
@@ -576,11 +604,30 @@ def round_rows(
             "nci_null_mean": nci_null_mean,
             "nci_null_hi": nci_null_hi,
             "nci_excess": nci_excess,
+            "neighbor_corr": neighbor_corr_value,
+            "neighbor_corr_null_mean": neighbor_corr_null_mean,
+            "neighbor_corr_null_hi": neighbor_corr_null_hi,
+            "neighbor_corr_excess": neighbor_corr_excess,
             "bimodality": bimodality(xs),
+            # Fix 2: v̄(t) - v̄(0), signed, over agents with a valid reading
+            # at both rounds -- replaces the old mean_signed_shift (removed).
             "mean_belief_shift": (
-                sum(abs(s) for s in shifts) / len(shifts) if shifts else None
+                sum(shifts_v) / len(shifts_v) if shifts_v else None
             ),
-            "mean_signed_shift": sum(shifts) / len(shifts) if shifts else None,
+            # v̄(t) - v̄(1): Jo et al.'s own baseline round, which this
+            # codebase's pre-interaction round 0 is not. None at round 0,
+            # where comparing against a round that has not happened yet
+            # (in Jo et al.'s sense) is not meaningful regardless of what
+            # round1_x happens to hold.
+            "mean_belief_shift_from_r1": (
+                None if turn == 0
+                else (sum(shifts_v_from_r1) / len(shifts_v_from_r1) if shifts_v_from_r1 else None)
+            ),
+            # Fix 2: what mean_belief_shift held before this fix -- mean of
+            # each agent's own |v(t) - v(0)|, on v.
+            "mean_abs_individual_shift": (
+                sum(abs(s) for s in shifts_v) / len(shifts_v) if shifts_v else None
+            ),
             "n_rewires": (rewires or {}).get(turn, 0),
             "n_side_switches": n_side_switches,
             "mean_feed_size": _mean_or_none(turn_frame.get("feed_size", pd.Series(dtype=float))),
@@ -589,7 +636,9 @@ def round_rows(
                 round_graph, known, config.get("recsys_threshold")
             ),
             "mean_feed_gap": mean_feed_gap(turn_frame, known),
-            "mean_neighbor_gap": local_dis,
+            # Fix 2: no longer an alias of local_disagreement -- that moved
+            # to v, and this stays on x (see mean_feed_gap's own note).
+            "mean_neighbor_gap": mean_neighbor_gap_x,
             "n_valid": len(rows),
             "n_failed": population - len(rows),
             "mean_reply_prompt_tokens": _mean_or_none(
@@ -740,58 +789,74 @@ def minority_share(x_by_agent: dict[str, float]) -> float | None:
     return min(pro, con) / len(sides)
 
 
-# --- E5 extra echo-chamber metrics (Wang et al.) --------------------------
+# --- E5 extra echo-chamber metrics (Jo et al.; Wang et al. for the rest) --
 #
-# Wang et al., "Decoding Echo Chambers: LLM-Powered Simulations Revealing
-# Polarization in Social Networks" (COLING 2025), use opinions in [-2, 2];
-# this codebase's x is in [-1, 1]. Their Pz (polarization_index) and DG
-# (global_disagreement) are therefore 4x ours for the same underlying state
-# -- a scale factor, not a different quantity.
+# Fix 2: polarization_index (Pz, Eq. 1), global_disagreement (DG, Eq. 2) and
+# nci (NCI, Eq. 3) follow Jo et al., "Model-Specific Echo Chamber Formation
+# Patterns in Repeated LLM Agent Networks" (IAIT 2026) literally, computed on
+# v = 2x -- their own [-2, 2] scale, where this codebase's x is [-1, 1], so
+# Pz and DG read 4x this codebase's x-based equivalents for the same
+# underlying state. pairwise_disagreement/local_disagreement also moved to
+# v (disagreement_ratio is unaffected, being a same-scale ratio of the two).
+# neighbor_corr is the Pearson correlation Wang et al., "Decoding Echo
+# Chambers: LLM-Powered Simulations Revealing Polarization in Social
+# Networks" (COLING 2025), describe in text as their own NCI -- kept under
+# this name since it is a different quantity from Jo et al.'s NCI (see
+# nci's own docstring for where they disagree).
 
 
 def global_disagreement(
-    graph: nx.Graph | None, x_by_agent: dict[str, float], population: int
+    graph: nx.Graph | None, x_by_agent: dict[str, float]
 ) -> float | None:
-    """DG in Wang et al.: how much an agent disagrees with its own
-    neighbours, averaged over the population.
+    """DG in Jo et al. (Eq. 2): how much an agent disagrees with its own
+    neighbours, averaged over the population -- on v = 2x (their own
+    [-2, 2] scale, where their Pz/DG read 4x this codebase's x-based ones
+    for the same underlying state).
 
-        DG_i = mean over i's neighbours j of (x_i - x_j)^2
-        DG   = (1 / (2 * population)) * sum_i DG_i
+        DG_i = mean over i's neighbours j of (v_i - v_j)^2
+        DG   = (1 / (2 * n)) * sum_i DG_i
 
     Summed only over agents with at least one known neighbour -- an
     isolated node (or one with no neighbour that has a reading) has no
-    DG_i to contribute, and is not the same as contributing 0 -- but the
-    denominator is still `population`, not the count of agents that
-    qualified, which is what makes this a population-level rate rather
-    than a per-qualifying-agent average.
+    DG_i to contribute, and is not the same as contributing 0. `n` (Fix 2)
+    is the count of agents in the graph with a known reading, whether or
+    not they have a qualifying neighbour -- NOT the config's population M
+    the way this used to divide, and the same agent set `nci` below uses
+    for its own Pz/DG so the two share one n (Jo's Eq. 3 depends on that).
 
-    None when nobody in the graph has a known neighbour to compare
-    against at all, the same "no measurement" answer the other graph
-    metrics give rather than 0 ("agents agree with their neighbours").
+    None when nobody in the graph has a known reading at all, or when
+    nobody who does has a known neighbour to compare against -- the same
+    "no measurement" answer the other graph metrics give rather than 0
+    ("agents agree with their neighbours").
     """
     if graph is None:
         return None
+    known = {a: x for a, x in x_by_agent.items() if a in graph}
+    n = len(known)
+    if n == 0:
+        return None
     total = 0.0
     any_qualified = False
-    for agent in graph.nodes:
-        if agent not in x_by_agent:
-            continue
-        neighbors = [j for j in graph.neighbors(agent) if j in x_by_agent]
+    for agent, xi in known.items():
+        neighbors = [j for j in graph.neighbors(agent) if j in known]
         if not neighbors:
             continue
         any_qualified = True
-        xi = x_by_agent[agent]
-        total += sum((xi - x_by_agent[j]) ** 2 for j in neighbors) / len(neighbors)
+        vi = 2.0 * xi
+        total += sum((vi - 2.0 * known[j]) ** 2 for j in neighbors) / len(neighbors)
     if not any_qualified:
         return None
-    return total / (2 * population)
+    return total / (2 * n)
 
 
 def pairwise_disagreement(x_by_agent: dict[str, float]) -> float | None:
-    """Mean |x_i - x_j| over all unordered pairs of agents with a known
-    reading -- not in Wang et al., but the population-wide baseline
-    `disagreement_ratio` needs: a graph structure's own edges can disagree
-    less, or more, than two agents picked at random would.
+    """Mean |v_i - v_j| (Fix 2: on v = 2x, Jo et al.'s own scale) over all
+    unordered pairs of agents with a known reading -- not in Jo/Wang et
+    al., but the population-wide baseline `disagreement_ratio` needs: a
+    graph structure's own edges can disagree less, or more, than two
+    agents picked at random would. disagreement_ratio itself is unaffected
+    by the x-vs-v scale, since both its numerator and denominator scale by
+    the same factor.
 
     None below two known agents, where no pair exists.
     """
@@ -803,13 +868,16 @@ def pairwise_disagreement(x_by_agent: dict[str, float]) -> float | None:
         abs(values[i] - values[j]) for i in range(n) for j in range(i + 1, n)
     )
     pairs = n * (n - 1) // 2
-    return total / pairs
+    return 2.0 * (total / pairs)
 
 
-def local_disagreement(graph: nx.Graph | None, x_by_agent: dict[str, float]) -> float | None:
-    """Mean |x_i - x_j| over this round's edges whose both ends have a
-    known reading. Unlike cross_side_edge_share, an agent at x == 0 is not
-    excluded -- this is a magnitude of disagreement, not a side comparison.
+def _mean_abs_diff_over_known_edges(
+    graph: nx.Graph | None, x_by_agent: dict[str, float]
+) -> float | None:
+    """Mean |a_i - a_j| over this round's edges whose both ends have a
+    known reading, on whatever scale the caller's values already are --
+    the shared core of local_disagreement (which reports it on v) and
+    mean_neighbor_gap (which reports it on x; see that column's own note).
 
     None when no edge survives with both ends known.
     """
@@ -820,6 +888,18 @@ def local_disagreement(graph: nx.Graph | None, x_by_agent: dict[str, float]) -> 
     if not edges:
         return None
     return sum(abs(known[a] - known[b]) for a, b in edges) / len(edges)
+
+
+def local_disagreement(graph: nx.Graph | None, x_by_agent: dict[str, float]) -> float | None:
+    """Mean |v_i - v_j| (Fix 2: on v = 2x) over this round's edges whose
+    both ends have a known reading. Unlike cross_side_edge_share, an agent
+    at x == 0 is not excluded -- this is a magnitude of disagreement, not a
+    side comparison.
+
+    None when no edge survives with both ends known.
+    """
+    on_x = _mean_abs_diff_over_known_edges(graph, x_by_agent)
+    return None if on_x is None else 2.0 * on_x
 
 
 def disagreement_ratio(local: float | None, pairwise: float | None) -> float | None:
@@ -866,6 +946,12 @@ def mean_feed_gap(turn_frame: pd.DataFrame, x_by_agent: dict[str, float]) -> flo
     actually assembled this round -- whatever the strategy, since every
     strategy logs neighbor_agent_ids as the feed it delivered.
 
+    Fix 2: stays on x, unlike pairwise_disagreement/local_disagreement/nci
+    (which moved to v = 2x) -- recsys_threshold, the number this column is
+    read alongside, is itself in x units, and converting one side of that
+    comparison and not the other would make a threshold of 1.0 mean two
+    different things.
+
     Under GraphSampling/AlphaSampling this is the same N posts every reader
     always gets; under graph_similarity it is the (up to N) posts the
     recommender actually chose, which is the number mean_neighbor_gap (the
@@ -895,6 +981,10 @@ def share_neighbors_filtered(
     """Share of this round's graph edges -- the full candidate
     neighbourhood, not the delivered feed -- whose two known ends disagree
     by more than `threshold`.
+
+    Fix 2: stays on x, like mean_feed_gap, for the same reason --
+    recsys_threshold is in x units, and this is the share of edges that
+    fall on either side of it.
 
     None when there is no graph, no threshold (a run logged before
     recsys_threshold existed), or no edge survives with both ends known --
@@ -931,9 +1021,11 @@ def _neighbor_mean_pairs(
     graph: nx.Graph, x_by_agent: dict[str, float]
 ) -> tuple[list[float], list[float]]:
     """(x_i, mean of i's known neighbours' x) for every agent with at
-    least one known neighbour. Shared by `nci` and `nci_null`'s permutation
-    loop, so a reshuffled assignment is scored the same way the real one
-    is."""
+    least one known neighbour. Shared by `neighbor_corr` and
+    `neighbor_corr_null`'s permutation loop (Fix 2 renamed the Pearson
+    reading off `nci`, which now follows Jo et al.'s different Eq. 3
+    instead), so a reshuffled assignment is scored the same way the real
+    one is."""
     xs: list[float] = []
     means: list[float] = []
     for agent in graph.nodes:
@@ -947,24 +1039,64 @@ def _neighbor_mean_pairs(
     return xs, means
 
 
+def _nci_from_moments(pz: float, dg: float) -> float | None:
+    """NCI = 1 - DG / (2 * Pz) (Jo et al. Eq. 3). None when Pz is 0 (every
+    qualifying agent holds the same belief), where the ratio divides by
+    zero.
+
+    Worked example, Jo et al.'s own GPT-4o round-30 numbers: Pz = 0.07,
+    DG = 0.02 gives NCI = 1 - 0.02 / 0.14 = 6/7 ~ 0.857.
+
+    When opinions are placed on the graph at random, NCI works out to
+    about 1 - n / (2 * (n - 1)) -- 0.47 at n = 20 -- so 0.5, not 0, is the
+    "no neighbour alignment" baseline this index sits around.
+    """
+    if pz == 0:
+        return None
+    return 1.0 - dg / (2.0 * pz)
+
+
 def nci(graph: nx.Graph | None, x_by_agent: dict[str, float]) -> float | None:
-    """NCI in Wang et al.: the correlation between an agent's own opinion
-    and the mean opinion of its neighbours, over agents with at least one
-    known neighbour.
+    """NCI in Jo et al. (Eq. 3): NCI = 1 - DG / (2 * Pz), with Pz and DG
+    (see global_disagreement) computed over the SAME agent set -- those in
+    the round's graph with a known (carried-forward) reading, whether or
+    not they have a qualifying neighbour -- so the `n` in each denominator
+    is identical, which the formula depends on (Fix 2). Both are computed
+    on v = 2x, Jo et al.'s own [-2, 2] scale; NCI itself is a ratio of two
+    quantities that scale the same way, so this is equivalent to computing
+    both on x, but is done on v to match Eq. 1-3 literally rather than
+    relying on that cancellation.
 
-    Follows their text description ("the correlation between a node's
-    opinion and its neighbours' average opinion"), not their printed
-    formula -- the paper's own formula does not match that description,
-    and the text is what every other implementation of NCI follows.
+    This replaces the Pearson-correlation reading this column used to
+    hold -- see neighbor_corr for that (Wang et al.'s text description of
+    their own NCI, kept under a new name since Jo et al.'s NCI is a
+    different quantity: a perfectly anti-correlated alternating ring
+    scores neighbor_corr = -1 but nci = 0, not -1 -- see
+    test_nci_is_zero_on_a_perfectly_alternating_ring.
 
-    None when fewer than two agents qualify, or when either side of the
-    correlation has zero variance (e.g. every qualifying agent's own x is
-    identical).
+    None when graph is None, when no agent in the graph has a known
+    reading, or when Pz is 0 for that agent set (see _nci_from_moments).
     """
     if graph is None:
         return None
-    xs, means = _neighbor_mean_pairs(graph, x_by_agent)
-    return _pearson(xs, means)
+    known = {a: x for a, x in x_by_agent.items() if a in graph}
+    n = len(known)
+    if n == 0:
+        return None
+    pz = population_variance([2.0 * x for x in known.values()])
+    total = 0.0
+    any_qualified = False
+    for agent, xi in known.items():
+        neighbors = [j for j in graph.neighbors(agent) if j in known]
+        if not neighbors:
+            continue
+        any_qualified = True
+        vi = 2.0 * xi
+        total += sum((vi - 2.0 * known[j]) ** 2 for j in neighbors) / len(neighbors)
+    if not any_qualified:
+        return None
+    dg = total / (2 * n)
+    return _nci_from_moments(pz, dg)
 
 
 def nci_null(
@@ -995,6 +1127,56 @@ def nci_null(
         shuffled = list(values)
         rng.shuffle(shuffled)
         sample = nci(graph, dict(zip(nodes, shuffled, strict=True)))
+        if sample is not None:
+            samples.append(sample)
+    if not samples:
+        return None, None
+    samples.sort()
+    mean = sum(samples) / len(samples)
+    return mean, percentile(samples, ASSORT_NULL_PERCENTILE)
+
+
+def neighbor_corr(graph: nx.Graph | None, x_by_agent: dict[str, float]) -> float | None:
+    """The Pearson correlation Wang et al.'s text describes as NCI ("the
+    correlation between a node's opinion and its neighbours' average
+    opinion") -- kept under this name since Fix 2 redefines `nci` itself to
+    Jo et al.'s different Eq. 3 quantity (see nci's own docstring for a
+    case where the two disagree in sign, not just in magnitude).
+
+    Over agents with at least one known neighbour. None when fewer than
+    two agents qualify, or when either side of the correlation has zero
+    variance (e.g. every qualifying agent's own x is identical).
+    """
+    if graph is None:
+        return None
+    xs, means = _neighbor_mean_pairs(graph, x_by_agent)
+    return _pearson(xs, means)
+
+
+def neighbor_corr_null(
+    graph: nx.Graph | None, x_by_agent: dict[str, float], seed_key: str
+) -> tuple[float | None, float | None]:
+    """The permutation null for `neighbor_corr`, built exactly like
+    `nci_null` (same seeding scheme, same resample count) so the two nulls
+    are reproducible the same way.
+
+    None, None under exactly the conditions `neighbor_corr` itself would
+    be None under for lack of variance to permute.
+    """
+    if graph is None:
+        return None, None
+    known = {a: x for a, x in x_by_agent.items() if a in graph}
+    if len(set(known.values())) < 2:
+        return None, None
+    nodes = sorted(known)
+    values = [known[node] for node in nodes]
+
+    rng = random.Random(seed_key)
+    samples: list[float] = []
+    for _ in range(ASSORT_NULL_RESAMPLES):
+        shuffled = list(values)
+        rng.shuffle(shuffled)
+        sample = neighbor_corr(graph, dict(zip(nodes, shuffled, strict=True)))
         if sample is not None:
             samples.append(sample)
     if not samples:
@@ -1069,10 +1251,16 @@ RUN_COLUMNS = (
     "final_polarization_index", "final_global_disagreement",
     "final_pairwise_disagreement", "final_local_disagreement",
     "final_disagreement_ratio", "final_nci", "final_nci_null_mean",
-    "final_nci_null_hi", "final_nci_excess", "final_bimodality",
-    "final_mean_belief_shift", "final_mean_signed_shift",
+    "final_nci_null_hi", "final_nci_excess",
+    "final_neighbor_corr", "final_neighbor_corr_null_mean",
+    "final_neighbor_corr_null_hi", "final_neighbor_corr_excess",
+    "final_bimodality",
+    "final_mean_belief_shift", "final_mean_belief_shift_from_r1",
+    "final_mean_abs_individual_shift",
     "delta_polarization_index", "delta_global_disagreement", "delta_nci",
-    "auc_nci_excess", "total_side_switches", "total_rewires",
+    "delta_neighbor_corr",
+    "auc_nci_excess", "auc_neighbor_corr_excess",
+    "total_side_switches", "total_rewires",
     *(f"rate_{name}" for name in OUTCOMES),
     "rate_reply_truncated",
     "mean_n_repeat_reads",
@@ -1146,9 +1334,14 @@ def run_row(
         "final_nci_null_mean": final["nci_null_mean"],
         "final_nci_null_hi": final["nci_null_hi"],
         "final_nci_excess": final["nci_excess"],
+        "final_neighbor_corr": final["neighbor_corr"],
+        "final_neighbor_corr_null_mean": final["neighbor_corr_null_mean"],
+        "final_neighbor_corr_null_hi": final["neighbor_corr_null_hi"],
+        "final_neighbor_corr_excess": final["neighbor_corr_excess"],
         "final_bimodality": final["bimodality"],
         "final_mean_belief_shift": final["mean_belief_shift"],
-        "final_mean_signed_shift": final["mean_signed_shift"],
+        "final_mean_belief_shift_from_r1": final["mean_belief_shift_from_r1"],
+        "final_mean_abs_individual_shift": final["mean_abs_individual_shift"],
         "delta_polarization_index": _delta(
             final["polarization_index"], first["polarization_index"]
         ),
@@ -1156,7 +1349,9 @@ def run_row(
             final["global_disagreement"], first["global_disagreement"]
         ),
         "delta_nci": _delta(final["nci"], first["nci"]),
+        "delta_neighbor_corr": _delta(final["neighbor_corr"], first["neighbor_corr"]),
         "auc_nci_excess": auc_nci_excess(ordered),
+        "auc_neighbor_corr_excess": auc_neighbor_corr_excess(ordered),
         "total_side_switches": _sum_or_none(
             [r["n_side_switches"] for r in ordered]
         ),
@@ -1215,6 +1410,18 @@ def auc_nci_excess(rounds: list[dict]) -> float | None:
         r["nci_excess"]
         for r in rounds
         if r["turn"] >= 1 and r["nci_excess"] is not None
+    ]
+    return sum(values) / len(values) if values else None
+
+
+def auc_neighbor_corr_excess(rounds: list[dict]) -> float | None:
+    """Mean neighbor_corr_excess over rounds 1..K -- the same AUC
+    construction as auc_nci_excess/auc_assort_excess, for the Pearson
+    reading `neighbor_corr` kept under its own name (Fix 2)."""
+    values = [
+        r["neighbor_corr_excess"]
+        for r in rounds
+        if r["turn"] >= 1 and r["neighbor_corr_excess"] is not None
     ]
     return sum(values) / len(values) if values else None
 

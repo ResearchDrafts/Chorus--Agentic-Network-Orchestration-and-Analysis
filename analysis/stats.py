@@ -84,13 +84,21 @@ ECHO_METRICS = (
     "final_global_disagreement",
     "final_bimodality",
     "final_mean_belief_shift",
+    # Fix 2: final_neighbor_corr is Wang et al.'s own Pearson reading, kept
+    # under this name now that final_nci follows Jo et al.'s different
+    # Eq. 3; final_mean_abs_individual_shift is what final_mean_belief_shift
+    # held before Fix 2 redefined it to the signed group-mean difference.
+    "final_neighbor_corr",
+    "final_mean_abs_individual_shift",
     "total_side_switches",
 )
 
 # auc_nci_excess is the primary echo-chamber outcome (see network_contrasts'
 # `primary` column): unlike t_echo, it needs no threshold and is defined for
 # EVERY run, censored or not, so a campaign with no formation yet still
-# reports it.
+# reports it. Fix 2 redefined nci() to Jo et al.'s Eq. 3; this stays the
+# primary metric under the new definition, not the old Pearson one (now
+# neighbor_corr).
 PRIMARY_ECHO_METRIC = "auc_nci_excess"
 
 # E7 rewires without selecting a same-side neighbour; the e5-vs-e7 contrast
@@ -109,19 +117,22 @@ E5_E7_METRICS = (
 # Fix 9: e8 (the similarity recommender) vs. e9 (random neighbours at the
 # same feed size N=5), contrasted the same way e5-vs-e6/e5-vs-e7 are:
 # language minus English within each, and the difference between them.
-# final_neighbor_corr is not its own column -- Wang et al.'s "correlation
-# between an agent's opinion and its neighbours' mean" is exactly what
-# analysis/metrics.py's nci() already computes (it follows their text
-# description, not their printed formula), and correlation is invariant to
-# the x-vs-v=2x rescaling, so final_nci IS final_neighbor_corr under this
-# codebase's naming. Listed here once, under the name the rest of this
-# module already uses, rather than duplicating the column.
+# Fix 2: final_neighbor_corr used to not be its own column here -- before
+# Fix 2 redefined analysis/metrics.py's nci() to Jo et al.'s Eq. 3, it
+# already computed Wang et al.'s own "correlation between an agent's
+# opinion and its neighbours' mean", so final_nci WAS final_neighbor_corr
+# under the old naming. They are different quantities now (see nci's own
+# docstring for where they disagree), so final_neighbor_corr is listed
+# explicitly; final_mean_abs_individual_shift is what final_mean_belief_shift
+# held before Fix 2 redefined it to the signed group-mean difference.
 RECSYS_METRICS = (
     "auc_nci_excess",
     "final_nci",
+    "final_neighbor_corr",
     "final_global_disagreement",
     "final_polarization_index",
     "final_mean_belief_shift",
+    "final_mean_abs_individual_shift",
     "final_minority_share",
 )
 

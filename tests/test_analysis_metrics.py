@@ -455,20 +455,27 @@ def test_the_graph_metric_carries_a_missing_agent_forward():
     assert rounds[1]["n_valid"] == 3 and rounds[1]["n_failed"] == 1
 
 
-# --- Fix 4: polarization_index, belief shift, n_side_switches --------------
+# --- Fix 2/4: polarization_index, belief shift, n_side_switches -----------
 
 
-def test_polarization_index_equals_var_x():
+def test_polarization_index_equals_four_times_var_x():
+    """Fix 2: Pz is on v = 2x (Jo et al. Eq. 1), so it is 4 * var_x, not
+    var_x itself."""
     frame = _frame([
         {"speaker_agent_id": "a", "turn": 0, "x": 1.0},
         {"speaker_agent_id": "b", "turn": 0, "x": -1.0},
     ])
     probes = m.probe_rows(frame, CONFIG, TAU, TAU_CONF)
     rounds = m.round_rows(frame, probes, CONFIG, None)
-    assert rounds[0]["polarization_index"] == rounds[0]["var_x"] == pytest.approx(1.0)
+    assert rounds[0]["var_x"] == pytest.approx(1.0)
+    assert rounds[0]["polarization_index"] == pytest.approx(4.0 * rounds[0]["var_x"])
 
 
 def test_belief_shift_is_measured_against_each_agents_own_round_zero():
+    """Fix 2: mean_belief_shift is now the SIGNED, group-level v̄(t) - v̄(0)
+    (what mean_signed_shift used to hold, now on v = 2x and under this
+    name); mean_abs_individual_shift is the mean of each agent's own
+    |v(t) - v(0)| (what mean_belief_shift used to hold, now on v)."""
     frame = _frame([
         {"speaker_agent_id": "a", "turn": 0, "x": 0.0},
         {"speaker_agent_id": "b", "turn": 0, "x": 0.5},
@@ -477,13 +484,18 @@ def test_belief_shift_is_measured_against_each_agents_own_round_zero():
     ])
     probes = m.probe_rows(frame, CONFIG, TAU, TAU_CONF)
     rounds = m.round_rows(frame, probes, CONFIG, None)
-    # round 0 compared against itself: both shifts are 0.
+    # round 0 compared against itself: both are 0.
     assert rounds[0]["mean_belief_shift"] == pytest.approx(0.0)
-    assert rounds[0]["mean_signed_shift"] == pytest.approx(0.0)
-    # a: |0.2 - 0.0| = 0.2, 0.2 - 0.0 = +0.2
-    # b: |-0.3 - 0.5| = 0.8, -0.3 - 0.5 = -0.8
-    assert rounds[1]["mean_belief_shift"] == pytest.approx((0.2 + 0.8) / 2)
-    assert rounds[1]["mean_signed_shift"] == pytest.approx((0.2 - 0.8) / 2)
+    assert rounds[0]["mean_abs_individual_shift"] == pytest.approx(0.0)
+    # v = 2x. a: v(1)-v(0) = 0.4-0.0 = +0.4, |+0.4| = 0.4
+    # b: v(1)-v(0) = -0.6-1.0 = -1.6, |-1.6| = 1.6
+    assert rounds[1]["mean_belief_shift"] == pytest.approx((0.4 - 1.6) / 2)
+    assert rounds[1]["mean_abs_individual_shift"] == pytest.approx((0.4 + 1.6) / 2)
+    # Signed and equals the difference of the two rounds' group means, over
+    # the same paired set (both agents have both rounds here).
+    v0_mean = sum(2 * x for x in (0.0, 0.5)) / 2
+    v1_mean = sum(2 * x for x in (0.2, -0.3)) / 2
+    assert rounds[1]["mean_belief_shift"] == pytest.approx(v1_mean - v0_mean)
 
 
 def test_belief_shift_excludes_an_agent_whose_round_zero_probe_failed():
@@ -496,7 +508,24 @@ def test_belief_shift_excludes_an_agent_whose_round_zero_probe_failed():
     probes = m.probe_rows(frame, CONFIG, TAU, TAU_CONF)
     rounds = m.round_rows(frame, probes, CONFIG, None)
     # Only a contributes: b has no round-0 baseline to compare against.
-    assert rounds[1]["mean_belief_shift"] == pytest.approx(0.4)
+    # v(1)-v(0) for a = 0.8 - 0.0 = 0.8.
+    assert rounds[1]["mean_belief_shift"] == pytest.approx(0.8)
+    assert rounds[1]["mean_abs_individual_shift"] == pytest.approx(0.8)
+
+
+def test_mean_belief_shift_from_r1_is_none_at_round_zero_and_zero_at_round_one():
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 0, "x": 0.0},
+        {"speaker_agent_id": "a", "turn": 1, "x": 0.2},
+        {"speaker_agent_id": "a", "turn": 2, "x": 0.5},
+    ])
+    probes = m.probe_rows(frame, CONFIG, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, CONFIG, None)
+    by_turn = {r["turn"]: r for r in rounds}
+    assert by_turn[0]["mean_belief_shift_from_r1"] is None
+    assert by_turn[1]["mean_belief_shift_from_r1"] == pytest.approx(0.0)
+    # v(2) - v(1) = 1.0 - 0.4 = 0.6
+    assert by_turn[2]["mean_belief_shift_from_r1"] == pytest.approx(0.6)
 
 
 def test_n_side_switches_is_none_at_round_zero():
@@ -601,19 +630,25 @@ def test_run_row_aggregates_the_new_echo_metrics():
     assert row["total_rewires"] == 3
     # Only b switches, at turn 1; turn 0 is None and contributes nothing.
     assert row["total_side_switches"] == 1
-    assert row["final_polarization_index"] == row["final_var_x"]
-    # turn 0: {a:1,b:1,c:-1,d:-1} -> var 1.0. turn 2: {a:1,b:-1,c:-1,d:-1}
-    # -> mean -0.5, var ((1.5)^2 + 3*(0.5)^2) / 4 = 0.75.
-    assert rounds[0]["polarization_index"] == pytest.approx(1.0)
-    assert row["final_polarization_index"] == pytest.approx(0.75)
-    assert row["delta_polarization_index"] == pytest.approx(0.75 - 1.0)
-    # turn 0: every edge agrees exactly -> 0.0. turn 2: a-b disagree by 2
-    # (DG 4 each), c-d agree (DG 0 each) -> (4+4+0+0) / (2*4) = 1.0.
+    # Fix 2: Pz is on v = 2x, so it is 4 * var_x rather than equal to it.
+    assert row["final_polarization_index"] == pytest.approx(4.0 * row["final_var_x"])
+    # turn 0: {a:1,b:1,c:-1,d:-1} -> var 1.0 -> Pz 4.0. turn 2:
+    # {a:1,b:-1,c:-1,d:-1} -> mean -0.5, var ((1.5)^2 + 3*(0.5)^2) / 4 = 0.75
+    # -> Pz 3.0.
+    assert rounds[0]["polarization_index"] == pytest.approx(4.0)
+    assert row["final_polarization_index"] == pytest.approx(3.0)
+    assert row["delta_polarization_index"] == pytest.approx(3.0 - 4.0)
+    # turn 0: every edge agrees exactly -> DG 0.0. turn 2: on v = 2x, a-b
+    # disagree by 4 (DG_i 16 each), c-d agree (DG_i 0 each)
+    # -> (16+16+0+0) / (2*4) = 4.0.
     assert rounds[0]["global_disagreement"] == pytest.approx(0.0)
-    assert row["final_global_disagreement"] == pytest.approx(1.0)
-    assert row["delta_global_disagreement"] == pytest.approx(1.0)
+    assert row["final_global_disagreement"] == pytest.approx(4.0)
+    assert row["delta_global_disagreement"] == pytest.approx(4.0)
     assert row["delta_nci"] is not None
     assert row["auc_nci_excess"] is not None
+    assert row["delta_neighbor_corr"] is not None
+    assert row["auc_neighbor_corr_excess"] is not None
+    assert row["final_mean_abs_individual_shift"] is not None
 
 
 def test_run_row_carries_the_reply_truncated_rate_through():
@@ -731,7 +766,9 @@ def test_mean_feed_gap_is_none_at_round_zero():
 def test_share_neighbors_filtered_and_mean_neighbor_gap_use_the_full_graph():
     """Over the round's own graph -- the full candidate neighbourhood, not
     the delivered feed -- one of the triangle's three edges exceeds the
-    threshold; mean_neighbor_gap is local_disagreement under a second name."""
+    threshold. Fix 2: mean_neighbor_gap stays on x (recsys_threshold is in
+    x), so it is no longer local_disagreement under a second name -- that
+    moved to v = 2x and is exactly double."""
     graph = nx.Graph([("a", "b"), ("b", "c"), ("a", "c")])
     frame = _frame([
         {"speaker_agent_id": "a", "turn": 1, "x": 0.0},
@@ -745,7 +782,7 @@ def test_share_neighbors_filtered_and_mean_neighbor_gap_use_the_full_graph():
     # a-b: 0.1 (ok), b-c: 0.1 (ok), a-c: 0.2 (over 0.15) -> 1 of 3.
     assert row["share_neighbors_filtered"] == pytest.approx(1 / 3)
     assert row["mean_neighbor_gap"] == pytest.approx((0.1 + 0.1 + 0.2) / 3)
-    assert row["mean_neighbor_gap"] == row["local_disagreement"]
+    assert row["local_disagreement"] == pytest.approx(2 * row["mean_neighbor_gap"])
 
 
 def test_share_neighbors_filtered_is_none_without_a_threshold():

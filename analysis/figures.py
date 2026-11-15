@@ -369,8 +369,10 @@ def figure_cross_side_edge_share(rounds: pd.DataFrame, out_dir: Path) -> list[Pa
 
 
 def figure_nci_excess(rounds: pd.DataFrame, out_dir: Path) -> list[Path]:
-    """nci_excess by round: the neighbour-correlation index above its own
-    permutation null, one line per language, E5/E6/E7 in the usual styles.
+    """nci_excess by round: Jo et al.'s NCI (Eq. 3; Fix 2 redefined this
+    column from Wang et al.'s Pearson reading, now `neighbor_corr`) above
+    its own permutation null, one line per language, E5/E6/E7 in the usual
+    styles.
 
     auc_nci_excess (its area under this curve) is the primary echo-chamber
     outcome (see analysis/stats.py); this figure is what that number is
@@ -378,8 +380,8 @@ def figure_nci_excess(rounds: pd.DataFrame, out_dir: Path) -> list[Path]:
     """
     return _line_by_round_figure(
         rounds, "nci_excess",
-        "neighbour-correlation index − null mean\n(excess over random mixing)",
-        "Neighbour-correlation excess by language\n"
+        "NCI − null mean\n(excess over random mixing)",
+        "NCI excess by language\n"
         "band: range over seeds · solid: E5 · dashed: E6 · dotted: E7",
         "nci_excess", out_dir,
         ECHO_EXPERIMENT_STYLES, ECHO_EXPERIMENT_LABELS,
