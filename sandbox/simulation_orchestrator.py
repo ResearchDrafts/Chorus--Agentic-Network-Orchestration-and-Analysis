@@ -43,6 +43,7 @@ reproducible, silently.
 from __future__ import annotations
 
 import asyncio
+import random
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,7 +56,7 @@ from sandbox.interaction_engine import AlphaSampling, GraphSampling, Recommendat
 from sandbox.logging_writer import LoggingWriter
 from sandbox.meme_pool_manager import MemePoolManager
 from sandbox.model_gateway import BackendResponse, FatalGatewayError, ModelGateway
-from sandbox.models import Agent, ExperimentRun, Interaction, MemeContent, PromptRecord
+from sandbox.models import Agent, ExperimentRun, Interaction, MemeContent, PromptRecord, RewireRecord
 from sandbox.probe_scorer import MIDPOINT, ProbeMassTooLow, ProbeScore
 from sandbox.probe_scorer import score as score_probe
 from sandbox.prompt_builder import BuiltPrompt, PromptBuilder, RoundMemory
@@ -178,6 +179,17 @@ class SimulationOrchestrator:
         if resume_state is not None:
             start_turn = resume_state.last_completed_turn + 1
             self._agent_manager.restore_from_snapshot(resume_state.agent_snapshot)
+            # The graph is state once E5 rewiring can change it: a checkpoint
+            # saved after round 2's rewiring restores round 2's edges, not
+            # the edges graph_seed alone would build. A checkpoint from
+            # before this field existed, or from a non-GraphSampling run,
+            # carries graph_edges=None and this is a no-op -- the graph is
+            # reconstructed from graph_seed exactly as it always was.
+            if (
+                isinstance(self._interaction_engine, GraphSampling)
+                and resume_state.graph_edges is not None
+            ):
+                self._interaction_engine.restore_edges(resume_state.graph_edges)
             # Everything rebuilt from the log is rebuilt as of the
             # checkpoint, never as of the end of the file: a run that died
             # mid-round left rows on disk that no checkpoint covers, and
@@ -514,6 +526,16 @@ class SimulationOrchestrator:
             )
             for agent in all_agents
         }
+        # Captured now, before anything this round can mutate it: this is
+        # "the graph used for reading" step 3 just read from, which is what
+        # graph_edges_by_round.csv records for this turn (Design: logging).
+        # None when rewiring is off, so a rewire_rate=0.0 run skips the one
+        # edges() call a GraphSampling run would otherwise pay for nothing.
+        edges_used_this_round = (
+            self._interaction_engine.edges()
+            if self._run.rewire_rate > 0.0 and isinstance(self._interaction_engine, GraphSampling)
+            else None
+        )
 
         # 4. Delivery. Under `delivery: off` each agent is shown N side-free
         # messages instead of its neighbours' N bank items -- one standing in
@@ -619,6 +641,7 @@ class SimulationOrchestrator:
 
         # 7. Apply. One row per agent, always written; applied only when both
         # phases produced something.
+        probe_mean_map: dict[str, float | None] = {}
         for agent, reply, probe in zip(all_agents, replies, probes, strict=True):
             agent_id = agent.agent_id
             interaction = self._build_bank_interaction(
@@ -632,6 +655,10 @@ class SimulationOrchestrator:
                 probe=probe,
             )
             await self._logger.write_interaction(interaction)
+            # This round's own probe reading, win or lose: step 8 (rewiring)
+            # needs it to decide each reader's new side, and None here means
+            # exactly what it means to Fix I -- nothing was measured.
+            probe_mean_map[agent_id] = interaction.probe_mean
 
             # The item was selected and shown to this agent's neighbours
             # whether or not its own round succeeded, so the cycle advances
@@ -651,6 +678,147 @@ class SimulationOrchestrator:
             self._remember_round(
                 agent_id, delivered_texts[agent_id], interaction.reply_text
             )
+
+        # 8. E5's rewiring, once the round has fully committed. Skipped
+        # entirely -- no rng draw, no file touched -- when rewire_rate is
+        # 0.0, which is every config written before this feature and what
+        # keeps such a run's output byte-identical to before it.
+        if self._run.rewire_rate > 0.0:
+            assert edges_used_this_round is not None
+            await self._rewire_round(
+                turn, all_agents, side_map, neighbor_map, probe_mean_map, edges_used_this_round
+            )
+
+    async def _rewire_round(
+        self,
+        turn: int,
+        all_agents: list[Agent],
+        side_map: dict[str, str],
+        neighbor_map: dict[str, list[Agent]],
+        probe_mean_map: dict[str, float | None],
+        edges_used_this_round: list[tuple[str, str]],
+    ) -> None:
+        """E5's rewiring rule (Design points 1-5), run once after a round's
+        apply loop commits.
+
+        Every decision here comes from what steps 1-7 already computed for
+        THIS round: side_map (what each agent posted on, decided from its
+        probe BEFORE this round) and probe_mean_map (what each agent's probe
+        read AFTER this round -- its new side). Nothing here re-reads an
+        agent's probe privately on another agent's behalf: side_j, the side
+        a read post argued, is side_map[sender] -- a property of what was
+        POSTED, identical whether that post reached the reader directly
+        (delivery: on) or stood in for a shadow item (delivery: off), since
+        both items_read and shadow_items are built from post_map/side_map
+        the same way in step 4 regardless of delivery mode. That is also
+        what "E4's rewiring uses shadow items" amounts to in code: there is
+        nothing separate to branch on.
+
+        Writes graph_edges_by_round.csv for this round -- the graph as it
+        was used for this round's reading, captured by the caller before
+        step 3 returned -- and one rewires.jsonl line per opposite-side read,
+        applied or skipped. If this is the last round, one further
+        graph_edges_by_round.csv block is written at turn K+1 for the graph
+        after the final rewiring, per the design's logging spec.
+
+        Only called when rewire_rate > 0.0, which the schema ties to
+        regime='bank' and neighbor_strategy='graph' -- so
+        self._interaction_engine is always a GraphSampling here.
+        """
+        strategy = self._interaction_engine
+        assert isinstance(strategy, GraphSampling)
+        self._logger.write_graph_edges_round(turn, edges_used_this_round)
+
+        rewire_rng = self._seeds.turn_rng("rewire", turn)
+        all_agent_ids = [agent.agent_id for agent in all_agents]  # already sorted
+
+        for agent in all_agents:
+            reader_id = agent.agent_id
+            side_i = _side_of_mean(probe_mean_map.get(reader_id))
+            for neighbor in neighbor_map[reader_id]:
+                sender_id = neighbor.agent_id
+                # Drawn for EVERY read post, whether or not it turns out to
+                # be opposite-side: the same unconditional-draw discipline
+                # _resolve_side's tie-break uses, so the stream's position
+                # depends only on how many posts were read, never on any
+                # agent's stance.
+                u = rewire_rng.random()
+                side_j = side_map[sender_id]
+                if side_i is None or side_j == side_i:
+                    continue  # same side, or the reader has no side this round
+                if u >= self._run.rewire_rate:
+                    continue
+
+                status, dropped, added = self._attempt_rewire(
+                    strategy, reader_id, sender_id, side_i, side_map,
+                    all_agent_ids, rewire_rng,
+                )
+                await self._logger.write_rewire(
+                    RewireRecord(
+                        run_id=self._run.run_id,
+                        turn=turn,
+                        agent_id=reader_id,
+                        dropped=dropped,
+                        added=added,
+                        reader_side=side_i,
+                        status=status,
+                    )
+                )
+
+        if turn == self._run.K:
+            self._logger.write_graph_edges_round(turn + 1, strategy.edges())
+
+    def _attempt_rewire(
+        self,
+        strategy: "GraphSampling",
+        reader_id: str,
+        sender_id: str,
+        side_i: str,
+        side_map: dict[str, str],
+        all_agent_ids: list[str],
+        rewire_rng: random.Random,
+    ) -> tuple[str, str | None, str | None]:
+        """One rewire attempt: candidates, then the degree floor, then the
+        pick (Design point 2).
+
+        Checked in the stated order: no candidate at all is
+        `skipped_no_candidate`; a candidate exists but dropping sender_id
+        would leave it under N is `skipped_min_degree`. Both read the
+        graph's CURRENT state via neighbors_of/degree, so an earlier rewire
+        within this same round's pass is already reflected -- i's own
+        candidate set and j's degree can both have moved since the round
+        started.
+
+        The edge (reader_id, sender_id) can itself already be gone by the
+        time this runs. Graph edges are undirected and neighbor_map was
+        frozen before any rewiring began, so reader_id and sender_id can
+        each have sampled the OTHER as one of their own N read-neighbours
+        this round; whichever of the two is processed first (sorted
+        agent_id order) may drop the shared edge before the second is
+        reached, since dropping removes it from both sides at once. That is
+        not a bug to raise on -- there is simply nothing left for this read
+        to act on -- and it is the same outcome as finding no candidate, so
+        it is folded into skipped_no_candidate rather than given a fourth
+        status the schema does not define.
+        """
+        current_neighbors = set(strategy.neighbors_of(reader_id))
+        if sender_id not in current_neighbors:
+            return "skipped_no_candidate", None, None
+        candidates = sorted(
+            agent_id
+            for agent_id in all_agent_ids
+            if agent_id != reader_id
+            and agent_id not in current_neighbors
+            and (self._run.rewire_target != "same_side" or side_map[agent_id] == side_i)
+        )
+        if not candidates:
+            return "skipped_no_candidate", None, None
+        if strategy.degree(sender_id) - 1 < self._run.N:
+            return "skipped_min_degree", None, None
+
+        target_id = rewire_rng.choice(candidates)
+        strategy.rewire((reader_id, sender_id), (reader_id, target_id))
+        return "rewired", sender_id, target_id
 
     async def _probe_round_zero(self) -> None:
         """Measures every agent's starting stance before it reads anything.
@@ -1255,8 +1423,12 @@ class SimulationOrchestrator:
         return results
 
     def _save_checkpoint(self, turn: int) -> None:
+        strategy = self._interaction_engine
         self._checkpoint_mgr.save(
-            self._run.run_id, turn, self._agent_manager.snapshot()
+            self._run.run_id,
+            turn,
+            self._agent_manager.snapshot(),
+            graph_edges=strategy.edges() if isinstance(strategy, GraphSampling) else None,
         )
 
     def _finalize(self, status: str) -> None:
@@ -1352,6 +1524,29 @@ async def _no_probe() -> None:
     asyncio.gather needs an awaitable per position so the results line up
     with the agent list; this returns the same None a failed probe does.
     """
+    return None
+
+
+def _side_of_mean(mean: float | None) -> str | None:
+    """pro above the midpoint, con below, None exactly on it or missing.
+
+    Mirrors _resolve_side's split, minus the tie-break: E5's rule gives the
+    exact-midpoint case no side at all rather than breaking the tie, since
+    "which side is this agent now on" genuinely has no answer there, and a
+    reader with no side cannot have a mismatch with anything it read.
+
+    None is also what a failed round's probe_mean produces (Fix I never
+    writes one): this agent's reads simply never trigger a rewire attempt
+    this round. The unconditional draw in _rewire_round's loop still
+    consumes the rewire stream regardless, so a later reader's draws do not
+    shift because of it.
+    """
+    if mean is None:
+        return None
+    if mean > MIDPOINT:
+        return SIDE_PRO
+    if mean < MIDPOINT:
+        return SIDE_CON
     return None
 
 

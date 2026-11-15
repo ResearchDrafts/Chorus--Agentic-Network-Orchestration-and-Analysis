@@ -13,6 +13,7 @@ exclude_items_path: null
 graph_degree: 4
 graph_rewire_p: 0.1
 language_condition: hindi
+lean_assignment: random
 max_concurrency: 32
 max_prompt_tokens: 28000
 meme_injection:
@@ -27,6 +28,8 @@ probe_question: क्या शहर की बस किराया सब�
 probe_top_logprobs: 20
 rate_limits: {}
 regime: bank
+rewire_rate: 0.0
+rewire_target: same_side
 rq_target: RQ1_RQ2
 run_id: e4_hindi_ws_s01
 seed: 1001

@@ -19,10 +19,21 @@ class CheckpointManager:
     def __init__(self, runs_dir: Path = Path("runs")):
         self._runs_dir = runs_dir
 
-    def save(self, run_id: str, turn: int, agent_snapshot: list[Agent]) -> None:
+    def save(
+        self,
+        run_id: str,
+        turn: int,
+        agent_snapshot: list[Agent],
+        graph_edges: list[tuple[str, str]] | None = None,
+    ) -> None:
         checkpoint_dir = self._runs_dir / run_id / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        state = CheckpointState(run_id=run_id, last_completed_turn=turn, agent_snapshot=agent_snapshot)
+        state = CheckpointState(
+            run_id=run_id,
+            last_completed_turn=turn,
+            agent_snapshot=agent_snapshot,
+            graph_edges=graph_edges,
+        )
         tmp_path = checkpoint_dir / "latest.json.tmp"
         final_path = checkpoint_dir / "latest.json"
         tmp_path.write_text(state.model_dump_json())

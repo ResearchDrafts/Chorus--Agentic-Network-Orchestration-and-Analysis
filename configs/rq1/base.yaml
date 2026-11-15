@@ -33,6 +33,23 @@ graph_degree: 4            # PLACEHOLDER (smoke). Even, and < M.
 graph_rewire_p: 0.1        # Watts-Strogatz: 0 is a ring, 1 is random
 N: 3                       # PLACEHOLDER (smoke). Neighbours read per round; <= graph_degree.
 
+# E5's echo-chamber rewiring. 0.0 here -- off -- for every experiment that
+# does not ask for it: e3 and e4 inherit this value unchanged, so they
+# behave exactly as they did before E5 existed. The generator
+# (scripts/make_rq1_configs.py) sets rewire_rate to its own ECHO_REWIRE_RATE
+# constant (0.3, "the campaign's echo_rewire_rate") for e5/e6/e7 only, never
+# read from this file: a literal echo_rewire_rate key here would be an
+# unknown field, and this config has to stay a config an unmodified
+# ExperimentRun can load, which `python run_simulation.py
+# configs/rq1/base.yaml --dry-run` and this file's own test rely on.
+rewire_rate: 0.0
+rewire_target: same_side
+
+# How starting leans are drawn. "random" here, like rewire_rate's 0.0, so
+# e3/e4 are unaffected; the generator sets this to "balanced" for e5/e6/e7,
+# so every echo-chamber seed starts with the same mix of camps.
+lean_assignment: random
+
 # alpha is unused under the graph strategy but still required by the schema.
 alpha: 0.5
 

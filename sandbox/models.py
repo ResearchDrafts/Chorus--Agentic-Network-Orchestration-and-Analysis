@@ -321,6 +321,18 @@ class ExperimentRun(BaseModel):
     persona_pool_id: str = Field(min_length=1)
     meme_injection: MemeInjectionConfig = Field(default_factory=MemeInjectionConfig)
 
+    # How the population's starting positions are drawn. "random" -- every
+    # existing config -- draws each agent's initial_stance independently and
+    # uniformly from stance_scale, which is what AgentManager has always
+    # done. "balanced" instead builds a list that repeats stance_scale to
+    # length M (so every point is represented as evenly as M allows) and
+    # shuffles it, so every seed starts the population with the same mix of
+    # leans rather than a draw that could land lopsided. E5's rewiring
+    # measures how fast a population sorts itself into camps, and a starting
+    # population already lopsided toward one pole would sort faster for a
+    # reason that has nothing to do with language or rewiring.
+    lean_assignment: str = Field(default="random", pattern="^(random|balanced)$")
+
     # --- RQ1 bank regime --------------------------------------------------
     #
     # Every field here defaults to the pre-existing behaviour, so every config
@@ -343,6 +355,25 @@ class ExperimentRun(BaseModel):
     # it silently.
     graph_degree: int = Field(default=6, ge=2)
     graph_rewire_p: float = Field(default=0.1, ge=0.0, le=1.0)
+
+    # --- E5: echo-chamber formation (RQ1, graph strategy only) ------------
+    #
+    # Selection on top of influence: an agent that reads an opposite-side
+    # post may drop that neighbour and pick up one more like itself. alpha
+    # sampling already has selection built in (that is the whole reason the
+    # graph strategy exists for RQ1 -- see neighbor_strategy above), so this
+    # is graph-only, and 0.0 is today's behaviour byte for byte.
+    #
+    # Probability, per opposite-side post read, that the reader drops that
+    # link at the end of the round. 0.0 means rewiring never happens, which
+    # is every config written before this field existed.
+    rewire_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    # "same_side": the new link goes to an agent whose own post this round
+    # was on the reader's new side -- selection. "random": to any
+    # non-neighbour, regardless of side -- a control that rewires without
+    # selecting, to separate "agents reshuffle their feed" from "agents
+    # reshuffle it towards their own side".
+    rewire_target: str = Field(default="same_side", pattern="^(same_side|random)$")
 
     # "generated": agents write their own posts (the original mechanism).
     # "bank": posts come from a fixed, pre-translated argument bank, so the
@@ -614,6 +645,33 @@ class ExperimentRun(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def check_rewire_requirements(self) -> "ExperimentRun":
+        """Rewiring needs a side to read and a structure to rewire.
+
+        A side comes from the bank regime's probe; alpha sampling has no
+        fixed structure to rewire at all -- who an agent reads is already a
+        function of stance there, which is the confound the graph strategy
+        exists to avoid (see neighbor_strategy). Raising here means a
+        misconfigured echo-chamber run fails at load time, not after the
+        population and the run directory are already on disk.
+        """
+        if self.rewire_rate <= 0.0:
+            return self
+        if self.regime != "bank":
+            raise ValueError(
+                f"rewire_rate > 0 requires regime='bank' (got {self.regime!r}): "
+                "rewiring decides a side from the probe, which only the bank "
+                "regime has"
+            )
+        if self.neighbor_strategy != "graph":
+            raise ValueError(
+                f"rewire_rate > 0 requires neighbor_strategy='graph' "
+                f"(got {self.neighbor_strategy!r}): there is no fixed "
+                "structure to rewire under alpha sampling"
+            )
+        return self
+
+    @model_validator(mode="after")
     def check_stance_scale_distinct(self) -> "ExperimentRun":
         """full_design_doc.md Sec 7.1 requires at least 2 DISTINCT values.
 
@@ -634,3 +692,47 @@ class CheckpointState(BaseModel):
     run_id: str
     last_completed_turn: int
     agent_snapshot: list[Agent]
+    # The graph strategy's current edge list, under E5 rewiring. None for
+    # every run that does not use GraphSampling, and for a graph-strategy run
+    # from before this field existed -- both read back as "nothing to
+    # restore", which is correct: a graph that never rewires is already
+    # reproduced exactly by rebuilding it from graph_seed, the way it always
+    # was. Only a rewired graph has state that construction alone cannot
+    # recover, which is why this is saved rather than left to be rebuilt
+    # like the bank's post counts and remembered rounds (see
+    # SimulationOrchestrator._restore_bank_state): the edges are not
+    # recoverable from interactions.jsonl, which records what an agent read
+    # and never who it is currently linked to.
+    graph_edges: list[tuple[str, str]] | None = None
+
+
+class RewireRecord(BaseModel):
+    """One line of rewires.jsonl: one read post's rewire decision.
+
+    Written for every opposite-side post an agent reads in a round once
+    rewire_rate > 0 -- whether or not the draw and the degree floor actually
+    let it rewire. A skipped attempt is as much a fact about the run as an
+    applied one: without it, a reader could not tell "nothing was opposite-
+    side this round" from "everything that could rewire was blocked by the
+    degree floor", and n_rewires in round_metrics.csv would be the only trace
+    either way left.
+    """
+
+    run_id: str
+    turn: int = Field(ge=1)
+    agent_id: str
+    dropped: str | None = None
+    added: str | None = None
+    reader_side: str = Field(pattern="^(pro|con)$")
+    status: str = Field(pattern="^(rewired|skipped_no_candidate|skipped_min_degree)$")
+
+    @model_validator(mode="after")
+    def check_dropped_added_consistency(self) -> "RewireRecord":
+        if self.status == "rewired" and (self.dropped is None or self.added is None):
+            raise ValueError("status='rewired' requires both dropped and added")
+        if self.status != "rewired" and (self.dropped is not None or self.added is not None):
+            raise ValueError(
+                f"status={self.status!r} must leave dropped and added null: "
+                "nothing was actually rewired"
+            )
+        return self

@@ -333,7 +333,7 @@ token on a 7-point scale at temperature 0. The distribution over digits gives
 a continuous reading, its mass tells you whether the reading is usable, and
 the probe never enters the agent's memory.
 
-RQ1 has three experiments:
+RQ1 has six experiments:
 
 - **E1, single exposure.** One reader sees one argument, then is probed. This
   isolates the effect of a single post and provides the manipulation check.
@@ -349,6 +349,7 @@ RQ1 has three experiments:
   arm. E4 measures drift when nothing persuasive happened, and its spread
   supplies `epsilon`, the tolerance in the stationarity rule, via
   `--epsilon-from-e4`.
+- **E5, E6, E7 -- echo-chamber formation.** See the next section.
 
 The per-round change threshold is a separate instrument. `calibrate_tau.py`
 measures a per-language `tau` from single-reader trials in which no persuasive
@@ -400,6 +401,62 @@ RQ1 uses the **graph** neighbor strategy so that an agent's feed is not a
 function of its current stance. Under alpha sampling, a stance effect and a
 selection effect produce the same rows and cannot be separated afterwards.
 
+### E5: echo-chamber formation, and whether language slows it
+
+E3/E4 give agents influence (they can be moved by what they read) but no
+selection (who they read is a fixed graph, not a choice). Echo chambers need
+both, so E5 adds a rewiring rule on top of the graph strategy: at the end of
+each round, an agent that just read an opposite-side post may drop that
+neighbour and pick up someone on its own side instead. Three new
+`ExperimentRun` fields drive it, all graph-strategy, bank-regime only:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `rewire_rate` | `0.0` | Probability, per opposite-side post read, that the reader drops that link. `0.0` reproduces pre-E5 behaviour exactly. |
+| `rewire_target` | `same_side` | `same_side`: the new link goes to an agent whose own post this round was on the reader's side. `random`: to any non-neighbour, ignoring side -- a control for whether rewiring alone, without selection, sorts anything. |
+| `lean_assignment` | `random` | `balanced`: the population's starting leans are built by repeating `stance_scale` to length `M` and shuffling, so every seed starts with the same mix of camps rather than whatever a uniform draw landed on. |
+
+A reader's own degree never changes -- one edge leaves, one arrives, both at
+the reader's end -- so `select_neighbors` can always return `N`, and no
+rewire is applied if it would drop a neighbour below `N`. Three experiments
+use the rule:
+
+- **E5** (`delivery: on`, `rewire_rate: 0.3`, `rewire_target: same_side`,
+  `lean_assignment: balanced`): the treatment.
+- **E6** (`delivery: off`, otherwise identical to E5): E5's control, the same
+  way E4 is E3's -- it runs the identical rewiring rule over the shadow items
+  the neutral messages stand in for, so a population that sorts under E6 did
+  so without ever reading a persuasive argument.
+- **E7** (`delivery: on`, `rewire_target: random`): rewiring without
+  selection, to separate "agents reshuffle their feed" from "agents reshuffle
+  it toward their own side".
+
+`scripts/make_rq1_configs.py --experiments e3 e4 e5 e6 e7` generates all five
+(the default stays `e3 e4`, so a bare invocation is unchanged).
+`analysis.metrics` adds, per round, `assort_null_mean`/`assort_null_hi` (a
+1,000-draw permutation null for that round's assortativity),
+`assort_excess` (assortativity above that null), `cross_side_edge_share` and
+`minority_share`; per run, `t_echo` (the first round an echo chamber formed,
+censored at `K + 1` if it never did) and `auc_assort_excess` (a speed measure
+that needs no threshold). `minority_share` guards `t_echo`: a population that
+collapsed onto one side is consensus, not an echo chamber. `analysis.stats`
+contrasts `t_echo`, `auc_assort_excess`, `final_assort_excess` and
+`final_cross_side_edge_share` between languages and does the E5-vs-E6
+difference-in-differences, the same way it already does for E3 vs. E4.
+`analysis.figures` adds `assort_excess.{pdf,png}`,
+`cross_side_edge_share.{pdf,png}`, a `t_echo.{pdf,png}` dot plot, and
+`network_snapshots.{pdf,png}` -- a force-directed layout at rounds 0, K/2 and
+K, one row per language, nodes coloured by side (pass `--runs-dir` to get
+this last one, since it reads each run's own graph files rather than the
+results CSVs).
+
+A rewired graph is run state: `graph_edges_by_round.csv` records the edges
+used for reading each round (plus one final block at `K + 1` for the graph
+after the last rewiring), `rewires.jsonl` records every opposite-side read's
+rewire decision (applied or skipped, and why), and the checkpoint now carries
+the current edge list so a resumed run restores the graph as it stood, not
+the one `graph_seed` alone would rebuild.
+
 ### RQ2: Reasoning quality
 
 RQ2 is a post-hoc analysis of RQ1's own transcripts. It asks whether the
@@ -425,6 +482,8 @@ There is one simulation engine, with three independent switches:
 | `regime` | `generated`, `bank` | Who writes the post: the agent or the argument bank |
 | `neighbor_strategy` | `alpha`, `graph` | Who an agent reads: similarity-weighted sample or fixed graph |
 | `start_mode` | `sentence`, `none`, `posts` | How an agent's starting position enters the prompt (bank regime only) |
+| `rewire_rate` / `rewire_target` | `0.0`+ / `same_side`, `random` | Whether and how agents drop opposite-side links for same-side ones (bank + graph only; see E5) |
+| `lean_assignment` | `random`, `balanced` | Whether the population's starting leans are drawn uniformly or built to an even mix |
 
 The generated regime is the original loop and is what RQ3 uses. The bank regime
 is RQ1's instrument. `delivery: off` turns a bank run into the E4 control, and
@@ -485,6 +544,8 @@ previous one wrote, and each is resumable.
 ```bash
 # 1. Expand one base config into matched sets for all four languages
 python scripts/make_rq1_configs.py --seeds 5 --out configs/rq1/campaign
+#    Add --experiments e3 e4 e5 e6 e7 to also generate E5's echo-chamber arms
+#    (the default stays e3 e4, so a bare invocation is unchanged).
 
 # 2. Check that the model can read each bank item in each language.
 #    This writes runs/comprehension/failed_items.txt.
@@ -644,8 +705,10 @@ A run writes to `runs/{run_id}/`:
 | `interactions.jsonl` | One record per agent-round, the primary dataset |
 | `agents_final.jsonl` | Final state of every agent |
 | `prompts.jsonl` | Every prompt, when `log_prompts` is on |
-| `graph_edges.csv` | The social graph, under the graph strategy |
-| `checkpoints/` | Latest full-state checkpoint for resume |
+| `graph_edges.csv` | The social graph at round 0, under the graph strategy |
+| `graph_edges_by_round.csv` | The graph used for reading each round, when `rewire_rate > 0` (E5/E6/E7) |
+| `rewires.jsonl` | Every opposite-side read's rewire decision, when `rewire_rate > 0` |
+| `checkpoints/` | Latest full-state checkpoint for resume (includes the current graph edges once rewiring can change them) |
 
 `export_csv.py` turns a completed run into analysis CSVs, including probe
 readings, prompt lengths, exposure counts, and control shadow items.
@@ -705,6 +768,13 @@ and 8,000 interactions. In general, completed campaigns should be stored under
   `max_prompt_tokens` raises rather than letting one arm quietly overflow.
 - **The persona pools are small.** `test_pool.jsonl` has 4 personas and
   `pool_20.jsonl` has 20. At `M=100`, each persona is shared by several agents.
+- **`run_campaign.py` does not yet dispatch E5/E6/E7.** Its `EXPERIMENT_ORDER`
+  and `--experiments` choices are still `e3`/`e4` only, so
+  `make_rq1_configs.py --experiments e5 e6 e7`'s configs have to be launched
+  one at a time with `python run_simulation.py` until that script's
+  experiment list is extended. Nothing about generating, running or
+  analysing an individual E5/E6/E7 config depends on `run_campaign.py` --
+  only running them as an unattended batch does.
 - **`check_comprehension.py` ignores two of its own flags.** It takes
   `--sample` and `--start-mode` from the shared argument parser but acts on
   neither, so both are accepted silently and do nothing. Use `--limit` to

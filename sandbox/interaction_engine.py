@@ -194,6 +194,14 @@ class GraphSampling:
             )
             for node in self._graph.nodes
         }
+        # agent_id -> its node index, the inverse of self._agent_ids. Built
+        # once rather than searched per call: rewire() and the resume-time
+        # restore_edges() both need it, and both run once per rewire attempt
+        # or once per resume, which over a long campaign is often enough that
+        # an O(n) list.index() per lookup would matter.
+        self._node_of_id: dict[str, int] = {
+            agent_id: node for node, agent_id in enumerate(self._agent_ids)
+        }
 
     def _verify_every_node_has_k_neighbours(self, graph_seed: int) -> None:
         """Rejects a graph in which any node has fewer than k neighbours.
@@ -285,9 +293,119 @@ class GraphSampling:
         Exposed so analysis can compute assortativity -- whether agents are
         adjacent to others who ended up on their own side -- which needs the
         structure the run actually used, not a graph rebuilt afterwards from
-        the config.
+        the config. Live: once rewire() has run, this is the CURRENT edge
+        set, not the one the graph was constructed with.
         """
         return sorted(
             tuple(sorted((self._agent_ids[a], self._agent_ids[b])))
             for a, b in self._graph.edges
         )
+
+    def neighbors_of(self, agent_id: str) -> list[str]:
+        """The CURRENT neighbours of one agent, sorted.
+
+        Live, like edges() -- this reflects every rewire() applied so far,
+        which is the point: E5's rewiring rule has to check "is k already a
+        neighbour of i" against the graph as it stands partway through a
+        round's pass, not as it stood at the round's start.
+        """
+        if agent_id not in self._neighbors:
+            raise ValueError(
+                f"{agent_id!r} is not a node in this run's graph"
+            )
+        return list(self._neighbors[agent_id])
+
+    def degree(self, agent_id: str) -> int:
+        """How many CURRENT neighbours one agent has.
+
+        Every agent starts at graph_degree; rewire() can only move edges
+        between agents it is not asked to touch, never remove one without
+        adding another, so this only ever changes for the two agents at an
+        applied rewire's non-reader ends (the one dropped, the one added).
+        """
+        return len(self.neighbors_of(agent_id))
+
+    def rewire(self, drop: tuple[str, str], add: tuple[str, str]) -> None:
+        """Replaces edge `drop` with edge `add`, keeping both ends' other
+        neighbours untouched.
+
+        `drop` and `add` need not share an endpoint -- the caller decides
+        that -- but E5's rule always calls this as drop=(reader, old) and
+        add=(reader, new), which is what keeps the reader's own degree fixed
+        (Design point 3): one edge leaves it, one edge arrives, and it is the
+        SAME end of both.
+
+        Raises rather than silently no-opping on every way this could be
+        asked to do something that is not a well-defined rewire: dropping an
+        edge that is not there, adding one that already is, a self-loop, or
+        an unknown agent. A caller that reaches any of these has a bug in its
+        candidate selection, and a silent no-op would leave the graph
+        looking rewired in the log while the structure never moved.
+        """
+        drop_a, drop_b = drop
+        add_a, add_b = add
+        for agent_id in (drop_a, drop_b, add_a, add_b):
+            if agent_id not in self._neighbors:
+                raise ValueError(f"{agent_id!r} is not a node in this run's graph")
+        if drop_b not in self._neighbors[drop_a]:
+            raise ValueError(f"{drop_a!r} and {drop_b!r} are not neighbours; cannot drop")
+        if add_a == add_b:
+            raise ValueError(f"cannot add a self-loop at {add_a!r}")
+        if add_b in self._neighbors[add_a]:
+            raise ValueError(f"{add_a!r} and {add_b!r} are already neighbours; cannot add")
+
+        self._graph.remove_edge(self._node_of_id[drop_a], self._node_of_id[drop_b])
+        self._graph.add_edge(self._node_of_id[add_a], self._node_of_id[add_b])
+
+        self._neighbors[drop_a].remove(drop_b)
+        self._neighbors[drop_b].remove(drop_a)
+        # Re-sorted after insertion, not just appended: select_neighbors'
+        # rng.sample draws over this list, and its order is part of what a
+        # seed means (see the sorting note on self._neighbors' construction
+        # above).
+        self._neighbors[add_a] = sorted(self._neighbors[add_a] + [add_b])
+        self._neighbors[add_b] = sorted(self._neighbors[add_b] + [add_a])
+
+    def restore_edges(self, edges: list[tuple[str, str]]) -> None:
+        """Replaces the current edge set wholesale, for resuming a rewired
+        run.
+
+        A rewired graph's edges are not recoverable from interactions.jsonl
+        the way the bank's post counts and remembered rounds are (see
+        SimulationOrchestrator._restore_bank_state): the log records what an
+        agent read, not who it is currently linked to. So the checkpoint
+        carries the edge list directly, and this is how it goes back in --
+        called once, at resume, before any turn runs.
+
+        Validated rather than trusted: the node set must be exactly this
+        graph's agent_ids (same population, same run), and every agent must
+        still have at least k neighbours, which is the invariant
+        select_neighbors depends on. A checkpoint from an incompatible run is
+        a resume error, not a run that quietly starts in a broken state.
+        """
+        graph = nx.Graph()
+        graph.add_nodes_from(range(len(self._agent_ids)))
+        for a, b in edges:
+            if a not in self._node_of_id or b not in self._node_of_id:
+                raise ValueError(
+                    f"checkpoint edge {(a, b)!r} names an agent not in this "
+                    "run's graph"
+                )
+            graph.add_edge(self._node_of_id[a], self._node_of_id[b])
+
+        neighbors = {
+            self._agent_ids[node]: sorted(
+                self._agent_ids[other] for other in graph.neighbors(node)
+            )
+            for node in graph.nodes
+        }
+        short = sorted(
+            agent_id for agent_id, ns in neighbors.items() if len(ns) < self.k
+        )
+        if short:
+            raise ValueError(
+                f"checkpoint graph_edges give {short} fewer than k={self.k} "
+                "neighbours; this checkpoint does not match this run"
+            )
+        self._graph = graph
+        self._neighbors = neighbors

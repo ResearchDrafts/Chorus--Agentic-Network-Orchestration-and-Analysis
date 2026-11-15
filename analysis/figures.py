@@ -46,9 +46,11 @@ import matplotlib
 matplotlib.use("Agg")  # headless: no display in CI, in Colab, or over ssh
 
 import matplotlib.pyplot as plt
+import networkx as nx
 import numpy as np
 import pandas as pd
 
+from analysis import metrics
 from sandbox.models import LANGUAGE_CONDITIONS
 from sandbox.single_exposure import STATUS_OK, load_trials
 
@@ -70,6 +72,20 @@ GRID = "#e3e2de"
 # being read; E4 dashed because it is the baseline underneath it.
 EXPERIMENT_STYLES = {"e3": "-", "e4": "--"}
 EXPERIMENT_LABELS = {"e3": "E3 (delivery on)", "e4": "E4 (control)"}
+
+# E5's echo-chamber arms, in the same solid-treatment / dashed-control
+# convention: e5 is rewiring on, e6 is the shadow-item control that runs the
+# same rewiring rule without delivering anything persuasive.
+ECHO_EXPERIMENT_STYLES = {"e5": "-", "e6": "--"}
+ECHO_EXPERIMENT_LABELS = {"e5": "E5 (rewiring on)", "e6": "E6 (control)"}
+
+# Side categories for the network-snapshot figure, by sign of x -- the same
+# three-way split cross_side_edge_share and minority_share use upstream in
+# analysis/metrics.py, computed here rather than imported, since that
+# module does not expose a standalone sign-of-x classifier (sign_of returns
+# -1/0/+1, which this just names for the legend).
+SIDE_COLORS = {"pro": "#1baf7a", "undecided": "#9c9a94", "con": "#eb6834"}
+UNDECIDED_BAND = 1.0 / 3.0  # |x| below this is "undecided" in the snapshot
 
 LINE_WIDTH = 2.0
 MARKER_SIZE = 5.0
@@ -234,6 +250,280 @@ def figure_trajectories(rounds: pd.DataFrame, out_dir: Path) -> list[Path]:
             loc="upper center", bbox_to_anchor=(0.5, -0.01),
         )
     return save(fig, out_dir, "trajectories")
+
+
+# --- E5: echo-chamber formation --------------------------------------------
+#
+# Four figures, read together: the two line-by-round panels below show
+# WHETHER and HOW FAST a population sorted itself into camps; the snapshot
+# grid shows WHAT that looks like structurally, for one seed; and the dot
+# plot shows HOW MUCH the sorting speed varies across seeds and languages.
+# Nothing here recomputes assort_excess, cross_side_edge_share, minority_share
+# or t_echo -- all four are read straight from round_metrics.csv/
+# run_metrics.csv, which analysis/metrics.py already computed them into.
+
+
+def _line_by_round_figure(
+    rounds: pd.DataFrame,
+    metric: str,
+    ylabel: str,
+    title: str,
+    stem: str,
+    out_dir: Path,
+    styles: dict[str, str],
+    labels: dict[str, str],
+) -> list[Path]:
+    """One panel, one metric, one line per (language, experiment) pair.
+
+    Shared by figure_assort_excess and figure_cross_side_edge_share, which
+    differ only in which column they read and how they describe themselves
+    -- the same band-over-seeds, solid-treatment/dashed-control drawing
+    figure_trajectories already established for E3/E4.
+    """
+    fig, axis = plt.subplots(figsize=(7.4, 4.2))
+    for language in languages_in(rounds):
+        for experiment, style in styles.items():
+            arm = rounds[(rounds.language == language) & (rounds.experiment == experiment)]
+            arm = arm[arm[metric].notna()]
+            if arm.empty:
+                continue
+            grouped = arm.groupby("turn")[metric]
+            turns = sorted(arm.turn.unique())
+            mean = grouped.mean().reindex(turns)
+            axis.plot(
+                turns, mean.values, style, color=color_for(language),
+                marker="o" if experiment == list(styles)[0] else None,
+                label=f"{language} · {labels[experiment]}",
+            )
+            low = grouped.min().reindex(turns)
+            high = grouped.max().reindex(turns)
+            if arm.seed.nunique() > 1:
+                axis.fill_between(
+                    turns, low.values, high.values,
+                    color=color_for(language), alpha=BAND_ALPHA, linewidth=0,
+                )
+    axis.set_ylabel(ylabel)
+    axis.set_xlabel("round  (0 = probed before reading anything)")
+    axis.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
+    axis.set_title(title, loc="left")
+    fig.tight_layout()
+    handles, labels_ = axis.get_legend_handles_labels()
+    if handles:
+        fig.legend(
+            handles, labels_, ncol=min(len(handles), 2),
+            loc="upper center", bbox_to_anchor=(0.5, -0.02),
+        )
+    return save(fig, out_dir, stem)
+
+
+def figure_assort_excess(rounds: pd.DataFrame, out_dir: Path) -> list[Path]:
+    """assort_excess by round: assortativity above its own permutation null,
+    one line per language, E5 solid and E6 (the shadow-item control) dashed.
+
+    A population that has not sorted itself at all has assort_excess near
+    0; a rising line is camps forming faster than chance adjacency alone
+    would produce.
+    """
+    return _line_by_round_figure(
+        rounds, "assort_excess",
+        "assortativity − null mean\n(excess over random mixing)",
+        "Echo-chamber formation by language\n"
+        "band: range over seeds · solid: E5 (rewiring on) · dashed: E6 (control)",
+        "assort_excess", out_dir,
+        ECHO_EXPERIMENT_STYLES, ECHO_EXPERIMENT_LABELS,
+    )
+
+
+def figure_cross_side_edge_share(rounds: pd.DataFrame, out_dir: Path) -> list[Path]:
+    """cross_side_edge_share by round: the share of edges still linking
+    opposite sides, one line per language, E5 solid and E6 dashed.
+
+    The complementary read to assort_excess: a falling line is neighbours
+    increasingly agreeing with each other, which is what rewiring toward
+    one's own side looks like from the edge list alone.
+    """
+    return _line_by_round_figure(
+        rounds, "cross_side_edge_share",
+        "share of edges crossing sides\n(0 = fully sorted, higher = more mixed)",
+        "Cross-side edges by language\n"
+        "band: range over seeds · solid: E5 (rewiring on) · dashed: E6 (control)",
+        "cross_side_edge_share", out_dir,
+        ECHO_EXPERIMENT_STYLES, ECHO_EXPERIMENT_LABELS,
+    )
+
+
+def figure_t_echo(runs: pd.DataFrame, out_dir: Path) -> list[Path]:
+    """t_echo per language: one dot per seed, for every experiment present
+    that has a t_echo column with values (e5, e6, e7, if present).
+
+    A censored run (echo_censored=True, t_echo == K+1) is drawn as an open
+    marker rather than dropped, so a language that never formed an echo
+    chamber within K rounds is visibly different from one that is simply
+    missing from the plot.
+    """
+    arms = [e for e in ("e5", "e6", "e7") if (runs.experiment == e).any()]
+    fig, axis = plt.subplots(figsize=(7.4, 0.9 + 0.9 * max(len(arms), 1)))
+    y_labels: list[str] = []
+    y = 0
+    for experiment in arms:
+        for language in languages_in(runs[runs.experiment == experiment]):
+            arm = runs[(runs.experiment == experiment) & (runs.language == language)]
+            censored = arm.get("echo_censored")
+            for _, row in arm.iterrows():
+                is_censored = bool(row.get("echo_censored", False))
+                axis.scatter(
+                    row["t_echo"], y, color=color_for(language),
+                    marker="o" if not is_censored else "x",
+                    s=40, zorder=3,
+                )
+            y_labels.append(f"{language} · {experiment.upper()}")
+            y += 1
+    axis.set_yticks(range(len(y_labels)))
+    axis.set_yticklabels(y_labels)
+    axis.set_xlabel("t_echo  (round an echo chamber first formed; × = never within K)")
+    axis.set_title(
+        "Speed of echo-chamber formation\none dot per seed · × = censored at K+1",
+        loc="left",
+    )
+    axis.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
+    fig.tight_layout()
+    return save(fig, out_dir, "t_echo")
+
+
+class RunGraphs:
+    """One run's graph history, read from its run directory.
+
+    Backs figure_network_snapshots: edges_at(turn) is the graph used for
+    reading in that round (graph_edges_by_round.csv, falling back to
+    graph_edges.csv exactly as analysis.metrics reads the same two files
+    for round_metrics.csv); x_at(turn, probes) looks up each node's x in the
+    already-aggregated probes.csv rather than re-deriving it from the run's
+    own interactions.jsonl, so the snapshot's node colours agree with every
+    other figure's x values by construction.
+    """
+
+    def __init__(self, run_dir: Path, run_id: str, k: int):
+        self.run_id = run_id
+        self.k = k
+        self._static = metrics.load_graph(run_dir)
+        self._by_round = metrics.load_graphs_by_round(run_dir)
+
+    def edges_at(self, turn: int) -> list[tuple[str, str]]:
+        graph = metrics._graph_for_round(turn, self._by_round, self._static)
+        return list(graph.edges) if graph is not None else []
+
+    def x_at(self, turn: int, probes: pd.DataFrame) -> dict[str, float]:
+        rows = probes[(probes.run_id == self.run_id) & (probes.turn == turn)]
+        return dict(zip(rows.agent_id, rows.x, strict=True))
+
+
+def load_run_graphs(
+    runs_dir: Path, runs: pd.DataFrame, experiment: str = "e5"
+) -> dict[str, RunGraphs]:
+    """One RunGraphs per language: the lowest-seed `experiment` run present
+    in run_metrics.csv for that language.
+
+    The lowest seed, rather than any particular one, so the figure is
+    reproducible from the same inputs every time it is drawn -- "one seed
+    per language" (the design's own phrase) needs a rule, not a free choice.
+    Skips a language whose chosen run directory is not actually present
+    under runs_dir (e.g. a campaign analysed from a copy of just the three
+    results CSVs), rather than raising: this is the one figure that needs
+    raw run directories, and main() already treats it as optional.
+    """
+    out: dict[str, RunGraphs] = {}
+    arm = runs[runs.experiment == experiment]
+    for language in languages_in(arm):
+        candidates = arm[arm.language == language].sort_values("seed")
+        if candidates.empty:
+            continue
+        row = candidates.iloc[0]
+        run_dir = runs_dir / str(row["run_id"])
+        if not run_dir.exists():
+            continue
+        out[language] = RunGraphs(run_dir, str(row["run_id"]), int(row["K"]))
+    return out
+
+
+def figure_network_snapshots(
+    probes: pd.DataFrame,
+    run_graphs: dict[str, RunGraphs],
+    out_dir: Path,
+) -> list[Path]:
+    """One row per language, one column per snapshot round (0, K/2, K): the
+    social graph laid out by spring_layout, nodes coloured by side.
+
+    `run_graphs` is keyed by language and supplies, for one chosen seed's
+    run, the edges at each of the three rounds (RunGraphs.edges_at) -- read
+    from graph_edges_by_round.csv with the graph_edges.csv fallback, exactly
+    as analysis/metrics.py reads them, which main() builds via
+    `load_run_graphs` before calling this.
+
+    spring_layout is seeded (FIGURE_LAYOUT_SEED) and recomputed per round:
+    an echo chamber is a cluster that forms over rounds, and a layout fixed
+    at round 0 would not show the separation that only exists in later
+    rounds' edges.
+    """
+    languages = [lang for lang in LANGUAGE_CONDITIONS if lang in run_graphs]
+    if not languages:
+        return []
+    fig, axes = plt.subplots(
+        len(languages), len(SNAPSHOT_LABELS),
+        figsize=(3.2 * len(SNAPSHOT_LABELS), 3.0 * len(languages)),
+        squeeze=False,
+    )
+    for row, language in enumerate(languages):
+        graphs = run_graphs[language]
+        for col, (turn, label) in enumerate(SNAPSHOT_LABELS_FOR(graphs.k)):
+            axis = axes[row][col]
+            edges = graphs.edges_at(turn)
+            x_by_agent = graphs.x_at(turn, probes)
+            _draw_one_snapshot(axis, edges, x_by_agent)
+            if row == 0:
+                axis.set_title(label)
+            if col == 0:
+                axis.set_ylabel(language, rotation=0, ha="right", va="center")
+    fig.suptitle(
+        "Network structure over rounds, one seed per language\n"
+        "node colour: pro / undecided / against the midpoint",
+        x=0.02, ha="left", fontsize=11,
+    )
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    return save(fig, out_dir, "network_snapshots")
+
+
+def _draw_one_snapshot(axis, edges: list[tuple[str, str]], x_by_agent: dict[str, float]) -> None:
+    graph = nx.Graph()
+    graph.add_edges_from(edges)
+    graph.add_nodes_from(x_by_agent)  # an isolate (no edges this round) still appears
+    layout = nx.spring_layout(graph, seed=FIGURE_LAYOUT_SEED)
+    colors = [
+        SIDE_COLORS["pro"] if x_by_agent.get(node, 0.0) > UNDECIDED_BAND
+        else SIDE_COLORS["con"] if x_by_agent.get(node, 0.0) < -UNDECIDED_BAND
+        else SIDE_COLORS["undecided"]
+        for node in graph.nodes
+    ]
+    nx.draw_networkx_edges(graph, layout, ax=axis, edge_color=GRID, width=0.8)
+    nx.draw_networkx_nodes(graph, layout, ax=axis, node_color=colors, node_size=60)
+    axis.set_xticks([])
+    axis.set_yticks([])
+    for spine in axis.spines.values():
+        spine.set_visible(False)
+
+
+FIGURE_LAYOUT_SEED = 20_260_103
+
+
+def SNAPSHOT_LABELS_FOR(k: int) -> list[tuple[int, str]]:
+    """The three snapshot rounds for a run of length K: 0, K//2, K -- with
+    the middle round dropped if it collides with either end (K < 2), so a
+    very short smoke run draws two panels rather than three identical ones.
+    """
+    rounds = sorted({0, k // 2, k})
+    return [(r, f"round {r}") for r in rounds]
+
+
+SNAPSHOT_LABELS = ("round 0", "round K/2", "round K")  # the usual (K >= 2) case
 
 
 # --- 2: E1 ----------------------------------------------------------------
@@ -511,6 +801,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--calibration", type=Path, required=True,
                         help="the directory holding tau.json")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--runs-dir", type=Path, default=None,
+        help="the run directories themselves (not just --results' CSVs); "
+             "only needed for the network_snapshots figure, which reads "
+             "each run's own graph files. Omit to skip that one figure.",
+    )
     args = parser.parse_args(argv)
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -526,6 +822,25 @@ def main(argv: list[str] | None = None) -> int:
     written += figure_e1(e1, args.out)
     written += figure_tau(tau, args.out)
     written += figure_instrument(probes, args.out)
+
+    # E5's four figures. Guarded on column presence rather than unconditional:
+    # round_metrics.csv/run_metrics.csv written before this feature existed
+    # (or by a campaign that never ran E5) have none of these columns, and
+    # that is not an error here -- it just means there is nothing yet to draw.
+    if "assort_excess" in rounds.columns:
+        written += figure_assort_excess(rounds, args.out)
+    if "cross_side_edge_share" in rounds.columns:
+        written += figure_cross_side_edge_share(rounds, args.out)
+
+    run_metrics_path = args.results / "run_metrics.csv"
+    runs = pd.read_csv(run_metrics_path) if run_metrics_path.exists() else None
+    if runs is not None and "t_echo" in runs.columns:
+        written += figure_t_echo(runs, args.out)
+
+    if runs is not None and args.runs_dir is not None:
+        run_graphs = load_run_graphs(args.runs_dir, runs)
+        if run_graphs:
+            written += figure_network_snapshots(probes, run_graphs, args.out)
 
     print(f"\n{args.out}/")
     for path in written:

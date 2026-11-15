@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 from pathlib import Path
 
@@ -70,6 +71,24 @@ STATIONARY_WINDOW = 3
 # whole population, so its own round-to-round wobble is the right scale for
 # "this metric has stopped moving".
 EPSILON_PERCENTILE = 95.0
+
+# --- E5: echo-chamber formation -------------------------------------------
+#
+# A population at the minority_share floor or below has collapsed onto one
+# side -- consensus, not an echo chamber, which needs two camps that have
+# each pulled away from the other.
+MINORITY_SHARE_FLOOR = 0.2
+
+# "2 consecutive rounds" in t_echo's definition.
+ECHO_WINDOW = 2
+
+# How many permutations assort_null_mean/assort_null_hi are built from, and
+# which percentile of that distribution assort_null_hi reports. 1,000 is
+# cheap enough to run per round per run and stable enough at the 97.5th
+# percentile (a two-sided 95% reference region's upper arm) to use as a
+# per-round significance line for one correlation coefficient.
+ASSORT_NULL_RESAMPLES = 1_000
+ASSORT_NULL_PERCENTILE = 97.5
 
 
 class MissingTau(Exception):
@@ -140,6 +159,74 @@ def load_graph(run_dir: Path) -> nx.Graph | None:
             a, b = line.strip().split(",")
             graph.add_edge(a, b)
     return graph
+
+
+def load_graphs_by_round(run_dir: Path) -> dict[int, nx.Graph] | None:
+    """turn -> the graph used for that round's reading, from
+    graph_edges_by_round.csv.
+
+    None when the file does not exist -- every run before E5, and every E5
+    run with rewire_rate=0.0 (SimulationOrchestrator skips writing it in
+    that case). The caller falls back to the static graph_edges.csv graph
+    for every round in that case, which is correct: a graph that never
+    rewires is the same graph every round.
+
+    Round 0 is never a key here: the round-0 probe reads nothing, so there
+    is no "graph used for reading" to record for it, and the caller's
+    fallback to the static graph covers it too.
+    """
+    path = run_dir / "graph_edges_by_round.csv"
+    if not path.exists():
+        return None
+    by_turn: dict[int, nx.Graph] = {}
+    with path.open(encoding="utf-8") as handle:
+        header = handle.readline()
+        if "turn" not in header:
+            raise ValueError(f"{path} has no turn,agent_a,agent_b header")
+        for line in handle:
+            if not line.strip():
+                continue
+            turn_text, a, b = line.strip().split(",")
+            by_turn.setdefault(int(turn_text), nx.Graph()).add_edge(a, b)
+    return by_turn
+
+
+def _graph_for_round(
+    turn: int,
+    graphs_by_round: dict[int, nx.Graph] | None,
+    static_graph: nx.Graph | None,
+) -> nx.Graph | None:
+    """The graph to score round `turn` against.
+
+    The per-round file's own entry when there is one, else the static
+    graph_edges.csv graph -- which is also what a run with no per-round file
+    at all uses for every round, and what round 0 always uses.
+    """
+    if graphs_by_round and turn in graphs_by_round:
+        return graphs_by_round[turn]
+    return static_graph
+
+
+def load_rewires(run_dir: Path) -> dict[int, int]:
+    """turn -> how many rewires were actually applied that round, from
+    rewires.jsonl.
+
+    Empty for a run with no file -- rewiring was off, so zero happened,
+    which is a known fact rather than a missing one. A round with no entry
+    at all (every run's round 0, and every round of a rewire_rate=0.0 run)
+    reads back as 0 for the same reason.
+    """
+    path = run_dir / "rewires.jsonl"
+    counts: dict[int, int] = {}
+    if not path.exists():
+        return counts
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get("status") == "rewired":
+            counts[row["turn"]] = counts.get(row["turn"], 0) + 1
+    return counts
 
 
 def discover_runs(runs_dir: Path) -> list[Path]:
@@ -316,8 +403,17 @@ def _float_or_none(value) -> float | None:
     return None if pd.isna(value) else float(value)
 
 
+# Every experiment experiment_of recognizes. e5/e6/e7 are E5's echo-chamber
+# arms (treatment, the shadow-item control, and the rewiring-without-
+# selection control); recognizing them here is what lets t_echo and
+# assort_excess find them by run_id the same way e3/e4 already are, and lets
+# stats.py's e5-vs-e6 contrast find its two arms.
+EXPERIMENT_PREFIXES = ("e3", "e4", "e5", "e6", "e7")
+
+
 def experiment_of(run_id: str) -> str:
-    """The experiment, from the run_id prefix -- "e3", "e4", or "other".
+    """The experiment, from the run_id prefix -- one of EXPERIMENT_PREFIXES,
+    or "other".
 
     Read off the id rather than out of a column, because there is no column:
     `delivery` says on or off, which is the mechanism, while the experiment
@@ -326,7 +422,7 @@ def experiment_of(run_id: str) -> str:
     tables instead of stopping the analysis.
     """
     prefix = run_id.split("_", 1)[0]
-    return prefix if prefix in ("e3", "e4") else "other"
+    return prefix if prefix in EXPERIMENT_PREFIXES else "other"
 
 
 # --- round_metrics.csv ----------------------------------------------------
@@ -335,6 +431,8 @@ def experiment_of(run_id: str) -> str:
 ROUND_COLUMNS = (
     "run_id", "experiment", "language", "seed", "delivery", "turn",
     "mean_x", "var_x", "extremity", "assortativity",
+    "assort_null_mean", "assort_null_hi", "assort_excess",
+    "cross_side_edge_share", "minority_share", "n_rewires",
     *(f"share_{name}" for name in OUTCOMES),
     "n_valid", "n_failed",
     "mean_reply_prompt_tokens", "mean_probe_prompt_tokens",
@@ -346,6 +444,8 @@ def round_rows(
     probes: list[dict],
     config: dict,
     graph: nx.Graph | None,
+    graphs_by_round: dict[int, nx.Graph] | None = None,
+    rewires: dict[int, int] | None = None,
 ) -> list[dict]:
     """One row per round: the population's shape, and what moved in it.
 
@@ -354,12 +454,20 @@ def round_rows(
     reply failed has a row, and an agent that never appeared at all does not,
     and both are the same kind of missing for this purpose.
 
-    The graph metric alone carries a missing agent's last valid x forward. An
+    The graph metrics alone carry a missing agent's last valid x forward. An
     assortativity computed over a shrinking node set would move as agents
     dropped out, which would read as structural change; carrying the last
     reading forward keeps the node set fixed and says, correctly, that
     nothing new is known about that agent. Nothing else does this: a mean or
     a variance over carried-forward values would count one reading twice.
+
+    `graph` is the static graph_edges.csv graph, used for every round when
+    `graphs_by_round` is None or has no entry for a round -- which is every
+    round of a run with no per-round file, and always round 0, which never
+    rewires. `rewires` is turn -> count of rewires applied that round, from
+    rewires.jsonl; a round with no entry reads back as 0 rewires, which is
+    correct whether that is because rewiring never ran or because nothing
+    happened to rewire.
     """
     by_turn: dict[int, list[dict]] = {}
     for row in probes:
@@ -375,6 +483,16 @@ def round_rows(
         xs = [r["x"] for r in rows]
         for row in rows:
             last_known[row["agent_id"]] = row["x"]
+        known = dict(last_known)
+
+        round_graph = _graph_for_round(turn, graphs_by_round, graph)
+        assort = assortativity(round_graph, known)
+        null_mean, null_hi = assortativity_null(
+            round_graph, known, f"{config['seed']}|{turn}|assort_null"
+        )
+        assort_excess = (
+            None if assort is None or null_mean is None else assort - null_mean
+        )
 
         turn_frame = frame[frame.turn == turn]
         outcomes = [r["outcome"] for r in rows if r["outcome"] is not None]
@@ -388,7 +506,13 @@ def round_rows(
             "mean_x": sum(xs) / len(xs),
             "var_x": population_variance(xs),
             "extremity": sum(1 for x in xs if abs(x) > EXTREMITY_THRESHOLD) / len(xs),
-            "assortativity": assortativity(graph, dict(last_known)),
+            "assortativity": assort,
+            "assort_null_mean": null_mean,
+            "assort_null_hi": null_hi,
+            "assort_excess": assort_excess,
+            "cross_side_edge_share": cross_side_edge_share(round_graph, known),
+            "minority_share": minority_share(known),
+            "n_rewires": (rewires or {}).get(turn, 0),
             "n_valid": len(rows),
             "n_failed": population - len(rows),
             "mean_reply_prompt_tokens": _mean_or_none(
@@ -449,6 +573,96 @@ def assortativity(graph: nx.Graph | None, x_by_agent: dict[str, float]) -> float
     return float(nx.numeric_assortativity_coefficient(subgraph, "x"))
 
 
+def assortativity_null(
+    graph: nx.Graph | None, x_by_agent: dict[str, float], seed_key: str
+) -> tuple[float | None, float | None]:
+    """The permutation null for this round's assortativity: mean and the
+    ASSORT_NULL_PERCENTILE-th percentile over ASSORT_NULL_RESAMPLES shuffles
+    of x across the graph's nodes.
+
+    None, None under exactly the conditions `assortativity` itself returns
+    None under (no graph, fewer than two distinct values, no surviving
+    edge): a null distribution for a statistic that is not defined is not
+    defined either, and every permutation would otherwise raise the same
+    way `assortativity` declines to.
+
+    Seeded by `seed_key` (the run's seed and the turn, per the design) so
+    the null is reproducible from the run alone -- re-running this module
+    over the same runs_dir must not change assort_null_hi out from under a
+    reported t_echo.
+    """
+    if graph is None:
+        return None, None
+    known = {a: x for a, x in x_by_agent.items() if a in graph}
+    if len(set(known.values())) < 2:
+        return None, None
+    subgraph = graph.subgraph(known)
+    if subgraph.number_of_edges() == 0:
+        return None, None
+    work = nx.Graph(subgraph)
+    nodes = sorted(known)
+    values = [known[node] for node in nodes]
+
+    rng = random.Random(seed_key)
+    samples: list[float] = []
+    for _ in range(ASSORT_NULL_RESAMPLES):
+        shuffled = list(values)
+        rng.shuffle(shuffled)
+        nx.set_node_attributes(work, dict(zip(nodes, shuffled, strict=True)), "x")
+        samples.append(float(nx.numeric_assortativity_coefficient(work, "x")))
+    samples.sort()
+    mean = sum(samples) / len(samples)
+    return mean, percentile(samples, ASSORT_NULL_PERCENTILE)
+
+
+def cross_side_edge_share(graph: nx.Graph | None, x_by_agent: dict[str, float]) -> float | None:
+    """Share of this round's edges whose two ends sit on opposite sides of
+    the midpoint.
+
+    Sign of x, with 0 excluded on either end exactly as sign_of excludes it
+    everywhere else: an edge touching an undecided agent is not "same side"
+    or "different side", it is neither, so it is dropped from both the
+    numerator and the denominator rather than counted as agreement.
+
+    None when no edge survives with both ends known and decided -- the same
+    "not defined" answer assortativity gives, for the same reason: a share
+    of nothing is not zero agreement, it is no measurement.
+    """
+    if graph is None:
+        return None
+    sides = {
+        agent: sign_of(x)
+        for agent, x in x_by_agent.items()
+        if agent in graph and sign_of(x) != 0
+    }
+    edges = [(a, b) for a, b in graph.edges if a in sides and b in sides]
+    if not edges:
+        return None
+    cross = sum(1 for a, b in edges if sides[a] != sides[b])
+    return cross / len(edges)
+
+
+def minority_share(x_by_agent: dict[str, float]) -> float | None:
+    """Share of agents on the smaller of the two sides this round.
+
+    A population-level quantity, not a graph one -- every agent with a
+    known, decided (non-zero-sign) reading counts, whether or not it is in
+    the run's graph. None when nobody has a decided side (every reading is
+    exactly 0, or there are no readings at all), where "the smaller side" has
+    no answer.
+
+    t_echo's floor on this is what tells consensus apart from an echo
+    chamber: a population that collapsed onto one side has minority_share
+    near 0, and that is not two camps that pulled apart from each other.
+    """
+    sides = [sign_of(x) for x in x_by_agent.values() if sign_of(x) != 0]
+    if not sides:
+        return None
+    pro = sum(1 for s in sides if s > 0)
+    con = len(sides) - pro
+    return min(pro, con) / len(sides)
+
+
 def _mean_or_none(series: pd.Series) -> float | None:
     cleaned = series.dropna()
     return None if cleaned.empty else float(cleaned.mean())
@@ -462,6 +676,8 @@ RUN_COLUMNS = (
     "topic", "model_backend_id", "neighbor_strategy",
     "final_turn", "final_mean_x", "final_var_x", "final_extremity",
     "final_assortativity",
+    "final_assort_excess", "final_cross_side_edge_share", "final_minority_share",
+    "auc_assort_excess", "t_echo", "echo_censored",
     "d_var_x", "d_extremity",
     *(f"rate_{name}" for name in OUTCOMES),
     "mean_n_repeat_reads",
@@ -494,6 +710,7 @@ def run_row(
         r["n_repeat_reads"] for r in probes if r["n_repeat_reads"] is not None
     ]
     t_stationary, stationary = stationary_round(ordered, epsilon, int(config["K"]))
+    t_echo, echo_censored = echo_round(ordered, int(config["K"]))
 
     row = {
         "run_id": config["run_id"],
@@ -512,6 +729,12 @@ def run_row(
         "final_var_x": final["var_x"],
         "final_extremity": final["extremity"],
         "final_assortativity": final["assortativity"],
+        "final_assort_excess": final["assort_excess"],
+        "final_cross_side_edge_share": final["cross_side_edge_share"],
+        "final_minority_share": final["minority_share"],
+        "auc_assort_excess": auc_assort_excess(ordered),
+        "t_echo": t_echo,
+        "echo_censored": echo_censored,
         "d_var_x": final["var_x"] - first["var_x"],
         "d_extremity": final["extremity"] - first["extremity"],
         "mean_n_repeat_reads": (
@@ -535,6 +758,65 @@ def run_row(
             else sum(1 for r in classified if r["outcome"] == name) / len(classified)
         )
     return row
+
+
+def auc_assort_excess(rounds: list[dict]) -> float | None:
+    """Mean assort_excess over rounds 1..K: a speed measure that needs no
+    threshold, unlike t_echo.
+
+    Round 0 is excluded -- it is the measurement before anything was read,
+    with no rewiring and no reading behind it yet, so it is not a round the
+    manipulation could have moved. None rounds (an undefined assort_excess,
+    e.g. a round where the population already agrees on everything) are
+    dropped rather than treated as 0: "we cannot tell" is not "no excess".
+    """
+    values = [
+        r["assort_excess"]
+        for r in rounds
+        if r["turn"] >= 1 and r["assort_excess"] is not None
+    ]
+    return sum(values) / len(values) if values else None
+
+
+def echo_round(rounds: list[dict], k: int) -> tuple[int, bool]:
+    """t_echo: the first round at which the population has formed an echo
+    chamber, per the design's definition.
+
+    A round qualifies when its assortativity clears its own permutation
+    null (assortativity > assort_null_hi) AND its minority_share is at
+    least MINORITY_SHARE_FLOOR -- the second clause is what keeps a
+    population that collapsed onto one side (consensus, not an echo
+    chamber) from reporting one. t_echo is the LATER of the first
+    ECHO_WINDOW consecutive qualifying rounds, mirroring
+    stationary_round's own convention of reporting the end of its window
+    rather than the start.
+
+    Consecutive means adjacent round numbers, not merely two qualifying
+    rows in a row of a possibly-gappy sequence (a round with no valid
+    probes at all has no row here and would otherwise bridge a gap that
+    is not evidence of anything).
+
+    K + 1 with echo_censored=True when no such window exists -- never K,
+    which is a real round number and would read as "formed on the last
+    round" rather than "never formed".
+    """
+    ordered = sorted(rounds, key=lambda r: r["turn"])
+    qualifies = [
+        r["assortativity"] is not None
+        and r["assort_null_hi"] is not None
+        and r["assortativity"] > r["assort_null_hi"]
+        and r["minority_share"] is not None
+        and r["minority_share"] >= MINORITY_SHARE_FLOOR
+        for r in ordered
+    ]
+    turns = [r["turn"] for r in ordered]
+    for index in range(ECHO_WINDOW - 1, len(turns)):
+        window = turns[index - ECHO_WINDOW + 1 : index + 1]
+        if window[-1] - window[0] != ECHO_WINDOW - 1:
+            continue  # a gap in turn numbers, not ECHO_WINDOW consecutive rounds
+        if all(qualifies[index - ECHO_WINDOW + 1 : index + 1]):
+            return turns[index], False
+    return k + 1, True
 
 
 def _mean_of(values: list[float | None]) -> float | None:
@@ -694,7 +976,11 @@ def compute(
         if not run_probes:
             print(f"  skipped {run_dir.name}: no valid probe readings")
             continue
-        run_rounds = round_rows(frame, run_probes, config, load_graph(run_dir))
+        run_rounds = round_rows(
+            frame, run_probes, config, load_graph(run_dir),
+            graphs_by_round=load_graphs_by_round(run_dir),
+            rewires=load_rewires(run_dir),
+        )
 
         probes.extend(run_probes)
         rounds.extend(run_rounds)
