@@ -1,7 +1,7 @@
 # Chorus: Agentic Network Orchestration and Analysis
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB)
-![Tests](https://img.shields.io/badge/tests-917%20passing-2f9e6e)
+![Tests](https://img.shields.io/badge/tests-1113%20passing-2f9e6e)
 ![Inference](https://img.shields.io/badge/inference-self--hosted-2f9e6e)
 ![License](https://img.shields.io/badge/license-unreleased-lightgrey)
 
@@ -401,7 +401,7 @@ RQ1 uses the **graph** neighbor strategy so that an agent's feed is not a
 function of its current stance. Under alpha sampling, a stance effect and a
 selection effect produce the same rows and cannot be separated afterwards.
 
-### E5: echo-chamber formation, and whether language slows it
+### E5, E6, E7: echo-chamber formation, and whether language slows it
 
 E3/E4 give agents influence (they can be moved by what they read) but no
 selection (who they read is a fixed graph, not a choice). Echo chambers need
@@ -412,43 +412,69 @@ neighbour and pick up someone on its own side instead. Three new
 
 | Field | Default | Meaning |
 |---|---|---|
-| `rewire_rate` | `0.0` | Probability, per opposite-side post read, that the reader drops that link. `0.0` reproduces pre-E5 behaviour exactly. |
+| `rewire_rate` | `0.0` | Probability, per opposite-side post read, that the reader drops that link. `0.0` reproduces pre-E5 behaviour exactly. Swept with `make_rq1_configs.py --rewire-rate`; a non-default rate appears in the run_id (`e5_english_ws_r0p1_s01`) so a sweep can share one runs folder. |
 | `rewire_target` | `same_side` | `same_side`: the new link goes to an agent whose own post this round was on the reader's side. `random`: to any non-neighbour, ignoring side -- a control for whether rewiring alone, without selection, sorts anything. |
-| `lean_assignment` | `random` | `balanced`: the population's starting leans are built by repeating `stance_scale` to length `M` and shuffling, so every seed starts with the same mix of camps rather than whatever a uniform draw landed on. |
+| `lean_assignment` | `random` | `balanced`: `stance_scale` repeated to length `M` and shuffled. `balanced_two_camps`: equal-sized camps drawn evenly from the scale points strictly below and strictly above the midpoint, nobody at the midpoint -- what E5/E6/E7 actually use, since `balanced` alone can leave the midpoint's own agents tipping the population toward one side before round 0. |
 
 A reader's own degree never changes -- one edge leaves, one arrives, both at
 the reader's end -- so `select_neighbors` can always return `N`, and no
-rewire is applied if it would drop a neighbour below `N`. Three experiments
-use the rule:
+rewire is applied if it would drop a neighbour below `N`.
 
-- **E5** (`delivery: on`, `rewire_rate: 0.3`, `rewire_target: same_side`,
-  `lean_assignment: balanced`): the treatment.
-- **E6** (`delivery: off`, otherwise identical to E5): E5's control, the same
-  way E4 is E3's -- it runs the identical rewiring rule over the shadow items
-  the neutral messages stand in for, so a population that sorts under E6 did
-  so without ever reading a persuasive argument.
-- **E7** (`delivery: on`, `rewire_target: random`): rewiring without
-  selection, to separate "agents reshuffle their feed" from "agents reshuffle
-  it toward their own side".
+| Experiment | `delivery` | `rewire_target` | What it is |
+|---|---|---|---|
+| E3 | `on` | -- (no rewiring) | The network treatment: full population, no selection. |
+| E4 | `off` | -- (no rewiring) | E3's control: reads side-free messages instead of arguments. |
+| E5 | `on` | `same_side` | The echo-chamber treatment: rewiring toward one's own side on top of E3. |
+| E6 | `off` | `same_side` | E5's control, the same way E4 is E3's: identical rewiring, run over the shadow items the neutral messages stand in for, so a population that sorts under E6 did so without ever reading a persuasive argument. |
+| E7 | `on` | `random` | Rewiring without selection: separates "agents reshuffle their feed" from "agents reshuffle it toward their own side." |
 
 `scripts/make_rq1_configs.py --experiments e3 e4 e5 e6 e7` generates all five
-(the default stays `e3 e4`, so a bare invocation is unchanged).
-`analysis.metrics` adds, per round, `assort_null_mean`/`assort_null_hi` (a
-1,000-draw permutation null for that round's assortativity),
-`assort_excess` (assortativity above that null), `cross_side_edge_share` and
-`minority_share`; per run, `t_echo` (the first round an echo chamber formed,
-censored at `K + 1` if it never did) and `auc_assort_excess` (a speed measure
-that needs no threshold). `minority_share` guards `t_echo`: a population that
-collapsed onto one side is consensus, not an echo chamber. `analysis.stats`
-contrasts `t_echo`, `auc_assort_excess`, `final_assort_excess` and
-`final_cross_side_edge_share` between languages and does the E5-vs-E6
-difference-in-differences, the same way it already does for E3 vs. E4.
-`analysis.figures` adds `assort_excess.{pdf,png}`,
-`cross_side_edge_share.{pdf,png}`, a `t_echo.{pdf,png}` dot plot, and
-`network_snapshots.{pdf,png}` -- a force-directed layout at rounds 0, K/2 and
-K, one row per language, nodes coloured by side (pass `--runs-dir` to get
-this last one, since it reads each run's own graph files rather than the
-results CSVs).
+(the default stays `e3 e4`, so a bare invocation is unchanged); `--rounds`
+overrides `K` for every experiment generated, and `--probe-language` pins
+every arm's probe question to one language while posts stay in each arm's
+own (an E1-style control). The shipped `configs/rq1/campaign/` was generated
+with `--experiments e3 e4 e5 e6 e7 --seeds 6 --rounds 20`.
+
+**Metrics**, per round in `round_metrics.csv` and as `final_*`/run-level
+values in `run_metrics.csv` (`analysis/metrics.py`). Wang et al.,
+"Decoding Echo Chambers" (COLING 2025), use opinions in `[-2, 2]`; this
+codebase's `x` is in `[-1, 1]`, so their `Pz` and `DG` read 4x ours for the
+same underlying state -- a scale factor, not a different quantity.
+
+| Column | Definition | Notes |
+|---|---|---|
+| `assort_null_mean` / `assort_null_hi` | 1,000-draw permutation null of assortativity over the round's graph | `assort_excess` = assortativity above the null mean |
+| `cross_side_edge_share` | share of edges whose ends disagree in sign of `x` | `x == 0` agents excluded on either end |
+| `minority_share` | the smaller side's population share | guards `t_echo` against reporting consensus as an echo chamber |
+| `polarization_index` | `(1/M) * sum((x_i - mean(x))^2)` | Wang et al.'s `Pz`; identical to `var_x`, kept under both names |
+| `global_disagreement` | mean squared disagreement with one's own neighbours, population-normalized | Wang et al.'s `DG` |
+| `pairwise_disagreement` | mean \|x_i - x_j\| over all agent pairs | population-wide baseline for `disagreement_ratio` |
+| `local_disagreement` | mean \|x_i - x_j\| over this round's edges | |
+| `disagreement_ratio` | `local_disagreement / pairwise_disagreement` | below 1: neighbours disagree less than two random agents |
+| `nci` / `nci_null_mean` / `nci_null_hi` / `nci_excess` | correlation between an agent's own `x` and its neighbours' mean `x`, with a permutation null built like assortativity's | Wang et al.'s NCI, by their text description (their printed formula does not match it) |
+| `bimodality` | Sarle's coefficient | above 5/9 suggests two separated groups rather than one wide one |
+| `mean_belief_shift` / `mean_signed_shift` | mean \|x(t) - x(0)\| / mean signed version, agents with a valid probe at both rounds | |
+| `n_rewires` / `n_side_switches` | rewires applied this round / agents whose side differs from last round | read together: the sorting-versus-conversion race |
+| `t_echo` | the earlier round of the first 2 **consecutive** rounds where assortativity clears its own null **and** `minority_share >= 0.2` | `K + 1` with `echo_censored = True` if no such window exists within `K` rounds |
+| `auc_assort_excess` / `auc_nci_excess` | mean `assort_excess` / `nci_excess` over rounds 1..K | need no threshold, unlike `t_echo`; **`auc_nci_excess` is the primary echo-chamber outcome**, since it is defined for every run, censored or not |
+| `delta_polarization_index` / `delta_global_disagreement` / `delta_nci` | final minus round 0 | |
+| `total_side_switches` / `total_rewires` | summed over the run | |
+
+`analysis.stats` runs two contrast families: e5-vs-e6 (delivery) and
+e5-vs-e7 (selection versus rewiring as such), each Holm-corrected on its own
+and, when a campaign swept `--rewire-rate`, once per rate so two rates are
+never pooled. Every `t_echo` contrast row carries
+`n_censored_treatment`/`n_censored_control`/`censored_warning`, since a
+difference built from censored runs (`echo_censored`, `t_echo = K + 1`)
+depends on `K`; `formation_summary.csv` reports, per experiment/language/rate,
+how many runs formed an echo chamber at all and the median `t_echo` among the
+ones that did. `analysis.figures` adds `assort_excess`, `cross_side_edge_share`,
+`nci_excess`, `disagreement_ratio`, `minority_share` and `n_side_switches`
+line figures, a `t_echo` dot plot, and one `network_snapshots` file per
+experiment present (`network_snapshots_e6.{pdf,png}`, etc.) -- a
+force-directed layout at rounds 0, K/2 and K, one row per language, nodes
+coloured by side (pass `--runs-dir`, since this one reads each run's own
+graph files rather than the results CSVs).
 
 A rewired graph is run state: `graph_edges_by_round.csv` records the edges
 used for reading each round (plus one final block at `K + 1` for the graph
@@ -456,6 +482,36 @@ after the last rewiring), `rewires.jsonl` records every opposite-side read's
 rewire decision (applied or skipped, and why), and the checkpoint now carries
 the current edge list so a resumed run restores the graph as it stood, not
 the one `graph_seed` alone would rebuild.
+
+**Starting positions.** `ExperimentRun.starter_counts` overrides
+`bank_manager.STARTER_COUNTS` (how many con/pro starter posts
+`start_mode="posts"` shows an agent at each lean), validated at config load
+against the active mapping's own maximum rather than the module default.
+`scripts/calibrate_starts.py` sweeps every `(n_con, n_pro)` mix from `(0,0)`
+to `(4,4)`, probing readers cold (no item, no reply) across personas and
+languages, and writes `calibration/starts.csv`; `--suggest` prints the mix
+closest to each target lean and writes a ready-to-paste `starter_counts`
+block. The `(0, 0)` row doubles as a check for whether the model carries a
+prior on the topic that no starter-post mix could correct.
+
+### Structured persona attributes (off by default)
+
+`ExperimentRun.persona_attributes` ("none" / "demographic" /
+"demographic_big5") adds, as one extra sentence appended to the persona line
+of every prompt, age/gender/education and -- under `"demographic_big5"` --
+five Big Five traits drawn high or low with probability 0.5, keyed by
+persona index so the same persona draws the same traits in every language
+arm of a seed. The sentence's template lives in
+[`configs/persona_attribute_templates.yaml`](configs/persona_attribute_templates.yaml),
+not in code, and is rendered in the run's own language. With the default
+`"none"`, every prompt is byte-identical to before this existed. A
+demographic-mode persona pool is read as one JSON object per line
+(`{"persona": ..., "age": ..., "gender": ..., "education": ...}`) rather than
+the plain free text `"none"` pools use, and every field is validated at
+config load, naming the row if one is missing. `export_csv.py`'s `agents.csv`
+gains the resulting columns, and `analysis.metrics` writes
+`belief_shift_by_trait.csv` (mean and variance of belief shift by trait
+level, per language) whenever at least one run carries them.
 
 ### RQ2: Reasoning quality
 
@@ -538,14 +594,25 @@ check the plumbing before launching a real campaign.
 
 ### The RQ1 pipeline
 
-Eight steps, in order, with the generator run twice. Each consumes what the
+Nine steps, in order, with the generator run twice. Each consumes what the
 previous one wrote, and each is resumable.
 
 ```bash
+# 0. (optional) Calibrate the starter-post mix before generating a campaign
+#    that uses one -- writes calibration/starts.csv and, with --suggest, a
+#    ready-to-paste starter_counts block.
+python scripts/calibrate_starts.py --runs-dir runs --sample 200 \
+        --suggest 1.5,2.5,3.5,4.5,5.5,6.5
+
 # 1. Expand one base config into matched sets for all four languages
 python scripts/make_rq1_configs.py --seeds 5 --out configs/rq1/campaign
-#    Add --experiments e3 e4 e5 e6 e7 to also generate E5's echo-chamber arms
-#    (the default stays e3 e4, so a bare invocation is unchanged).
+#    --experiments e3 e4 e5 e6 e7 also generates E5/E6/E7's echo-chamber arms
+#    (the default stays e3 e4, so a bare invocation is unchanged);
+#    --rewire-rate sweeps E5/E6/E7's rewire_rate (appears in the run_id only
+#    when it differs from the 0.3 default, so a sweep can share one runs
+#    folder); --rounds overrides K for every experiment generated;
+#    --probe-language pins every arm's probe question to one language while
+#    posts stay in each arm's own, for an E1-style control.
 
 # 2. Check that the model can read each bank item in each language.
 #    This writes runs/comprehension/failed_items.txt.
@@ -564,7 +631,7 @@ python scripts/calibrate_tau.py --runs-dir runs
 # 4. Run the single-exposure experiment, on readers with no starting position
 python scripts/run_e1.py --runs-dir runs --start-mode none
 
-# 5. Run the network campaign
+# 5. Run the network campaign (e3/e4 only; see Known Limitations for E5/E6/E7)
 python scripts/run_campaign.py configs/rq1/campaign --runs-dir runs
 
 # 6. Turn runs into tidy tables, classified against each arm's tau
@@ -646,7 +713,7 @@ python -m pytest tests/test_agent_manager.py
 python -m pytest tests/test_agent_manager.py::test_name -q
 ```
 
-The suite currently has 917 passing tests. `asyncio_mode = "auto"` is set in
+The suite currently has 1113 passing tests. `asyncio_mode = "auto"` is set in
 `pyproject.toml`, so async tests run without a marker. Integration tests drive
 whole runs against a mocked gateway and compare whole runs line by line to keep
 the language arms byte-identical.
