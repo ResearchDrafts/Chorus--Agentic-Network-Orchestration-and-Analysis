@@ -26,6 +26,14 @@ from __future__ import annotations
 import random
 
 
+# The persona-assignment stream's offset from the base seed. Public (not a
+# SeedManager-private detail) because persona_trait_rng below derives from
+# the same seed space without going through a SeedManager instance -- see
+# persona_trait_rng's own docstring for why it cannot be a sequential draw
+# off SeedManager.persona_assignment_rng the way _balanced_leans' shuffle is.
+PERSONA_ASSIGNMENT_OFFSET = 2
+
+
 class SeedManager:
     """One instance per run. Each property returns the SAME long-lived
     random.Random instance on every call -- not a fresh one -- since each
@@ -43,7 +51,7 @@ class SeedManager:
         self._base_seed = seed
         self._neighbor_rng = random.Random(seed)
         self._meme_rng = random.Random(seed + 1)
-        self._persona_rng = random.Random(seed + 2)
+        self._persona_rng = random.Random(seed + PERSONA_ASSIGNMENT_OFFSET)
 
     @property
     def neighbor_sampling_rng(self) -> random.Random:
@@ -197,3 +205,26 @@ class SeedManager:
         return random.Random(
             f"{self._base_seed}|{purpose}|{turn}|{agent_id}"
         ).getrandbits(31)
+
+
+def persona_trait_rng(seed: int, persona_index: int) -> random.Random:
+    """A fresh stream for one persona index's Big Five draw (Fix 7),
+    derived from the persona-assignment seed space but keyed by index
+    rather than drawn sequentially off SeedManager.persona_assignment_rng.
+
+    A module-level function, not a SeedManager method, and deliberately
+    not a draw off the live persona_assignment_rng instance: that stream's
+    position after M agents depends on which lean_assignment mode ran and
+    on M itself (_balanced_leans and _balanced_two_camps_leans each consume
+    it differently), so two configs sharing a seed but differing in
+    lean_assignment -- e3 (random) and e5 (balanced_two_camps) of the same
+    campaign, say -- would otherwise draw DIFFERENT Big Five traits for
+    the same persona index, breaking "the same persona index gets the same
+    traits in every language arm of a seed" the moment that pair also
+    varies lean_assignment. Keying by index, like sender_rng and call_seed
+    key by agent id for the same class of reason, makes the draw a pure
+    function of (seed, persona_index) and nothing else.
+    """
+    if persona_index < 0:
+        raise ValueError(f"persona_index must be >= 0, got {persona_index}")
+    return random.Random(f"{seed + PERSONA_ASSIGNMENT_OFFSET}|big5|{persona_index}")

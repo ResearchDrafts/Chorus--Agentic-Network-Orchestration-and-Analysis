@@ -54,6 +54,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from sandbox.models import Agent, ExperimentRun, Interaction, MemeContent
 from sandbox.vision_fallback import build_meme_prompt
@@ -63,6 +64,12 @@ from sandbox.vision_fallback import build_meme_prompt
 # in-place .append() (phase4.md D7). This is the cap that reaches the model,
 # so it is the one that determines experimental results.
 MEMORY_WINDOW_TURNS = 5
+
+# Fix 7. A path, not inline text: the templates are translated content, and
+# content belongs in a file a translator can edit without touching this
+# module, the same reason the argument bank and probe_questions.yaml are
+# files rather than dicts in code.
+PERSONA_ATTRIBUTE_TEMPLATES_PATH = Path("configs/persona_attribute_templates.yaml")
 
 # phase4.md Q4.2. Exactly one of these lines varies across a language sweep;
 # everything else in the prompt is byte-identical. Keep them short and
@@ -174,6 +181,18 @@ class PromptBuilder:
             from sandbox.bank_manager import BankManager
 
             self._starters = BankManager(run.starter_bank_path)
+        # Loaded once, for persona_attributes != "none" only (Fix 7). YAML,
+        # not a module-scope import of anything heavier, and lazy for the
+        # same reason the starter bank above is: a run with the default
+        # "none" never touches the file and stays byte-identical to every
+        # config written before this feature existed.
+        self._persona_templates = None
+        if run.persona_attributes != "none":
+            import yaml
+
+            self._persona_templates = yaml.safe_load(
+                PERSONA_ATTRIBUTE_TEMPLATES_PATH.read_text(encoding="utf-8")
+            )
 
     def build_discussion_prompt(
         self,
@@ -205,6 +224,43 @@ class PromptBuilder:
             agent, neighbor_posts, turn, emphasize_format=emphasize_format
         )
 
+    def _persona_section(self, agent: Agent) -> str:
+        """"You are: <persona>", plus one extra sentence of demographic
+        (and, under "demographic_big5", personality) attributes when
+        run.persona_attributes asks for it.
+
+        Shared by both regimes and the probe prompt -- all three built this
+        line identically before Fix 7, and the attribute sentence is a
+        property of the agent and the run's language, not of which prompt
+        it is rendered into.
+
+        With persona_attributes="none" (every config written before Fix 7
+        existed) this returns exactly what it always has -- "You are:
+        <persona>" and nothing appended -- so every one of those prompts
+        stays byte-identical. The sentence itself comes from
+        configs/persona_attribute_templates.yaml, in the run's own
+        language, the same way LANGUAGE_DIRECTIVES and LEAN_SENTENCES are
+        rendered against the run's language and anchor labels rather than
+        hard-coded per condition.
+        """
+        base = f"You are: {agent.persona}"
+        if self._run.persona_attributes == "none":
+            return base
+        language = self._run.language_condition
+        sentence = self._persona_templates["demographic"][language].format(
+            age=agent.age, gender=agent.gender, education=agent.education,
+        )
+        if self._run.persona_attributes == "demographic_big5":
+            words = self._persona_templates["level_words"][language]
+            sentence += " " + self._persona_templates["big5"][language].format(
+                openness=words[agent.trait_openness],
+                conscientiousness=words[agent.trait_conscientiousness],
+                extraversion=words[agent.trait_extraversion],
+                agreeableness=words[agent.trait_agreeableness],
+                neuroticism=words[agent.trait_neuroticism],
+            )
+        return f"{base} {sentence}"
+
     def _build_generated_prompt(
         self,
         agent: Agent,
@@ -213,7 +269,10 @@ class PromptBuilder:
         *,
         emphasize_format: bool = False,
     ) -> BuiltPrompt:
-        """The original path, unchanged.
+        """The original path, with one addition: the persona line is built
+        by _persona_section rather than inline, so persona_attributes'
+        extra sentence (off by default) can be shared with the bank
+        regime's two prompts instead of a third copy of the same logic.
 
         neighbor_posts is list[Interaction], not list[Agent]: only Interaction
         carries content_type and meme_id, without which the meme path cannot
@@ -227,7 +286,7 @@ class PromptBuilder:
         image, fallback_used = self._resolve_meme_media(neighbor_posts)
 
         sections = [
-            f"You are: {agent.persona}",
+            self._persona_section(agent),
             f"You are taking part in an ongoing discussion about: {self._run.topic}",
             self._position_section(agent),
         ]
@@ -281,7 +340,7 @@ class PromptBuilder:
         kept so the orchestrator's two regimes return the same type.
         """
         sections = [
-            f"You are: {agent.persona}",
+            self._persona_section(agent),
             f"You are taking part in an ongoing discussion about: {self._run.topic}",
         ]
         start = self._lean_section(agent)
@@ -328,7 +387,7 @@ class PromptBuilder:
         appears anywhere.
         """
         sections = [
-            f"You are: {agent.persona}",
+            self._persona_section(agent),
             f"You are taking part in an ongoing discussion about: {self._run.topic}",
         ]
         start = self._lean_section(agent)

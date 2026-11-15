@@ -267,6 +267,57 @@ def _neutral_bank_errors(raw: dict) -> list[str]:
         return [f"neutral bank {neutral_bank_path}: {problem}" for problem in e.errors]
     return []
 
+
+def _persona_attributes_errors(raw: dict) -> list[str]:
+    """Validates a demographic-mode persona pool at config-load time.
+
+    With persona_attributes="none" (the default and every pre-Fix-7 config)
+    this runs nothing: load_persona_pool's plain-text pools are never
+    parsed as JSON here. With "demographic" or "demographic_big5", every
+    row the population could draw a persona from must carry a non-empty
+    age, gender and education -- checked in full, not merely that the pool
+    file exists, for the same reason _bank_errors loads its CSV in full: a
+    population missing one field on one row would start, run to
+    completion, and render that agent's extra sentence with a blank or
+    None baked into it, which is indistinguishable in the output from a
+    deliberately blank demographic.
+    """
+    attributes = raw.get("persona_attributes", "none")
+    if attributes not in ("demographic", "demographic_big5"):
+        return []
+    persona_pool_id = raw.get("persona_pool_id")
+    if not isinstance(persona_pool_id, str) or not persona_pool_id.strip():
+        return []  # ExperimentRun's own validator reports the missing field
+    path = Path("data/personas") / f"{persona_pool_id}.jsonl"
+    if not path.exists():
+        return []  # _referenced_asset_errors' own existence check reports this
+
+    # Imported inside the function for _bank_errors' reason: config_loader
+    # is Tier 0 and agent_manager is Tier 1.
+    from sandbox.agent_manager import PERSONA_ATTRIBUTE_FIELDS, load_persona_rows
+
+    try:
+        rows = load_persona_rows(persona_pool_id)
+    except (FileNotFoundError, ValueError) as e:
+        return [str(e)]
+
+    errors: list[str] = []
+    for index, row in enumerate(rows):
+        missing = [
+            field
+            for field in PERSONA_ATTRIBUTE_FIELDS
+            if not isinstance(getattr(row, field), (str, int))
+            or (isinstance(getattr(row, field), str) and not getattr(row, field).strip())
+        ]
+        if missing:
+            snippet = row.persona[:40] + ("..." if len(row.persona) > 40 else "")
+            errors.append(
+                f"persona pool {persona_pool_id!r} row {index} ({snippet!r}): "
+                f"missing {missing}"
+            )
+    return errors
+
+
 def _resolve_git_commit_hash() -> str:
 
 
@@ -302,6 +353,7 @@ def _referenced_asset_errors(raw: dict) -> list[str]:
     errors.extend(_bank_errors(raw))
     errors.extend(_neutral_bank_errors(raw))
     errors.extend(_starter_bank_errors(raw))
+    errors.extend(_persona_attributes_errors(raw))
 
     meme_injection = raw.get("meme_injection")
     if isinstance(meme_injection, dict) and meme_injection.get("enabled") is True:

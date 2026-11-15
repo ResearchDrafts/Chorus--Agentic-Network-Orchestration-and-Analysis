@@ -1311,14 +1311,102 @@ def parse_epsilon(pairs: list[str] | None) -> dict[str, float]:
 # --- the whole thing ------------------------------------------------------
 
 
+# --- Fix 7: belief_shift_by_trait.csv --------------------------------------
+#
+# Reads the structured persona attributes (off by default via
+# ExperimentRun.persona_attributes) back out of agents_final.jsonl, the
+# same file export_csv.py's agents.csv joins them from -- this module
+# never reads export_csv.py's output, so it is read independently here.
+
+TRAIT_COLUMNS = (
+    "gender", "education",
+    "trait_openness", "trait_conscientiousness", "trait_extraversion",
+    "trait_agreeableness", "trait_neuroticism",
+)
+
+BELIEF_SHIFT_BY_TRAIT_COLUMNS = (
+    "trait", "level", "language", "n", "mean_abs_shift", "var_abs_shift",
+)
+
+
+def load_agent_traits(run_dir: Path) -> dict[str, dict] | None:
+    """agent_id -> {trait_column: level}, from agents_final.jsonl.
+
+    None when the file does not exist yet (an interrupted run) or when
+    every row's TRAIT_COLUMNS are null (persona_attributes was "none",
+    which is every pre-Fix-7 run) -- the same "nothing to report" signal
+    the rest of this module gives rather than an empty-but-present table.
+    age is deliberately not in TRAIT_COLUMNS: it is continuous, not a
+    level, and "mean shift by age" is a different question (a regression,
+    not a group-by) than this table answers.
+    """
+    path = run_dir / "agents_final.jsonl"
+    if not path.exists():
+        return None
+    rows = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if not rows:
+        return None
+    if not any(any(row.get(c) is not None for c in TRAIT_COLUMNS) for row in rows):
+        return None
+    return {row["agent_id"]: {c: row.get(c) for c in TRAIT_COLUMNS} for row in rows}
+
+
+def agent_belief_shifts(probes: list[dict], k: int) -> dict[str, float]:
+    """agent_id -> |x(k) - x(0)|, for agents with a valid probe at both
+    round 0 and round k of THIS run's own configured K -- not "the last
+    round that agent had a valid probe", which belief_shift_by_trait
+    would otherwise be comparing across agents at different rounds.
+    """
+    by_agent: dict[str, dict[int, float]] = {}
+    for row in probes:
+        by_agent.setdefault(row["agent_id"], {})[row["turn"]] = row["x"]
+    return {
+        agent: abs(turns[k] - turns[0])
+        for agent, turns in by_agent.items()
+        if 0 in turns and k in turns
+    }
+
+
+def belief_shift_by_trait(rows: list[dict]) -> list[dict]:
+    """Groups belief-shift rows (one per agent per run, from `compute`)
+    by (trait, level, language): the mean and population variance
+    (ddof=0, consistent with population_variance elsewhere in this
+    module) of |x(K) - x(0)|.
+    """
+    groups: dict[tuple[str, str, str], list[float]] = {}
+    for row in rows:
+        key = (row["trait"], row["level"], row["language"])
+        groups.setdefault(key, []).append(row["shift"])
+    out = []
+    for (trait, level, language), shifts in sorted(groups.items()):
+        n = len(shifts)
+        mean = sum(shifts) / n
+        variance = sum((s - mean) ** 2 for s in shifts) / n
+        out.append({
+            "trait": trait, "level": level, "language": language,
+            "n": n, "mean_abs_shift": mean, "var_abs_shift": variance,
+        })
+    return out
+
+
 def compute(
     runs_dir: Path, tau_path: Path, epsilon: dict[str, float], from_e4: bool
-) -> tuple[list[dict], list[dict], list[dict]]:
-    """Every table, from every bank run under `runs_dir`."""
+) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """Every table, from every bank run under `runs_dir`.
+
+    The fourth element is belief_shift_by_trait's own rows -- empty when
+    no run under `runs_dir` carries any TRAIT_COLUMNS, which main() reads
+    to decide whether to write the file at all.
+    """
     tau = load_tau(tau_path)
     probes: list[dict] = []
     rounds: list[dict] = []
     per_run: list[tuple[list[dict], list[dict], dict, float | None]] = []
+    belief_shift_rows: list[dict] = []
 
     for run_dir in discover_runs(runs_dir):
         frame = load_run_frame(run_dir)
@@ -1351,6 +1439,18 @@ def compute(
         rounds.extend(run_rounds)
         per_run.append((run_rounds, run_probes, config, reply_truncated_rate(frame)))
 
+        traits = load_agent_traits(run_dir)
+        if traits is not None:
+            shifts = agent_belief_shifts(run_probes, int(config["K"]))
+            for agent_id, shift in shifts.items():
+                for trait_name, level in traits.get(agent_id, {}).items():
+                    if level is None:
+                        continue
+                    belief_shift_rows.append({
+                        "trait": trait_name, "level": str(level),
+                        "language": config["language_condition"], "shift": shift,
+                    })
+
     if from_e4:
         epsilon = epsilon_from_e4(rounds)
         print("  ε from the E4 control arm: " + ", ".join(
@@ -1358,7 +1458,7 @@ def compute(
         ))
 
     runs = [run_row(r, p, c, epsilon, rt) for r, p, c, rt in per_run]
-    return probes, rounds, runs
+    return probes, rounds, runs, belief_shift_rows
 
 
 def write_table(path: Path, rows: list[dict], columns: tuple[str, ...]) -> None:
@@ -1403,7 +1503,7 @@ def main(argv: list[str] | None = None) -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     print(f"\n{args.runs_dir} -> {args.out}/")
 
-    probes, rounds, runs = compute(
+    probes, rounds, runs, belief_shift_rows = compute(
         args.runs_dir, args.tau, epsilon, args.epsilon_from_e4
     )
     if not runs:
@@ -1413,6 +1513,15 @@ def main(argv: list[str] | None = None) -> int:
     write_table(args.out / "probes.csv", probes, PROBE_COLUMNS)
     write_table(args.out / "round_metrics.csv", rounds, ROUND_COLUMNS)
     write_table(args.out / "run_metrics.csv", runs, RUN_COLUMNS)
+    # Only when at least one run actually carried a structured persona
+    # attribute (Fix 7, off by default): a campaign that never set
+    # persona_attributes must not grow an all-empty belief_shift_by_trait.csv.
+    if belief_shift_rows:
+        write_table(
+            args.out / "belief_shift_by_trait.csv",
+            belief_shift_by_trait(belief_shift_rows),
+            BELIEF_SHIFT_BY_TRAIT_COLUMNS,
+        )
     return 0
 
 

@@ -66,6 +66,26 @@ class Agent(BaseModel):
     # or the difference between them measures a change of starter posts.
     start_key: str | None = None
 
+    # --- structured persona attributes (Fix 7, off by default) -----------
+    #
+    # All None when ExperimentRun.persona_attributes == "none" (every
+    # existing config): nothing here changes meaning for a run that never
+    # asked for it. With "demographic" or above, age/gender/education come
+    # from the persona pool row AgentManager drew this agent's persona from;
+    # with "demographic_big5", the five trait_* fields are also populated.
+    age: int | None = None
+    gender: str | None = None
+    education: str | None = None
+    # Each "high" or "low" -- not a continuous score, per the design's own
+    # draw rule (probability 0.5 each, independently). Kept as five separate
+    # fields rather than a dict so they round-trip through model_dump_json()
+    # (and so agents_final.jsonl / the agents CSV) as plain scalar columns.
+    trait_openness: str | None = None
+    trait_conscientiousness: str | None = None
+    trait_extraversion: str | None = None
+    trait_agreeableness: str | None = None
+    trait_neuroticism: str | None = None
+
     def current_stance(self) -> float:
         """Last stance_history entry's value, or initial_stance if empty."""
         return self.stance_history[-1].stance_value if self.stance_history else self.initial_stance
@@ -325,6 +345,24 @@ class ExperimentRun(BaseModel):
     stance_low_label: str = Field(default="strongly opposed", min_length=1)
     stance_high_label: str = Field(default="strongly in favour", min_length=1)
     persona_pool_id: str = Field(min_length=1)
+    # "none" (the default): every existing persona pool and every existing
+    # prompt is unchanged -- the pool's lines stay plain free text and
+    # nothing is appended to the persona section of any prompt.
+    # "demographic": each line of the pool is read as a JSON object
+    # carrying "persona", "age", "gender" and "education" (see
+    # agent_manager.load_persona_rows), and one extra sentence rendered
+    # from the three fields is appended to the persona section, in the
+    # run's own language (see prompt_builder._persona_section and
+    # configs/persona_attribute_templates.yaml -- a template is translated
+    # content, not logic, so it lives in a config file rather than in code).
+    # "demographic_big5" adds five Big Five traits (openness,
+    # conscientiousness, extraversion, agreeableness, neuroticism), each
+    # drawn high or low with probability 0.5, independently, keyed by
+    # persona index so the same persona draws the same five traits in
+    # every language arm of a seed.
+    persona_attributes: str = Field(
+        default="none", pattern="^(none|demographic|demographic_big5)$"
+    )
     meme_injection: MemeInjectionConfig = Field(default_factory=MemeInjectionConfig)
 
     # How the population's starting positions are drawn. "random" -- every

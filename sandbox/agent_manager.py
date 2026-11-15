@@ -10,9 +10,11 @@ which neighbor posts it saw this turn.
 
 from __future__ import annotations
 import copy
+import json
 import random
 from pathlib import Path
 from sandbox.models import Agent, ExperimentRun, Interaction, StanceRecord
+from sandbox.seed_manager import persona_trait_rng
 
 
 def load_persona_pool(persona_pool_id: str) -> list[str]:
@@ -36,6 +38,95 @@ def load_persona_pool(persona_pool_id: str) -> list[str]:
     if not path.exists():
         raise FileNotFoundError(f"persona pool vanished: {path}")
     return [line.strip() for line in path.read_text().splitlines() if line.strip()]
+
+
+# The three demographic fields ExperimentRun.persona_attributes="demographic"
+# (or above) requires every persona-pool row to carry. Named here, not
+# inlined, so config_loader's load-time check and this module's own parse
+# agree on the set without repeating it.
+PERSONA_ATTRIBUTE_FIELDS = ("age", "gender", "education")
+
+# The Big Five, in OCEAN order -- fixed so the five draws from one
+# persona_trait_rng call always land on the same trait in the same
+# position, regardless of which order a caller happens to read them in.
+BIG_FIVE_TRAITS = (
+    "openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism",
+)
+
+
+class PersonaRow:
+    """One line of a demographic-mode persona pool: the free-text
+    description plus whatever of age/gender/education that line carried.
+
+    A plain class, not a Pydantic model: this is an internal loader
+    artifact describing one line on disk, not a value that crosses a
+    process or API boundary the way Agent and ExperimentRun do.
+    """
+
+    __slots__ = ("persona", "age", "gender", "education")
+
+    def __init__(self, persona: str, age=None, gender=None, education=None):
+        self.persona = persona
+        self.age = age
+        self.gender = gender
+        self.education = education
+
+
+def load_persona_rows(persona_pool_id: str) -> list[PersonaRow]:
+    """Every row of the pool, read as a JSON object per line.
+
+    Used instead of load_persona_pool when ExperimentRun.persona_attributes
+    is "demographic" or "demographic_big5", which need age/gender/education
+    alongside the free-text description -- a plain-text pool's lines parse
+    as neither JSON nor an object, so pointing a demographic-mode run at
+    one fails here with the line number, not three fields silently None.
+
+    This loader itself only requires a non-empty "persona" key on each
+    line; whether age/gender/education are actually present and non-empty
+    is a validation question for config_loader (Fix 7's own "a missing
+    field is a load-time error naming the row"), not a parsing one -- a
+    row missing "education" is valid JSON and a valid PersonaRow, just one
+    config_loader must refuse to run a demographic-mode population from.
+    """
+    path = Path("data/personas") / f"{persona_pool_id}.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(f"persona pool vanished: {path}")
+    rows: list[PersonaRow] = []
+    for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"{path} line {line_no}: not valid JSON ({e}) -- a "
+                "demographic persona pool needs one JSON object per line"
+            ) from e
+        if not isinstance(raw, dict):
+            raise ValueError(f"{path} line {line_no}: not a JSON object")
+        persona = raw.get("persona")
+        if not isinstance(persona, str) or not persona.strip():
+            raise ValueError(f"{path} line {line_no}: no non-empty 'persona' field")
+        rows.append(PersonaRow(
+            persona=persona.strip(),
+            age=raw.get("age"), gender=raw.get("gender"), education=raw.get("education"),
+        ))
+    if not rows:
+        raise ValueError(f"{path}: no persona rows found")
+    return rows
+
+
+def draw_big5(seed: int, persona_index: int) -> dict[str, str]:
+    """This persona index's five Big Five draws: trait name -> "high" or
+    "low", each independently at probability 0.5.
+
+    Keyed by persona_index via persona_trait_rng (see its own docstring for
+    why this is not a sequential draw off the live persona-assignment
+    stream), so the same persona index gets the same five draws in every
+    language arm of a seed, and in every lean_assignment mode of it.
+    """
+    rng = persona_trait_rng(seed, persona_index)
+    return {trait: ("high" if rng.random() < 0.5 else "low") for trait in BIG_FIVE_TRAITS}
 
 
 def _evenly_repeated(points: list[float], n: int) -> list[float]:
@@ -85,8 +176,24 @@ class AgentManager:
         "balanced" the whole population's leans are drawn once, up front,
         in the same stream position the per-agent draws would otherwise
         occupy (see _balanced_leans).
+
+        With persona_attributes="none" (every existing config), this is
+        byte-for-byte what it always has been. With "demographic" or above,
+        personas come from load_persona_rows instead of load_persona_pool,
+        and each agent also carries the row's age/gender/education; with
+        "demographic_big5" it additionally carries five Big Five draws from
+        draw_big5, keyed by the persona's POOL index -- not the population
+        index i -- so two agents sharing a persona (the pool wraps before M
+        agents are built) also share its demographic and trait profile,
+        the same way they already share its free-text description.
         """
-        personas = self._load_persona_pool()
+        attributes = self._run.persona_attributes
+        persona_rows: list[PersonaRow] | None = None
+        if attributes == "none":
+            personas = self._load_persona_pool()
+        else:
+            persona_rows = load_persona_rows(self._run.persona_pool_id)
+            personas = [row.persona for row in persona_rows]
         if self._run.lean_assignment == "balanced":
             leans = self._balanced_leans()
         elif self._run.lean_assignment == "balanced_two_camps":
@@ -95,8 +202,18 @@ class AgentManager:
             leans = None
         agents = []
         for i in range(self._run.M):
-            persona = personas[i % len(personas)]  # cycle if M > pool size
+            pool_index = i % len(personas)  # cycle if M > pool size
+            persona = personas[pool_index]
             stance = leans[i] if leans is not None else self._draw_initial_stance()
+            extra: dict = {}
+            if persona_rows is not None:
+                row = persona_rows[pool_index]
+                extra["age"] = row.age
+                extra["gender"] = row.gender
+                extra["education"] = row.education
+            if attributes == "demographic_big5":
+                for trait, level in draw_big5(self._run.seed, pool_index).items():
+                    extra[f"trait_{trait}"] = level
             agent = Agent(
                 agent_id=agent_id_for(i),
                 run_id=self._run.run_id,
@@ -107,6 +224,7 @@ class AgentManager:
                 stance_history=[],
                 memory_window=[],
                 created_at_turn=0,
+                **extra,
             )
             self._agents[agent.agent_id] = agent
             agents.append(agent)

@@ -81,6 +81,18 @@ RUN_FIELDS = (
     "bank_path", "probe_mass_floor", "memory_rounds",
 )
 
+# Fix 7: the structured persona attributes, joined from agents_final.jsonl
+# onto every interaction row of the agent they belong to (see
+# _join_persona_attributes), so agents_table's groupby.first() carries them
+# through to agents.csv. Present but null for persona_attributes="none" and
+# for any run written before Fix 7 existed, the same "empty rather than
+# absent" convention EXPOSURE_COLUMNS already uses.
+PERSONA_ATTRIBUTE_COLUMNS = (
+    "age", "gender", "education",
+    "trait_openness", "trait_conscientiousness", "trait_extraversion",
+    "trait_agreeableness", "trait_neuroticism",
+)
+
 
 def load_run(run_dir: Path) -> pd.DataFrame | None:
     """One run's interactions with its config joined on, or None if unusable."""
@@ -103,6 +115,36 @@ def load_run(run_dir: Path) -> pd.DataFrame | None:
     # Row order within a run is write order, which is what makes "keep last"
     # mean "keep the post-resume copy".
     df["row_index"] = range(len(df))
+    return _join_persona_attributes(df, run_dir)
+
+
+def _join_persona_attributes(df: pd.DataFrame, run_dir: Path) -> pd.DataFrame:
+    """age/gender/education and the five Big Five draws, from
+    agents_final.jsonl, keyed on speaker_agent_id.
+
+    Joined once per run, here, rather than re-read inside agents_table:
+    agents_final.jsonl is per-agent, not per-interaction, and load_run is
+    already the one place every row of a run passes through. Columns are
+    added as all-null, not left absent, when the file does not exist yet
+    (an interrupted run) or carries none of them (persona_attributes was
+    "none"), so a campaign mixing attribute modes still exports as one
+    rectangular table.
+    """
+    agents_path = run_dir / "agents_final.jsonl"
+    if agents_path.exists():
+        agents = pd.read_json(agents_path, lines=True)
+    else:
+        agents = pd.DataFrame()
+    available = [c for c in PERSONA_ATTRIBUTE_COLUMNS if c in agents.columns]
+    if not available:
+        for column in PERSONA_ATTRIBUTE_COLUMNS:
+            df[column] = None
+        return df
+    lookup = agents.set_index("agent_id")[available]
+    for column in PERSONA_ATTRIBUTE_COLUMNS:
+        df[column] = (
+            df["speaker_agent_id"].map(lookup[column]) if column in available else None
+        )
     return df
 
 
@@ -344,6 +386,7 @@ def agents_table(df: pd.DataFrame) -> pd.DataFrame:
         turns_moved=("stance_moved", "sum"),
         mean_prompt_tokens=("prompt_token_count", "mean"),
         mean_completion_tokens=("completion_token_count", "mean"),
+        **{column: (column, "first") for column in PERSONA_ATTRIBUTE_COLUMNS},
     )
     agg["initial_stance"] = first.stance_before
     agg["final_stance"] = last.stance_after
