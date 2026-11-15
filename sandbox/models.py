@@ -454,6 +454,15 @@ class ExperimentRun(BaseModel):
     # non-recsys config's run_config.json still records a definite value
     # instead of a null that looks like a missing setting.
     recsys_threshold: float = Field(default=1.0, gt=0.0)
+    # Fix 1: under neighbor_strategy="graph", a node whose graph neighbourhood
+    # fell below N at construction time (Watts-Strogatz rewiring moves edges
+    # rather than adding them) raises by default -- the same check
+    # GraphSampling always ran. True opts into the same rule
+    # GraphSimilaritySampling already lives by: deliver min(N, however many
+    # graph neighbours this node has), never padded back up, with
+    # feed_size logged just like the recommender's. False (the default)
+    # keeps every pre-Fix-1 run's behaviour, and its error, unchanged.
+    allow_short_feed: bool = False
 
     # --- E5: echo-chamber formation (RQ1, graph strategy only) ------------
     #

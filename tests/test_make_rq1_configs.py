@@ -138,7 +138,7 @@ def test_the_seed_is_shared_across_languages_and_experiments(campaign):
     and nothing else, so four runs sharing a seed get the same graph, the same
     neighbour draws and the same bank item for the same sender on the same
     side."""
-    out = campaign("--seeds", "3", "--base-seed", "7000")
+    out = campaign("--seeds", "3", "--base-seed", "8000")
 
     for seed_index in (1, 2, 3):
         seeds = set()
@@ -148,7 +148,7 @@ def test_the_seed_is_shared_across_languages_and_experiments(campaign):
                 config = yaml.safe_load(path.read_text())
                 seeds.add(config["seed"])
                 assert config["trial_number"] == seed_index
-        assert seeds == {7000 + seed_index}
+        assert seeds == {8000 + seed_index}
 
 
 def test_different_seed_indices_get_different_seeds(campaign):

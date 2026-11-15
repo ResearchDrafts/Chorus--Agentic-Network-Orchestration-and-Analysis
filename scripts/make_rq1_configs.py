@@ -50,6 +50,8 @@ if __package__ in (None, ""):  # `python scripts/make_rq1_configs.py`
 
 from sandbox.config_loader import load_run_config
 from sandbox.models import LANGUAGE_CONDITIONS
+from sandbox.seed_manager import SeedManager
+from sandbox.simulation_orchestrator import _build_strategy
 
 DEFAULT_BASE = Path("configs/rq1/base.yaml")
 DEFAULT_PROBE_QUESTIONS = Path("configs/rq1/probe_questions.yaml")
@@ -120,6 +122,12 @@ EXPERIMENTS: dict[str, dict] = {
     "e9": {
         "delivery": "on",
         "N": RECSYS_N, "graph_degree": RECSYS_GRAPH_DEGREE,
+        # Fix 1: at N=5/degree=6, Watts-Strogatz construction strands enough
+        # nodes below N that most seeds cannot build at all under the
+        # default strict check. allow_short_feed makes e9 mean "up to 5"
+        # the same way e8's recommender already does, so the two arms stay
+        # the matched-feed-size control pair they are meant to be.
+        "allow_short_feed": True,
     },
 }
 
@@ -333,6 +341,8 @@ def build_config(
         config["N"] = overrides["N"]
     if "graph_degree" in overrides:
         config["graph_degree"] = overrides["graph_degree"]
+    if "allow_short_feed" in overrides:
+        config["allow_short_feed"] = overrides["allow_short_feed"]
     if experiment in RECSYS_EXPERIMENTS:
         config["recsys_threshold"] = recsys_threshold
     if experiment in BALANCED_LEAN_EXPERIMENTS:
@@ -526,8 +536,22 @@ def generate(
     # Validated after writing, all of them, so a schema problem in the base is
     # reported once per generated file with the file named -- and so a
     # generator bug cannot leave an unloadable config on disk unremarked.
+    #
+    # Fix 1: loading a config as a schema (load_run_config) is not the same
+    # as the run being able to start -- a graph/graph_similarity config can
+    # pass every schema check and still fail to build its Watts-Strogatz
+    # graph for this seed (the e8/e9 bug this fix exists for). So every
+    # generated config is also built as a strategy, the same object the
+    # orchestrator would construct at run start, with the offending file
+    # named on failure. A config that loads but cannot start should never be
+    # committed to the repo again.
     for row in manifest:
-        load_run_config(out_dir / f"{row['run_id']}.yaml")
+        path = out_dir / f"{row['run_id']}.yaml"
+        run = load_run_config(path)
+        try:
+            _build_strategy(run, SeedManager(run.seed))
+        except Exception as exc:
+            raise ValueError(f"{path}: strategy failed to build: {exc}") from exc
 
     return manifest
 

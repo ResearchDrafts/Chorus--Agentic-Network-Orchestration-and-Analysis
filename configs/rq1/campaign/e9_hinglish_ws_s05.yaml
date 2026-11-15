@@ -4,6 +4,7 @@
 K: 20
 M: 8
 N: 5
+allow_short_feed: true
 alpha: 0.5
 api_base: http://localhost:8000/v1
 bank_path: data/bank/test_bank.csv

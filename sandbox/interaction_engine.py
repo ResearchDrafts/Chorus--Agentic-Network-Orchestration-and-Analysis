@@ -165,6 +165,7 @@ class GraphSampling:
         rewire_p: float,
         k: int,
         graph_seed: int,
+        allow_short_feed: bool = False,
     ):
         if degree < 2:
             raise ValueError(f"degree must be >= 2, got {degree}")
@@ -190,6 +191,14 @@ class GraphSampling:
             raise ValueError("agent_ids must be unique")
 
         self.k = k
+        # Fix 1: at N=5/degree=6 (e8/e9), Watts-Strogatz rewiring during
+        # construction strands enough nodes below k that most seeds cannot
+        # build at all (48 of the originally committed e8/e9 configs failed
+        # this way). allow_short_feed, off by default, is the opt-in that
+        # lets both the construction check and select_neighbors below
+        # deliver fewer than k rather than raising -- every pre-Fix-1 config
+        # leaves this False and keeps today's error byte for byte.
+        self.allow_short_feed = allow_short_feed
         self._agent_ids = list(agent_ids)
         self._graph = nx.connected_watts_strogatz_graph(
             len(agent_ids), degree, rewire_p, seed=graph_seed
@@ -234,8 +243,12 @@ class GraphSampling:
         this node structurally unlike every other, and dropping to k-1 for it
         would give one agent a shorter feed, which is a confound nothing in
         the output records. The fix is a different seed, a higher degree or a
-        lower N, and all three are the caller's to choose.
+        lower N, and all three are the caller's to choose -- unless
+        allow_short_feed opted in to a short feed being the point rather than
+        an error (Fix 1), in which case this check does not run at all.
         """
+        if self.allow_short_feed:
+            return
         short = sorted(
             (self._agent_ids[node], degree)
             for node, degree in self._graph.degree
@@ -275,10 +288,11 @@ class GraphSampling:
                 "(the graph is built once from the initial population)"
             )
         candidates = self._neighbors[speaker.agent_id]
-        if len(candidates) < self.k:
+        if len(candidates) < self.k and not self.allow_short_feed:
             # Never return fewer. A short feed is a different stimulus, and an
             # agent that quietly read two posts where everyone else read three
-            # would be a confound nothing in the output records.
+            # would be a confound nothing in the output records. (Unless
+            # allow_short_feed opted into exactly that -- Fix 1.)
             raise ValueError(
                 f"{speaker.agent_id} has {len(candidates)} graph neighbours, "
                 f"need {self.k}"
@@ -286,7 +300,7 @@ class GraphSampling:
         # Sampled exactly once: a second rng.sample call would both advance
         # the stream twice per agent and return a different set than the one
         # just validated.
-        chosen = rng.sample(candidates, self.k)
+        chosen = rng.sample(candidates, min(self.k, len(candidates)))
         by_id = {a.agent_id: a for a in all_agents}
         missing = set(chosen) - by_id.keys()
         if missing:
@@ -504,6 +518,13 @@ class GraphSimilaritySampling(GraphSampling):
         self.threshold = threshold
         self._feed_info: dict[str, RecsysFeedInfo] = {}
 
+    def _verify_every_node_has_k_neighbours(self, graph_seed: int) -> None:
+        """No-op (Fix 1): this class already allows a feed shorter than k --
+        select_neighbors below delivers "up to k", never padding back up --
+        so a node with fewer than k graph neighbours is not a construction-
+        time error here the way it is for plain GraphSampling."""
+        return
+
     def feed_info(self, agent_id: str) -> RecsysFeedInfo:
         """This round's selection diagnostics for one reader, read back by
         the orchestrator right after select_neighbors ran for every agent.
@@ -540,10 +561,11 @@ class GraphSimilaritySampling(GraphSampling):
         candidate_ids = self.neighbors_of(speaker.agent_id)
 
         if not speaker.stance_history:
-            # No valid probe at all: rank against nothing, fall back to k
-            # random graph neighbours -- the same thing GraphSampling itself
-            # would deliver.
-            chosen_ids = rng.sample(candidate_ids, self.k)
+            # No valid probe at all: rank against nothing, fall back to up to
+            # k random graph neighbours -- the same thing GraphSampling
+            # itself would deliver under allow_short_feed (Fix 1: a reader
+            # with fewer than k graph neighbours cannot sample k of them).
+            chosen_ids = rng.sample(candidate_ids, min(self.k, len(candidate_ids)))
             self._feed_info[speaker.agent_id] = RecsysFeedInfo(
                 feed_size=len(chosen_ids),
                 n_neighbors_over_threshold=None,

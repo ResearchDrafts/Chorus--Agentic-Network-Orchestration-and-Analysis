@@ -669,3 +669,114 @@ def test_nothing_in_the_class_reads_language():
     chosen_en = strategy.select_neighbors(speaker_en, english, turn=1, rng=random.Random(9))
     chosen_hi = strategy.select_neighbors(speaker_hi, hindi, turn=1, rng=random.Random(9))
     assert [a.agent_id for a in chosen_en] == [a.agent_id for a in chosen_hi]
+
+
+# --- Fix 1: allow_short_feed, and e8/e9 build reliably at N=5/degree=6 ---
+
+
+def test_default_graph_sampling_still_raises_on_a_short_node():
+    """allow_short_feed defaults to False, so an un-opted-in config keeps
+    today's construction-time error byte for byte."""
+    with pytest.raises(ValueError, match="fewer than k=5"):
+        _graph(n=20, degree=6, rewire_p=0.1, k=5, graph_seed=1002 + 9_000_003)
+
+
+def test_allow_short_feed_builds_where_the_default_would_raise():
+    """Same seed/degree/k that raises by default succeeds under
+    allow_short_feed, which is the whole point of the flag."""
+    from sandbox.interaction_engine import GraphSampling
+
+    graph_seed = 1002 + 9_000_003
+    with pytest.raises(ValueError):
+        _graph(n=20, degree=6, rewire_p=0.1, k=5, graph_seed=graph_seed)
+    strategy = GraphSampling(
+        _ids(20), degree=6, rewire_p=0.1, k=5, graph_seed=graph_seed,
+        allow_short_feed=True,
+    )
+    assert strategy is not None
+
+
+@pytest.mark.parametrize("M", [8, 20, 50])
+def test_e8_e9_build_for_every_seed_1001_to_1100(M):
+    """The acceptance criterion for Fix 1: e8 (GraphSimilaritySampling) and
+    e9 (GraphSampling with allow_short_feed=True) at N=5/degree=6 must build
+    for every one of these 100 seeds at every one of these population
+    sizes -- before this fix, 29/100 (M=20) and 69/100 (M=50) raised."""
+    from sandbox.interaction_engine import GraphSampling, GraphSimilaritySampling
+    from sandbox.seed_manager import SeedManager
+
+    for seed in range(1001, 1101):
+        graph_seed = SeedManager(seed).graph_seed
+        GraphSampling(
+            _ids(M), degree=6, rewire_p=0.1, k=5, graph_seed=graph_seed,
+            allow_short_feed=True,
+        )
+        GraphSimilaritySampling(
+            _ids(M), degree=6, rewire_p=0.1, k=5, graph_seed=graph_seed,
+            threshold=1.0,
+        )
+
+
+def test_a_short_node_in_e9_delivers_exactly_its_own_neighbour_count():
+    """A node with 4 graph neighbours (one short of k=5) gets exactly 4
+    posts under allow_short_feed, never padded and never raising."""
+    from sandbox.interaction_engine import GraphSampling
+    from sandbox.seed_manager import SeedManager
+
+    graph_seed = SeedManager(1002).graph_seed
+    strategy = GraphSampling(
+        _ids(20), degree=6, rewire_p=0.1, k=5, graph_seed=graph_seed,
+        allow_short_feed=True,
+    )
+    short_agents = [a for a in _ids(20) if len(strategy.neighbors_of(a)) < 5]
+    assert short_agents, "expected this seed to produce at least one short node"
+    agent_id = short_agents[0]
+    expected_n = len(strategy.neighbors_of(agent_id))
+
+    population = _graph_population(20)
+    by_id = {a.agent_id: a for a in population}
+    chosen = strategy.select_neighbors(by_id[agent_id], population, turn=1, rng=random.Random(0))
+    assert len(chosen) == expected_n
+    assert expected_n < 5
+
+
+def test_graph_similarity_sampling_never_runs_the_every_node_check():
+    """GraphSimilaritySampling overrides the check unconditionally -- it
+    does not need allow_short_feed at all, since short feeds are already
+    its normal behaviour."""
+    from sandbox.interaction_engine import GraphSimilaritySampling
+
+    graph_seed = 1002 + 9_000_003
+    with pytest.raises(ValueError):
+        _graph(n=20, degree=6, rewire_p=0.1, k=5, graph_seed=graph_seed)
+    strategy = GraphSimilaritySampling(
+        _ids(20), degree=6, rewire_p=0.1, k=5, graph_seed=graph_seed, threshold=1.0
+    )
+    assert strategy is not None
+
+
+def test_graph_similarity_fallback_samples_min_k_and_neighbour_count():
+    """The no-valid-probe fallback must not call rng.sample(candidates, k)
+    when a reader has fewer than k graph neighbours -- that raises inside
+    random.sample itself rather than delivering a short feed."""
+    from sandbox.interaction_engine import GraphSimilaritySampling
+
+    graph_seed = 1002 + 9_000_003
+    strategy = GraphSimilaritySampling(
+        _ids(20), degree=6, rewire_p=0.1, k=5, graph_seed=graph_seed, threshold=1.0
+    )
+    short_agents = [a for a in _ids(20) if len(strategy.neighbors_of(a)) < 5]
+    assert short_agents
+    agent_id = short_agents[0]
+    expected_n = len(strategy.neighbors_of(agent_id))
+
+    population = _graph_population(20)
+    by_id = {a.agent_id: a for a in population}
+    speaker = by_id[agent_id]
+    assert not speaker.stance_history  # no probe -> fallback path
+
+    chosen = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(0))
+    assert len(chosen) == expected_n
+    info = strategy.feed_info(agent_id)
+    assert info.fallback is True
+    assert info.feed_size == expected_n

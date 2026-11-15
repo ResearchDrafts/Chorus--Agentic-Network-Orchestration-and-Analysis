@@ -927,22 +927,25 @@ and 8,000 interactions. In general, completed campaigns should be stored under
   Nothing about generating, running or analysing an individual config
   depends on `run_campaign.py` -- only running them as an unattended batch
   does.
-- **E8/E9's shipped smoke configs can fail graph construction at seed index
-  5.** `configs/rq1/base.yaml`'s population is `M=8` (a smoke-test
-  placeholder, not a campaign value), and E8/E9 need `N=5` (Jo et al.'s "up
-  to five") with `graph_degree=6` to satisfy it -- `graph_degree` must be
-  even and below `M`, so `6` is the most this population can offer at all.
+- **(Fixed by Fix 1.) E8/E9 used to be able to fail graph construction.**
+  `configs/rq1/base.yaml`'s population is `M=8` (a smoke-test placeholder,
+  not a campaign value), and E8/E9 need `N=5` (Jo et al.'s "up to five")
+  with `graph_degree=6` to satisfy it -- `graph_degree` must be even and
+  below `M`, so `6` is the most this population can offer at all.
   Watts-Strogatz rewiring at `graph_rewire_p=0.1` moves edges around rather
-  than guaranteeing every node keeps `degree` of them, and at this
-  population size `e8_*_s05`/`e9_*_s05` land on a graph where one node has
-  only 4: `GraphSampling`/`GraphSimilaritySampling` raise at construction
-  (not at `--dry-run`, which never builds the graph) rather than silently
-  running one agent short. E3 through E7 do not hit this at their own
-  `N=3`/`graph_degree=4`. This is a property of the smoke-scale placeholder
-  `M`, not of E8/E9's own logic -- a real campaign's `M` (100+) make it
-  vanishingly unlikely -- and raising `M` or picking a different seed for
-  that index is a one-line config change whenever this campaign stops being
-  smoke-scale.
+  than guaranteeing every node keeps `degree` of them, so some seeds landed
+  on a graph where one node had fewer than `N=5` (measured: 29 of 100 seeds
+  at `M=20`, 69 of 100 at `M=50`). `GraphSimilaritySampling` (E8) never ran
+  the every-node-has-k check to begin with -- it already delivers "up to
+  `N`", never padded back up -- and `GraphSampling` (E9) now has the same
+  option via `allow_short_feed: true`, which E9's generated configs set: a
+  short-feed node there delivers `min(N, however many graph neighbours it
+  has)` instead of raising, and its actual feed size is logged the same way
+  E8's is. `allow_short_feed` defaults to `False`, so E3 through E7 keep
+  today's strict behaviour (and today's error) unchanged.
+  `scripts/make_rq1_configs.py` now builds every generated config's
+  strategy, not just its schema, and fails naming the file if any config
+  cannot start -- the class of bug this was.
 - **`check_comprehension.py` ignores two of its own flags.** It takes
   `--sample` and `--start-mode` from the shared argument parser but acts on
   neither, so both are accepted silently and do nothing. Use `--limit` to

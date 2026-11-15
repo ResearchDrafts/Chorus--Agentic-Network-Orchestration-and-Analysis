@@ -678,6 +678,24 @@ class SimulationOrchestrator:
                 if isinstance(recsys, GraphSimilaritySampling)
                 else None
             )
+            if feed is not None:
+                feed_size = feed.feed_size
+                n_neighbors_over_threshold = feed.n_neighbors_over_threshold
+                recsys_fallback = feed.fallback
+            elif isinstance(recsys, GraphSampling) and self._run.allow_short_feed:
+                # Fix 1: e9 (plain "graph" strategy, allow_short_feed=True)
+                # has no RecsysFeedInfo to read back, but neighbor_map
+                # already holds however many neighbours select_neighbors
+                # actually delivered -- its length IS this round's feed
+                # size. Logged only under allow_short_feed, so every other
+                # graph run's feed_size stays None, unchanged.
+                feed_size = len(neighbor_map[agent_id])
+                n_neighbors_over_threshold = None
+                recsys_fallback = None
+            else:
+                feed_size = None
+                n_neighbors_over_threshold = None
+                recsys_fallback = None
             interaction = self._build_bank_interaction(
                 agent=agent,
                 turn=turn,
@@ -688,9 +706,9 @@ class SimulationOrchestrator:
                 reply=reply,
                 probe=probe,
                 no_feed=agent_id in empty_feed_ids,
-                feed_size=feed.feed_size if feed else None,
-                n_neighbors_over_threshold=feed.n_neighbors_over_threshold if feed else None,
-                recsys_fallback=feed.fallback if feed else None,
+                feed_size=feed_size,
+                n_neighbors_over_threshold=n_neighbors_over_threshold,
+                recsys_fallback=recsys_fallback,
             )
             await self._logger.write_interaction(interaction)
             # This round's own probe reading, win or lose: step 8 (rewiring)
@@ -1591,6 +1609,7 @@ def _build_strategy(run: ExperimentRun, seeds: SeedManager) -> RecommendationStr
             rewire_p=run.graph_rewire_p,
             k=run.N,
             graph_seed=seeds.graph_seed,
+            allow_short_feed=run.allow_short_feed,
         )
     return AlphaSampling(run.alpha, run.N)
 
