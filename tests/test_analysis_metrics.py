@@ -455,6 +455,89 @@ def test_the_graph_metric_carries_a_missing_agent_forward():
     assert rounds[1]["n_valid"] == 3 and rounds[1]["n_failed"] == 1
 
 
+# --- Fix 4: polarization_index, belief shift, n_side_switches --------------
+
+
+def test_polarization_index_equals_var_x():
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 0, "x": 1.0},
+        {"speaker_agent_id": "b", "turn": 0, "x": -1.0},
+    ])
+    probes = m.probe_rows(frame, CONFIG, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, CONFIG, None)
+    assert rounds[0]["polarization_index"] == rounds[0]["var_x"] == pytest.approx(1.0)
+
+
+def test_belief_shift_is_measured_against_each_agents_own_round_zero():
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 0, "x": 0.0},
+        {"speaker_agent_id": "b", "turn": 0, "x": 0.5},
+        {"speaker_agent_id": "a", "turn": 1, "x": 0.2},
+        {"speaker_agent_id": "b", "turn": 1, "x": -0.3},
+    ])
+    probes = m.probe_rows(frame, CONFIG, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, CONFIG, None)
+    # round 0 compared against itself: both shifts are 0.
+    assert rounds[0]["mean_belief_shift"] == pytest.approx(0.0)
+    assert rounds[0]["mean_signed_shift"] == pytest.approx(0.0)
+    # a: |0.2 - 0.0| = 0.2, 0.2 - 0.0 = +0.2
+    # b: |-0.3 - 0.5| = 0.8, -0.3 - 0.5 = -0.8
+    assert rounds[1]["mean_belief_shift"] == pytest.approx((0.2 + 0.8) / 2)
+    assert rounds[1]["mean_signed_shift"] == pytest.approx((0.2 - 0.8) / 2)
+
+
+def test_belief_shift_excludes_an_agent_whose_round_zero_probe_failed():
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 0, "x": 0.0},
+        # b has no round-0 row at all: its round-0 probe failed.
+        {"speaker_agent_id": "a", "turn": 1, "x": 0.4},
+        {"speaker_agent_id": "b", "turn": 1, "x": -0.9},
+    ])
+    probes = m.probe_rows(frame, CONFIG, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, CONFIG, None)
+    # Only a contributes: b has no round-0 baseline to compare against.
+    assert rounds[1]["mean_belief_shift"] == pytest.approx(0.4)
+
+
+def test_n_side_switches_is_none_at_round_zero():
+    frame = _frame([{"speaker_agent_id": "a", "turn": 0, "x": 0.5}])
+    probes = m.probe_rows(frame, CONFIG, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, CONFIG, None)
+    assert rounds[0]["n_side_switches"] is None
+
+
+def test_n_side_switches_ignores_agents_exactly_at_the_midpoint():
+    """x == 0 (probe mean == 4) has no side, in either round: an agent
+    there before, after, or both contributes no switch."""
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 0, "x": 0.0},   # midpoint before
+        {"speaker_agent_id": "b", "turn": 0, "x": 0.5},
+        {"speaker_agent_id": "c", "turn": 0, "x": 0.5},
+        {"speaker_agent_id": "a", "turn": 1, "x": 0.2},   # moved off it: not a "switch"
+        {"speaker_agent_id": "b", "turn": 1, "x": 0.0},   # moved TO the midpoint: not a switch
+        {"speaker_agent_id": "c", "turn": 1, "x": -0.5},  # a real switch
+    ])
+    probes = m.probe_rows(frame, CONFIG, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, CONFIG, None)
+    assert rounds[1]["n_side_switches"] == 1
+
+
+def test_n_side_switches_carries_the_side_forward_across_a_missing_round():
+    """Turn 1 has no row at all (every probe failed that round), the same
+    gap the graph metrics carry a reading across -- so turn 2's "previous
+    round" is turn 0's side, not an absence."""
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 0, "x": 0.5},
+        # turn 1: no row for "a" at all
+        {"speaker_agent_id": "a", "turn": 2, "x": -0.5},
+    ])
+    probes = m.probe_rows(frame, CONFIG, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, CONFIG, None)
+    by_turn = {r["turn"]: r for r in rounds}
+    assert sorted(by_turn) == [0, 2]  # turn 1 produced no row
+    assert by_turn[2]["n_side_switches"] == 1
+
+
 def test_outcome_shares_sum_to_one_and_are_null_at_round_zero():
     frame = _frame([
         {"speaker_agent_id": "a", "turn": 0, "x": 0.5},
@@ -490,6 +573,47 @@ def test_run_row_reports_the_change_from_round_zero():
     # Two rounds of changes is fewer than the three-round window, so it
     # cannot have been shown stationary.
     assert row["stationary"] is False and row["t_stationary"] == CONFIG["K"]
+
+
+def test_run_row_aggregates_the_new_echo_metrics():
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 0, "x": 1.0},
+        {"speaker_agent_id": "b", "turn": 0, "x": 1.0},
+        {"speaker_agent_id": "c", "turn": 0, "x": -1.0},
+        {"speaker_agent_id": "d", "turn": 0, "x": -1.0},
+        {"speaker_agent_id": "a", "turn": 1, "x": 1.0},
+        {"speaker_agent_id": "b", "turn": 1, "x": -1.0},  # switches side
+        {"speaker_agent_id": "c", "turn": 1, "x": -1.0},
+        {"speaker_agent_id": "d", "turn": 1, "x": -1.0},
+        {"speaker_agent_id": "a", "turn": 2, "x": 1.0},
+        {"speaker_agent_id": "b", "turn": 2, "x": -1.0},  # stays: no switch
+        {"speaker_agent_id": "c", "turn": 2, "x": -1.0},
+        {"speaker_agent_id": "d", "turn": 2, "x": -1.0},
+    ])
+    config = {**CONFIG, "M": 4}
+    probes = m.probe_rows(frame, config, TAU, TAU_CONF)
+    rounds = m.round_rows(
+        frame, probes, config, FOUR_NODES, rewires={1: 2, 2: 1}
+    )
+    row = m.run_row(rounds, probes, config, EPSILON)
+
+    # 0 at round 0 (no entry) + 2 + 1.
+    assert row["total_rewires"] == 3
+    # Only b switches, at turn 1; turn 0 is None and contributes nothing.
+    assert row["total_side_switches"] == 1
+    assert row["final_polarization_index"] == row["final_var_x"]
+    # turn 0: {a:1,b:1,c:-1,d:-1} -> var 1.0. turn 2: {a:1,b:-1,c:-1,d:-1}
+    # -> mean -0.5, var ((1.5)^2 + 3*(0.5)^2) / 4 = 0.75.
+    assert rounds[0]["polarization_index"] == pytest.approx(1.0)
+    assert row["final_polarization_index"] == pytest.approx(0.75)
+    assert row["delta_polarization_index"] == pytest.approx(0.75 - 1.0)
+    # turn 0: every edge agrees exactly -> 0.0. turn 2: a-b disagree by 2
+    # (DG 4 each), c-d agree (DG 0 each) -> (4+4+0+0) / (2*4) = 1.0.
+    assert rounds[0]["global_disagreement"] == pytest.approx(0.0)
+    assert row["final_global_disagreement"] == pytest.approx(1.0)
+    assert row["delta_global_disagreement"] == pytest.approx(1.0)
+    assert row["delta_nci"] is not None
+    assert row["auc_nci_excess"] is not None
 
 
 def test_run_row_carries_the_reply_truncated_rate_through():

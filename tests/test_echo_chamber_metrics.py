@@ -203,3 +203,184 @@ def test_minority_share_excludes_undecided_agents():
 
 def test_minority_share_is_none_when_nobody_has_a_side():
     assert m.minority_share({"a": 0.0, "b": 0.0}) is None
+
+
+# --- Fix 4: global_disagreement, (pairwise/local) disagreement, nci, -------
+# --- bimodality, on hand-built six-node graphs ------------------------------
+#
+# Two separated camps (two disjoint triangles) and a mixed ring (alternating
+# sides around a 6-cycle) use the SAME multiset of x values -- three +1s and
+# three -1s -- so pairwise_disagreement, which ignores structure entirely,
+# is identical on both; every structural metric differs.
+
+TWO_CAMPS = nx.Graph([
+    ("a", "b"), ("b", "c"), ("a", "c"),  # triangle 1
+    ("d", "e"), ("e", "f"), ("d", "f"),  # triangle 2, no edge to triangle 1
+])
+MIXED_RING = nx.Graph([
+    ("a", "b"), ("b", "c"), ("c", "d"), ("d", "e"), ("e", "f"), ("f", "a"),
+])
+CAMPS_X = {"a": 1.0, "b": 1.0, "c": 1.0, "d": -1.0, "e": -1.0, "f": -1.0}
+RING_X = {"a": 1.0, "b": -1.0, "c": 1.0, "d": -1.0, "e": 1.0, "f": -1.0}
+ALL_EQUAL_X = {n: 0.5 for n in "abcdef"}
+
+
+def test_global_disagreement_is_zero_within_two_separated_camps():
+    """Every edge joins two agents who agree exactly, so every DG_i is 0."""
+    assert m.global_disagreement(TWO_CAMPS, CAMPS_X, population=6) == pytest.approx(0.0)
+
+
+def test_global_disagreement_on_a_mixed_ring():
+    """Each node's two ring neighbours are both on the opposite side (diff
+    2, squared 4), so DG_i = 4 for every node: DG = (6 * 4) / (2 * 6) = 2."""
+    assert m.global_disagreement(MIXED_RING, RING_X, population=6) == pytest.approx(2.0)
+
+
+def test_global_disagreement_on_a_graph_with_an_isolated_node():
+    """The isolated node has no neighbour and contributes no DG_i, but the
+    denominator is still the full population -- not the count of agents
+    that qualified."""
+    graph = nx.Graph([("a", "b"), ("c", "d")])
+    graph.add_node("iso")  # no edges at all
+    x = {"a": 1.0, "b": 1.0, "c": -1.0, "d": -1.0, "iso": 5.0}
+    # a-b and c-d each agree exactly: both DG_i = 0. Population is 5.
+    assert m.global_disagreement(graph, x, population=5) == pytest.approx(0.0)
+
+
+def test_global_disagreement_is_none_when_nobody_has_a_known_neighbour():
+    graph = nx.Graph()
+    graph.add_node("iso")
+    assert m.global_disagreement(graph, {"iso": 1.0}, population=1) is None
+    assert m.global_disagreement(None, {"a": 1.0}, population=1) is None
+
+
+def test_pairwise_disagreement_ignores_structure():
+    """Same multiset of values, no graph at all: 9 cross-camp pairs (of 15)
+    differ by 2, so the mean is 18 / 15 = 1.2 -- identical for the camps'
+    values and the ring's, since both are three +1s and three -1s."""
+    assert m.pairwise_disagreement(CAMPS_X) == pytest.approx(1.2)
+    assert m.pairwise_disagreement(RING_X) == pytest.approx(1.2)
+
+
+def test_pairwise_disagreement_is_none_below_two_agents():
+    assert m.pairwise_disagreement({"a": 1.0}) is None
+
+
+def test_local_disagreement_on_two_separated_camps_is_zero():
+    assert m.local_disagreement(TWO_CAMPS, CAMPS_X) == pytest.approx(0.0)
+
+
+def test_local_disagreement_on_a_mixed_ring():
+    """Every edge differs by exactly 2."""
+    assert m.local_disagreement(MIXED_RING, RING_X) == pytest.approx(2.0)
+
+
+def test_local_disagreement_is_none_with_no_surviving_edge():
+    assert m.local_disagreement(None, {"a": 1.0}) is None
+
+
+def test_disagreement_ratio_below_one_means_neighbours_agree_more_than_random():
+    """Two camps: local 0.0 / pairwise 1.2 = 0.0 -- neighbours agree
+    completely, far below two random agents."""
+    ratio = m.disagreement_ratio(
+        m.local_disagreement(TWO_CAMPS, CAMPS_X),
+        m.pairwise_disagreement(CAMPS_X),
+    )
+    assert ratio == pytest.approx(0.0)
+
+
+def test_disagreement_ratio_above_one_means_neighbours_disagree_more_than_random():
+    """Mixed ring: local 2.0 / pairwise 1.2 = 5/3 -- every edge joins
+    opposite sides, worse than two random agents."""
+    ratio = m.disagreement_ratio(
+        m.local_disagreement(MIXED_RING, RING_X),
+        m.pairwise_disagreement(RING_X),
+    )
+    assert ratio == pytest.approx(5 / 3)
+
+
+def test_disagreement_ratio_is_none_when_everyone_agrees():
+    """Both local and pairwise disagreement are exactly 0: the ratio is
+    0/0, undefined -- not 0 ("neighbours agree less than random"), since
+    there is no disagreement anywhere to compare."""
+    local = m.local_disagreement(TWO_CAMPS, ALL_EQUAL_X)
+    pairwise = m.pairwise_disagreement(ALL_EQUAL_X)
+    assert local == pytest.approx(0.0) and pairwise == pytest.approx(0.0)
+    assert m.disagreement_ratio(local, pairwise) is None
+
+
+# --- nci and its permutation null -------------------------------------------
+
+
+def test_nci_is_perfect_within_two_separated_camps():
+    """Every node's neighbours all share its own exact value, so each
+    node's neighbour-mean equals its own x: a perfect correlation."""
+    assert m.nci(TWO_CAMPS, CAMPS_X) == pytest.approx(1.0)
+
+
+def test_nci_is_perfectly_negative_on_a_mixed_ring():
+    """Every node's two ring neighbours are both on the opposite side, so
+    the neighbour-mean is the exact negation of the node's own x."""
+    assert m.nci(MIXED_RING, RING_X) == pytest.approx(-1.0)
+
+
+def test_nci_is_none_when_everyone_agrees():
+    """Zero variance on both sides of the correlation: None, not 0 ("no
+    relationship"), since there is no spread to correlate."""
+    assert m.nci(TWO_CAMPS, ALL_EQUAL_X) is None
+
+
+def test_nci_null_is_reproducible_from_the_same_seed_key():
+    first = m.nci_null(MIXED_RING, RING_X, "1001|3|nci_null")
+    second = m.nci_null(MIXED_RING, RING_X, "1001|3|nci_null")
+    assert first == second
+
+
+def test_nci_null_differs_across_seed_keys():
+    a = m.nci_null(MIXED_RING, RING_X, "1001|3|nci_null")
+    b = m.nci_null(MIXED_RING, RING_X, "1001|4|nci_null")
+    assert a != b
+
+
+def test_nci_null_is_none_when_nci_itself_is_none():
+    assert m.nci_null(TWO_CAMPS, ALL_EQUAL_X, "k") == (None, None)
+    assert m.nci_null(None, CAMPS_X, "k") == (None, None)
+
+
+def test_a_perfectly_polarized_network_clears_its_own_nci_null():
+    """Two 3-node camps only has 2/C(6,3) = 10% of permutations landing a
+    perfect split by chance, which the 97.5th-percentile null still
+    reaches; two 5-cliques (as assortativity's own analogous test uses)
+    makes a perfect permutation rare enough (2/C(10,5) = 252, under 1%)
+    that the null's upper tail sits reliably below the real value."""
+    pro = [f"p{i}" for i in range(5)]
+    con = [f"c{i}" for i in range(5)]
+    wide = nx.Graph()
+    for group in (pro, con):
+        for i, u in enumerate(group):
+            for v in group[i + 1:]:
+                wide.add_edge(u, v)
+    x = {**{n: 1.0 for n in pro}, **{n: -1.0 for n in con}}
+    nci_value = m.nci(wide, x)
+    null_mean, null_hi = m.nci_null(wide, x, "seed|1")
+    assert nci_value == pytest.approx(1.0)
+    assert null_mean < nci_value and null_hi < nci_value
+
+
+# --- bimodality --------------------------------------------------------------
+
+
+def test_bimodality_of_a_perfect_two_point_split():
+    """Three +1s and three -1s: mean 0, m2 = 1, m3 = 0 (symmetric), m4 = 1.
+    g = 0, k = 1/1 - 3 = -2. denom = -2 + 3*25/(4*3) = 4.25 = 17/4.
+    bimodality = 1 / (17/4) = 4/17."""
+    values = [1.0, 1.0, 1.0, -1.0, -1.0, -1.0]
+    assert m.bimodality(values) == pytest.approx(4 / 17)
+
+
+def test_bimodality_is_none_below_four_values():
+    assert m.bimodality([1.0, 2.0, 3.0]) is None
+
+
+def test_bimodality_is_none_when_variance_is_zero():
+    assert m.bimodality([1.0, 1.0, 1.0, 1.0]) is None
