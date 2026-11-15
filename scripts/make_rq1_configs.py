@@ -60,9 +60,46 @@ DEFAULT_BASE_SEED = 1000
 # The graph the campaign runs on, as it appears in a filename.
 STRUCTURE = "ws"
 
-# delivery on / delivery off. The names are the ones the RQ1 plan uses, and
-# analysis/metrics.py reads the experiment back off the run_id prefix.
-EXPERIMENTS = {"e3": "on", "e4": "off"}
+# rewire_rate for E5's three arms. 0.3 is the one number the design asks
+# the generator to set, named after base.yaml's own comment on rewire_rate
+# ("the campaign's echo_rewire_rate") -- it cannot be a literal key IN
+# base.yaml, because base.yaml validates as a complete ExperimentRun on its
+# own (ExperimentRun.model_config forbids unknown fields, and
+# test_the_shipped_base_config_is_a_valid_bank_regime_run loads it exactly
+# that way), and an echo_rewire_rate field the schema does not define would
+# fail that load. So it lives here, where e3/e4's own delivery values
+# already live, rather than in the base config.
+ECHO_REWIRE_RATE = 0.3
+
+# delivery / rewire_rate / rewire_target per experiment. e3/e4 are
+# unchanged: rewire_rate and rewire_target are simply absent from their
+# overrides, so build_config leaves base.yaml's own rewire_rate=0.0 in
+# place, byte for byte. e5/e6/e7 are E5's echo-chamber arms: e5 is the
+# treatment (rewiring on, delivery on), e6 is its control (rewiring on the
+# shadow items under delivery off -- the same mirror E4 is for E3), and e7
+# is rewiring without selection (rewire_target="random"), a control for
+# whether rewiring ALONE -- without choosing same-side neighbours --
+# produces any sorting. analysis/metrics.py reads the experiment back off
+# the run_id prefix for all five.
+EXPERIMENTS: dict[str, dict] = {
+    "e3": {"delivery": "on"},
+    "e4": {"delivery": "off"},
+    "e5": {"delivery": "on", "rewire_rate": ECHO_REWIRE_RATE, "rewire_target": "same_side"},
+    "e6": {"delivery": "off", "rewire_rate": ECHO_REWIRE_RATE, "rewire_target": "same_side"},
+    "e7": {"delivery": "on", "rewire_rate": ECHO_REWIRE_RATE, "rewire_target": "random"},
+}
+
+# Experiments whose starting leans are balanced across stance_scale rather
+# than drawn uniformly at random (see ExperimentRun.lean_assignment): every
+# echo-chamber arm, so a population that happens to start lopsided toward
+# one pole does not confound "formed an echo chamber faster" with "started
+# closer to one already".
+BALANCED_LEAN_EXPERIMENTS = frozenset({"e5", "e6", "e7"})
+
+# The default --experiments: unchanged from before E5 existed, so a
+# generator invocation with no flag produces exactly the E3/E4 campaign it
+# always has.
+DEFAULT_EXPERIMENTS = ("e3", "e4")
 
 MANIFEST_COLUMNS = ("run_id", "experiment", "language", "seed_index", "seed")
 
@@ -154,21 +191,34 @@ def build_config(
     seed_index: int,
     base_seed: int,
 ) -> dict:
-    """One campaign config: the base, with the six generated fields set."""
+    """One campaign config: the base, with the generated fields set.
+
+    Six fields for every experiment (run_id, language_condition,
+    probe_question, delivery, seed, trial_number, per GENERATED_FIELDS),
+    plus -- for e5/e6/e7 only -- rewire_rate, rewire_target and
+    lean_assignment, which base.yaml does not set at all (rewire_rate stays
+    its schema default of 0.0 there, and e3/e4 inherit that unchanged).
+    """
     config = dict(base)
+    overrides = EXPERIMENTS[experiment]
     config["run_id"] = run_id_for(experiment, language, seed_index)
     config["language_condition"] = language
     config["probe_question"] = probe_question
-    config["delivery"] = EXPERIMENTS[experiment]
+    config["delivery"] = overrides["delivery"]
     # base_seed + i, not a hash of anything about the arm. The four languages
-    # and the two experiments of one seed index share this number, which is
-    # what makes them a matched set.
+    # and the experiments of one seed index share this number, which is what
+    # makes them a matched set.
     config["seed"] = base_seed + seed_index
     config["trial_number"] = seed_index
+    if "rewire_rate" in overrides:
+        config["rewire_rate"] = overrides["rewire_rate"]
+        config["rewire_target"] = overrides["rewire_target"]
+    if experiment in BALANCED_LEAN_EXPERIMENTS:
+        config["lean_assignment"] = "balanced"
     if config["delivery"] == "on":
-        # An E3 run never opens the neutral bank, so recording one in its
-        # run_config.json would claim it read something it did not. The E4
-        # control keeps it, and requires it.
+        # A delivery-on run never opens the neutral bank, so recording one in
+        # its run_config.json would claim it read something it did not. A
+        # delivery-off control (e4, e6) keeps it, and requires it.
         config.pop("neutral_bank_path", None)
     return config
 
@@ -228,21 +278,45 @@ def generate(
     languages: list[str],
     seeds: int,
     base_seed: int,
+    experiments: list[str] = DEFAULT_EXPERIMENTS,
 ) -> list[dict]:
     """Writes every config, validates each, and returns the manifest rows.
 
     Ordered by seed index, then experiment, then language -- the same order
     `run_campaign.py` runs them in, so the manifest reads as the plan.
+
+    `experiments` defaults to e3/e4 only, so a generator invocation with no
+    `--experiments` flag produces exactly the campaign it always has.
+    Passing e5/e6/e7 adds E5's echo-chamber arms alongside (or instead of)
+    them; every seed index still shares one seed across whichever
+    experiments are requested, the same matched-set guarantee e3/e4 already
+    give.
     """
     if seeds < 1:
         raise ValueError(f"--seeds must be >= 1, got {seeds}")
+    unknown = sorted(set(experiments) - set(EXPERIMENTS))
+    if unknown:
+        raise ValueError(
+            f"unknown experiment(s) {unknown}; expected one or more of "
+            f"{list(EXPERIMENTS)}"
+        )
     base = load_base(base_path)
     questions = load_probe_questions(probe_questions_path, languages)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # The exact original phrasing when experiments is the original default,
+    # so the --experiments flag's mere existence does not change a byte of
+    # what `make_rq1_configs.py` with no flag produces (and so the checked-in
+    # configs/rq1/campaign/ -- generated with no flag -- stays in sync).
+    experiments_note = (
+        "and by E3 and E4."
+        if list(experiments) == list(DEFAULT_EXPERIMENTS)
+        else f"and by every experiment in this campaign ({', '.join(experiments)})."
+    )
+
     manifest: list[dict] = []
     for seed_index in range(1, seeds + 1):
-        for experiment in EXPERIMENTS:
+        for experiment in experiments:
             for language in languages:
                 config = build_config(
                     base,
@@ -258,7 +332,7 @@ def generate(
                     config,
                     base_path,
                     f"Seed {config['seed']} is shared by all four languages "
-                    "and by E3 and E4.",
+                    f"{experiments_note}",
                 )
                 manifest.append(
                     {
@@ -329,6 +403,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--languages", nargs="+", default=list(LANGUAGE_CONDITIONS),
         choices=list(LANGUAGE_CONDITIONS),
     )
+    parser.add_argument(
+        "--experiments", nargs="+", default=list(DEFAULT_EXPERIMENTS),
+        choices=list(EXPERIMENTS),
+        help="which experiments to generate "
+             f"(default: {' '.join(DEFAULT_EXPERIMENTS)}). Add e5/e6/e7 for "
+             "E5's echo-chamber arms: e5 (rewiring on), e6 (its shadow-item "
+             "control) and e7 (rewiring without selection).",
+    )
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     return parser
 
@@ -342,6 +424,7 @@ def main(argv: list[str] | None = None) -> int:
         languages=args.languages,
         seeds=args.seeds,
         base_seed=args.base_seed,
+        experiments=args.experiments,
     )
     manifest_path = args.out / "manifest.csv"
     write_manifest(manifest_path, manifest)
@@ -349,13 +432,13 @@ def main(argv: list[str] | None = None) -> int:
     runs = [row for row in manifest if row["experiment"] != "single"]
     print(f"\n{args.out}/")
     print(f"  {len(runs)} campaign configs "
-          f"({args.seeds} seed indices x {len(EXPERIMENTS)} experiments "
-          f"x {len(args.languages)} languages)")
+          f"({args.seeds} seed indices x {len(args.experiments)} experiments "
+          f"({', '.join(args.experiments)}) x {len(args.languages)} languages)")
     print(f"  {len(manifest) - len(runs)} single-reader base configs")
     print(f"  {manifest_path}")
     print(
         f"\n  seeds {args.base_seed + 1}..{args.base_seed + args.seeds}, "
-        "each shared by every language and both experiments"
+        f"each shared by every language and every experiment requested"
     )
     return 0
 

@@ -67,13 +67,21 @@ class AgentManager:
 
         Deterministic given the same seed: persona assignment order and
         initial-stance draws both consume from self._rng in a fixed order
-        (persona first, then stance).
+        (persona first, then stance) under lean_assignment="random"; under
+        "balanced" the whole population's leans are drawn once, up front,
+        in the same stream position the per-agent draws would otherwise
+        occupy (see _balanced_leans).
         """
         personas = self._load_persona_pool()
+        leans = (
+            self._balanced_leans()
+            if self._run.lean_assignment == "balanced"
+            else None
+        )
         agents = []
         for i in range(self._run.M):
             persona = personas[i % len(personas)]  # cycle if M > pool size
-            stance = self._draw_initial_stance()
+            stance = leans[i] if leans is not None else self._draw_initial_stance()
             agent = Agent(
                 agent_id=agent_id_for(i),
                 run_id=self._run.run_id,
@@ -99,6 +107,36 @@ class AgentManager:
         # self._rng, NOT the global random module, for reproducibility.
         scale = self._run.stance_scale
         return float(self._rng.choice(scale))
+
+    def _balanced_leans(self) -> list[float]:
+        """M leans with every stance_scale point represented as evenly as
+        possible, shuffled -- so a "balanced" run starts with the same MIX
+        of camps on every seed, and only the ASSIGNMENT of that mix to
+        particular agents varies with the seed.
+
+        Built as stance_scale repeated whole as many times as it divides
+        into M, plus the first `remainder` points of the scale, in the
+        scale's own order (e.g. for M=20 over a 7-point scale: two full
+        passes of all 7 points, plus points 1-6 once more), then shuffled
+        as one list. The remainder is deterministic -- never drawn from
+        self._rng -- which is what makes the multiset itself independent
+        of the seed: a seeded `sample` of the remainder would let different
+        seeds exclude different scale points from their third pass, so two
+        seeds could disagree about which points are even represented
+        3 times, and "every seed starts with the same mix of leans" would
+        be false.
+
+        The shuffle is the only step that consumes self._rng, in the same
+        stream position _draw_initial_stance's own choice() calls would
+        otherwise occupy -- a "balanced" run and a "random" run of the same
+        seed start from the same point in the stream; they just use what
+        comes off it differently.
+        """
+        scale = self._run.stance_scale
+        full_blocks, remainder = divmod(self._run.M, len(scale))
+        leans = list(scale) * full_blocks + list(scale)[:remainder]
+        self._rng.shuffle(leans)
+        return leans
 
     def get_agent(self, agent_id: str) -> Agent:
         """Raises KeyError if agent_id is unknown -- treated as a

@@ -98,6 +98,12 @@ class SeedManager:
         "argument": 3_000_003,
         "probe": 4_000_003,
         "reply": 5_000_003,
+        # E5's rewiring stream. One draw per read post, every round, whether
+        # or not that post turns out to be opposite-side -- the same
+        # unconditional-draw discipline _resolve_side uses for its tie-break
+        # -- so the stream's position is a function of how many posts were
+        # read, never of any agent's stance.
+        "rewire": 6_000_003,
     }
 
     def turn_rng(self, purpose: str, turn: int) -> random.Random:

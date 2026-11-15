@@ -67,6 +67,19 @@ NETWORK_METRICS = (
     "t_stationary",
 )
 
+# E5's echo-chamber metrics, contrasted separately: language minus English
+# within e5 (rewiring on) and within e6 (the shadow-item control), and the
+# difference-in-differences between them. Not folded into NETWORK_METRICS,
+# whose e3/e4 contrast main() always runs regardless of which experiments a
+# campaign happens to contain -- these only make sense, and only get run, for
+# a campaign that actually has e5/e6 runs (see main()).
+ECHO_METRICS = (
+    "t_echo",
+    "auc_assort_excess",
+    "final_assort_excess",
+    "final_cross_side_edge_share",
+)
+
 # Bootstrap settings. Seeded, so re-running the analysis reproduces the
 # interval: a confidence interval that moved between two runs of the same
 # script on the same data would be impossible to report.
@@ -522,38 +535,56 @@ NETWORK_COLUMNS = (
 )
 
 
-def network_contrasts(frame: pd.DataFrame) -> list[dict]:
-    """Three scopes per metric per language: within E3, within E4, and DiD.
+def network_contrasts(
+    frame: pd.DataFrame,
+    metrics: tuple[str, ...] = NETWORK_METRICS,
+    experiment_pair: tuple[str, str] = ("e3", "e4"),
+) -> list[dict]:
+    """Three scopes per metric per language: within the treatment, within
+    the control, and the difference-in-differences between them.
 
-    The difference-in-differences is the primary one. A raw E3 difference
-    between English and Hindi mixes two things: what the language did to how
-    agents persuade each other, and what it did to the measurement itself --
-    a Hindi probe prompt is longer, tokenizes differently, and the reading
-    drifts differently under it. The E4 control is exposed to the second and
-    not the first, because its agents read nothing that argues anything. So
-    E3-minus-E4 is the part attributable to the manipulation, and the two
-    within-experiment rows are reported alongside it because a DiD near zero
-    means something quite different depending on whether both halves were
-    near zero or both were large.
+    The difference-in-differences is the primary one. A raw treatment
+    difference between English and Hindi mixes two things: what the
+    language did to how agents persuade each other, and what it did to the
+    measurement itself -- a Hindi probe prompt is longer, tokenizes
+    differently, and the reading drifts differently under it. The control
+    is exposed to the second and not the first, because its agents read
+    nothing that argues anything. So treatment-minus-control is the part
+    attributable to the manipulation, and the two within-experiment rows
+    are reported alongside it because a DiD near zero means something quite
+    different depending on whether both halves were near zero or both were
+    large.
+
+    `experiment_pair` generalizes this beyond E3/E4: the default reproduces
+    E3-vs-E4 exactly (including the "within_e3"/"within_e4"/"E3"/"E4" scope
+    and label strings, byte for byte), and main() calls this a second time
+    with `metrics=ECHO_METRICS, experiment_pair=("e5", "e6")` for E5's
+    echo-chamber contrast -- treatment e5 (rewiring on) against e6, which
+    runs the same rewiring rule over shadow items instead of delivered ones.
     """
+    treatment, control = experiment_pair
     languages = [
         language
         for language in sorted(frame.language.unique())
         if language != REFERENCE_LANGUAGE
     ]
     rows: list[dict] = []
-    for metric in NETWORK_METRICS:
+    for metric in metrics:
         for language in languages:
-            e3 = paired_differences(frame, metric, "e3", language)
-            e4 = paired_differences(frame, metric, "e4", language)
+            treated = paired_differences(frame, metric, treatment, language)
+            baseline = paired_differences(frame, metric, control, language)
             did = {
-                seed: e3[seed] - e4[seed]
-                for seed in sorted(set(e3) & set(e4))
+                seed: treated[seed] - baseline[seed]
+                for seed in sorted(set(treated) & set(baseline))
             }
             for scope, values, label in (
-                ("within_e3", e3, f"{language} - {REFERENCE_LANGUAGE} (E3)"),
-                ("within_e4", e4, f"{language} - {REFERENCE_LANGUAGE} (E4)"),
-                ("did", did, f"({language} - {REFERENCE_LANGUAGE}), E3 - E4"),
+                (f"within_{treatment}", treated,
+                 f"{language} - {REFERENCE_LANGUAGE} ({treatment.upper()})"),
+                (f"within_{control}", baseline,
+                 f"{language} - {REFERENCE_LANGUAGE} ({control.upper()})"),
+                ("did", did,
+                 f"({language} - {REFERENCE_LANGUAGE}), "
+                 f"{treatment.upper()} - {control.upper()}"),
             ):
                 rows.append(
                     _network_row(metric, scope, language, label, values)
@@ -659,6 +690,26 @@ def main(argv: list[str] | None = None) -> int:
 
     runs = load_run_metrics(args.results)
     network = network_contrasts(runs)
+    # E5's echo-chamber contrast runs only when the campaign actually has
+    # e5/e6 runs in it. Two guards, not one: a campaign with no e5/e6 runs
+    # must not grow extra all-None, n=0 rows in network_contrasts.csv (every
+    # existing e3/e4-only campaign), and a run_metrics.csv written before
+    # this feature existed has no ECHO_METRICS columns to read at all --
+    # load_run_metrics only requires NETWORK_METRICS, so that case is
+    # reached, not raised, and is reported rather than silently skipped.
+    has_echo_runs = bool({"e5", "e6"} & set(runs.get("experiment", pd.Series(dtype=object))))
+    if has_echo_runs:
+        missing_echo = [m for m in ECHO_METRICS if m not in runs.columns]
+        if missing_echo:
+            print(
+                f"  WARNING: e5/e6 runs are present but run_metrics.csv has no "
+                f"{missing_echo} column(s) -- re-run analysis.metrics to pick "
+                "up the echo-chamber metrics. Skipping the echo-chamber contrast."
+            )
+        else:
+            network += network_contrasts(
+                runs, metrics=ECHO_METRICS, experiment_pair=("e5", "e6")
+            )
     if not network:
         print("no non-English arms in run_metrics.csv to contrast", file=sys.stderr)
         return 1
