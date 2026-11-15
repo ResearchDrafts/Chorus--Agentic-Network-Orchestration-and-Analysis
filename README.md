@@ -437,28 +437,44 @@ with `--experiments e3 e4 e5 e6 e7 e8 e9 --seeds 6 --rounds 20` (e8/e9 are
 Fix 9's similarity recommender, below).
 
 **Metrics**, per round in `round_metrics.csv` and as `final_*`/run-level
-values in `run_metrics.csv` (`analysis/metrics.py`). Wang et al.,
-"Decoding Echo Chambers" (COLING 2025), use opinions in `[-2, 2]`; this
-codebase's `x` is in `[-1, 1]`, so their `Pz` and `DG` read 4x ours for the
-same underlying state -- a scale factor, not a different quantity.
+values in `run_metrics.csv` (`analysis/metrics.py`). `polarization_index`
+(`Pz`), `global_disagreement` (`DG`) and `nci` (`NCI`) follow Jo et al.,
+"Model-Specific Echo Chamber Formation Patterns in Repeated LLM Agent
+Networks" (IAIT 2026), Eq. 1-3 literally, computed on `v = 2x` -- their own
+`[-2, 2]` scale, where this codebase's `x` is `[-1, 1]`, so `Pz`/`DG` read
+4x this codebase's x-based equivalents for the same underlying state.
+`pairwise_disagreement`/`local_disagreement` are also on `v`;
+`disagreement_ratio` is unaffected, being a same-scale ratio of the two.
+`neighbor_corr` is the Pearson correlation Wang et al., "Decoding Echo
+Chambers" (COLING 2025), describe in text as their own NCI -- a different
+quantity from Jo et al.'s NCI (a perfectly anti-correlated alternating
+ring scores `neighbor_corr = -1` but `nci = 0`, not -1), kept under this
+name rather than conflated with `nci`.
+
+When opinions are placed on the graph at random, `nci` works out to about
+`1 - n / (2 * (n - 1))` -- `0.47` at `n = 20` -- so `0.5`, not `0`, is
+roughly the "no neighbour alignment" baseline this index sits around.
 
 | Column | Definition | Notes |
 |---|---|---|
 | `assort_null_mean` / `assort_null_hi` | 1,000-draw permutation null of assortativity over the round's graph | `assort_excess` = assortativity above the null mean |
 | `cross_side_edge_share` | share of edges whose ends disagree in sign of `x` | `x == 0` agents excluded on either end |
 | `minority_share` | the smaller side's population share | guards `t_echo` against reporting consensus as an echo chamber |
-| `polarization_index` | `(1/M) * sum((x_i - mean(x))^2)` | Wang et al.'s `Pz`; identical to `var_x`, kept under both names |
-| `global_disagreement` | mean squared disagreement with one's own neighbours, population-normalized | Wang et al.'s `DG` |
-| `pairwise_disagreement` | mean \|x_i - x_j\| over all agent pairs | population-wide baseline for `disagreement_ratio` |
-| `local_disagreement` | mean \|x_i - x_j\| over this round's edges | |
-| `disagreement_ratio` | `local_disagreement / pairwise_disagreement` | below 1: neighbours disagree less than two random agents |
-| `nci` / `nci_null_mean` / `nci_null_hi` / `nci_excess` | correlation between an agent's own `x` and its neighbours' mean `x`, with a permutation null built like assortativity's | Wang et al.'s NCI, by their text description (their printed formula does not match it) |
+| `polarization_index` | `(1/n) * sum((v_i - mean(v))^2)`, `v = 2x` | Jo et al.'s `Pz` (Eq. 1); equals `4 * var_x` on the same agents |
+| `global_disagreement` | `(1/(2n)) * sum_i [mean over i's known neighbours of (v_i - v_j)^2]` | Jo et al.'s `DG` (Eq. 2); `n` is agents in the graph with a known reading, the same set `nci` uses for its own `Pz`/`DG` |
+| `pairwise_disagreement` | mean \|v_i - v_j\| over all agent pairs | population-wide baseline for `disagreement_ratio` |
+| `local_disagreement` | mean \|v_i - v_j\| over this round's edges | |
+| `disagreement_ratio` | `local_disagreement / pairwise_disagreement` | below 1: neighbours disagree less than two random agents; unaffected by the x-vs-v scale |
+| `nci` / `nci_null_mean` / `nci_null_hi` / `nci_excess` | `1 - DG / (2 * Pz)`, with a permutation null built like assortativity's | Jo et al.'s NCI (Eq. 3); `None` when `Pz` is 0 |
+| `neighbor_corr` / `neighbor_corr_null_mean` / `neighbor_corr_null_hi` / `neighbor_corr_excess` | correlation between an agent's own `x` and its neighbours' mean `x` | Wang et al.'s own NCI, by their text description -- kept separate from `nci` (see above) |
 | `bimodality` | Sarle's coefficient | above 5/9 suggests two separated groups rather than one wide one |
-| `mean_belief_shift` / `mean_signed_shift` | mean \|x(t) - x(0)\| / mean signed version, agents with a valid probe at both rounds | |
+| `mean_belief_shift` | `mean(v(t)) - mean(v(0))`, signed, agents with a valid probe at both rounds | equals the difference of the two rounds' group means over that same set |
+| `mean_belief_shift_from_r1` | same, against round 1 instead of round 0 | `None` at round 0; Jo et al.'s own baseline round, which this codebase's pre-interaction round 0 is not |
+| `mean_abs_individual_shift` | mean \|v_i(t) - v_i(0)\| over the same agents | what `mean_belief_shift` held before this table's current definitions |
 | `n_rewires` / `n_side_switches` | rewires applied this round / agents whose side differs from last round | read together: the sorting-versus-conversion race |
 | `t_echo` | the earlier round of the first 2 **consecutive** rounds where assortativity clears its own null **and** `minority_share >= 0.2` | `K + 1` with `echo_censored = True` if no such window exists within `K` rounds |
-| `auc_assort_excess` / `auc_nci_excess` | mean `assort_excess` / `nci_excess` over rounds 1..K | need no threshold, unlike `t_echo`; **`auc_nci_excess` is the primary echo-chamber outcome**, since it is defined for every run, censored or not |
-| `delta_polarization_index` / `delta_global_disagreement` / `delta_nci` | final minus round 0 | |
+| `auc_assort_excess` / `auc_nci_excess` / `auc_neighbor_corr_excess` | mean `assort_excess` / `nci_excess` / `neighbor_corr_excess` over rounds 1..K | need no threshold, unlike `t_echo`; **`auc_nci_excess` is the primary echo-chamber outcome**, since it is defined for every run, censored or not |
+| `delta_polarization_index` / `delta_global_disagreement` / `delta_nci` / `delta_neighbor_corr` | final minus round 0 | |
 | `total_side_switches` / `total_rewires` | summed over the run | |
 
 `analysis.stats` runs two contrast families: e5-vs-e6 (delivery) and
@@ -562,13 +578,18 @@ follows.
 **Statistics.** `analysis.stats` runs E8-vs-E9 as its own Holm-corrected
 family -- language minus English within each, and the difference between
 them, paired by seed -- over `auc_nci_excess`, `final_nci`,
-`final_global_disagreement`, `final_polarization_index`,
-`final_mean_belief_shift`, `final_minority_share`. (Jo et al.'s "neighbour
-correlation" is, by construction, the same Pearson correlation `nci` already
-computes -- correlation is invariant to the `x`-vs-`v=2x` rescaling -- so
-there is no separate `final_neighbor_corr` column; `final_nci` is it.)
-Grouped by `recsys_threshold` the same way the E5 family is grouped by
-`rewire_rate`, so a threshold sweep is never pooled into one contrast.
+`final_neighbor_corr`, `final_global_disagreement`,
+`final_polarization_index`, `final_mean_belief_shift`,
+`final_mean_abs_individual_shift`, `final_minority_share`. Jo et al.'s own
+"neighbour correlation" is their NCI, Eq. 3 (`1 - DG/(2*Pz)`, a
+variance-ratio) -- **not** the same quantity as the Pearson correlation
+Wang et al. describe in text as their own NCI, which this codebase reports
+as `neighbor_corr`: the two can disagree even in sign (a perfectly
+anti-correlated alternating ring scores `neighbor_corr = -1` but
+`nci = 0`). Both are reported, under their own names, rather than treating
+one as a stand-in for the other. Grouped by `recsys_threshold` the same
+way the E5 family is grouped by `rewire_rate`, so a threshold sweep is
+never pooled into one contrast.
 
 **How this differs from Jo et al. and Wang et al.** Both reference papers
 have agents write their own opinion text and self-report a belief number.
