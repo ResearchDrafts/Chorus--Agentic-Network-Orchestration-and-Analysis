@@ -687,8 +687,16 @@ def network_contrasts(
             treated = paired_differences(
                 frame, metric, treatment, language, rewire_rate, recsys_threshold
             )
+            # Fix 4: recsys_threshold filters the TREATMENT arm only. e9
+            # (the only control this parameter is ever used for) always
+            # records its schema default, 1.0, since the field is inert
+            # under neighbor_strategy="graph" -- filtering it the same way
+            # as e8 would find zero e9 runs at any other threshold and turn
+            # the "did" row into an n=0 difference-in-differences. rewire_rate
+            # is unaffected: e5/e6/e7 all set it to the SAME real value, so
+            # filtering both arms by it is correct there.
             baseline = paired_differences(
-                frame, metric, control, language, rewire_rate, recsys_threshold
+                frame, metric, control, language, rewire_rate, None
             )
             did = {
                 seed: treated[seed] - baseline[seed]
@@ -895,12 +903,19 @@ def _echo_contrasts_for_pair(
 def _recsys_contrasts_for_pair(
     runs: pd.DataFrame, pair: tuple[str, str], metrics: tuple[str, ...]
 ) -> list[dict]:
-    """network_contrasts(), once per recsys_threshold present among `pair`'s
-    own runs -- Fix 9's e8-vs-e9 family, built the same way
+    """network_contrasts(), once per recsys_threshold present in `pair[0]`
+    (e8) -- Fix 9's e8-vs-e9 family, built the same way
     _echo_contrasts_for_pair builds e5-vs-e6/e5-vs-e7, grouping by
     recsys_threshold instead of rewire_rate. [] (with a warning) under the
     same two guards: neither arm of `pair` present, or a run_metrics.csv
     written before a needed column existed.
+
+    Fix 4: the sweep is over `pair[0]`'s (e8's) own thresholds, not the
+    union with `pair[1]` (e9) -- e9 always records its schema default,
+    1.0, since recsys_threshold is inert under its own "graph" strategy,
+    so including it in the union added a value e8 never actually swept
+    and network_contrasts (see its own Fix 4 note) no longer filters the
+    control by this value anyway.
     """
     present = set(pair) <= set(runs.get("experiment", pd.Series(dtype=object)))
     if not present:
@@ -914,8 +929,8 @@ def _recsys_contrasts_for_pair(
             f"{pair[0]}-vs-{pair[1]} contrast."
         )
         return []
-    pair_runs = runs[runs.experiment.isin(list(pair))]
-    thresholds = sorted(pair_runs["recsys_threshold"].dropna().unique())
+    treatment_runs = runs[runs.experiment == pair[0]]
+    thresholds = sorted(treatment_runs["recsys_threshold"].dropna().unique())
     rows: list[dict] = []
     for threshold in thresholds:
         rows += network_contrasts(

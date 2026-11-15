@@ -896,16 +896,27 @@ def test_recsys_contrasts_for_pair_runs_when_both_are_present():
 
 def test_recsys_contrasts_are_grouped_by_threshold():
     """A --recsys-threshold sweep must never average two thresholds'
-    results into one contrast, the same sweep-safety rewire_rate gets."""
+    results into one contrast, the same sweep-safety rewire_rate gets.
+
+    Fix 4: e9 never sweeps recsys_threshold at all (the field is inert
+    under its own "graph" strategy, so a real campaign's e9 configs always
+    record the schema default, 1.0) -- so this fixture gives e9 exactly
+    ONE row per seed/language, the way a real run_metrics.csv would,
+    reused as the baseline for BOTH of e8's thresholds below.
+    """
     frame = _run_metrics([
         _recsys_run("e8", "english", 1001, recsys_threshold=1.0, final_nci=0.1),
         _recsys_run("e8", "hindi", 1001, recsys_threshold=1.0, final_nci=0.3),
-        _recsys_run("e9", "english", 1001, recsys_threshold=1.0, final_nci=0.1),
-        _recsys_run("e9", "hindi", 1001, recsys_threshold=1.0, final_nci=0.2),
+        _recsys_run("e8", "english", 1002, recsys_threshold=1.0, final_nci=0.15),
+        _recsys_run("e8", "hindi", 1002, recsys_threshold=1.0, final_nci=0.35),
         _recsys_run("e8", "english", 1001, recsys_threshold=0.5, final_nci=0.1),
         _recsys_run("e8", "hindi", 1001, recsys_threshold=0.5, final_nci=0.9),
-        _recsys_run("e9", "english", 1001, recsys_threshold=0.5, final_nci=0.1),
-        _recsys_run("e9", "hindi", 1001, recsys_threshold=0.5, final_nci=0.2),
+        _recsys_run("e8", "english", 1002, recsys_threshold=0.5, final_nci=0.2),
+        _recsys_run("e8", "hindi", 1002, recsys_threshold=0.5, final_nci=0.8),
+        _recsys_run("e9", "english", 1001, final_nci=0.1),
+        _recsys_run("e9", "hindi", 1001, final_nci=0.2),
+        _recsys_run("e9", "english", 1002, final_nci=0.12),
+        _recsys_run("e9", "hindi", 1002, final_nci=0.22),
     ])
     rows = st._recsys_contrasts_for_pair(frame, ("e8", "e9"), st.RECSYS_METRICS)
     thresholds = {r["recsys_threshold"] for r in rows}
@@ -918,10 +929,18 @@ def test_recsys_contrasts_are_grouped_by_threshold():
         r for r in rows
         if r["scope"] == "did" and r["metric"] == "final_nci" and r["recsys_threshold"] == 0.5
     )
-    # threshold=1.0: e8 DiD (0.3-0.1) - e9 DiD (0.2-0.1) = 0.2 - 0.1 = 0.1
+    # Both seeds shared by e8 (at either threshold) and e9 -- the bug this
+    # fix resolves gave n=0 here, since e9 was filtered by a threshold it
+    # never carries.
+    assert did_at_1["n"] == 2
+    assert did_at_half["n"] == 2
+    # threshold=1.0: e8 per-seed DiD (0.3-0.1, 0.35-0.15) = (0.2, 0.2);
+    # e9 per-seed DiD (reused at both thresholds) = (0.2-0.1, 0.22-0.12)
+    # = (0.1, 0.1). did = (0.1, 0.1) -> mean 0.1.
     assert did_at_1["mean_diff"] == pytest.approx(0.1)
-    # threshold=0.5: e8 DiD (0.9-0.1) - e9 DiD (0.2-0.1) = 0.8 - 0.1 = 0.7
-    assert did_at_half["mean_diff"] == pytest.approx(0.7)
+    # threshold=0.5: e8 per-seed DiD (0.9-0.1, 0.8-0.2) = (0.8, 0.6);
+    # did = (0.8-0.1, 0.6-0.1) = (0.7, 0.5) -> mean 0.6.
+    assert did_at_half["mean_diff"] == pytest.approx(0.6)
 
 
 def test_recsys_family_is_independent_of_the_echo_families():
