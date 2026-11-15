@@ -78,6 +78,32 @@ ECHO_METRICS = (
     "auc_assort_excess",
     "final_assort_excess",
     "final_cross_side_edge_share",
+    "auc_nci_excess",
+    "final_nci_excess",
+    "final_disagreement_ratio",
+    "final_global_disagreement",
+    "final_bimodality",
+    "final_mean_belief_shift",
+    "total_side_switches",
+)
+
+# auc_nci_excess is the primary echo-chamber outcome (see network_contrasts'
+# `primary` column): unlike t_echo, it needs no threshold and is defined for
+# EVERY run, censored or not, so a campaign with no formation yet still
+# reports it.
+PRIMARY_ECHO_METRIC = "auc_nci_excess"
+
+# E7 rewires without selecting a same-side neighbour; the e5-vs-e7 contrast
+# isolates selection from rewiring as such, separately from e5-vs-e6's
+# shadow-item contrast. Only the metrics that bear on formation speed and
+# structure, not the full ECHO_METRICS list -- a disagreement or bimodality
+# comparison against the no-selection control answers a different question
+# than this family is for.
+E5_E7_METRICS = (
+    "t_echo",
+    "auc_assort_excess",
+    "auc_nci_excess",
+    "final_cross_side_edge_share",
 )
 
 # Bootstrap settings. Seeded, so re-running the analysis reproduces the
@@ -493,6 +519,33 @@ def paired_differences(
     }
 
 
+def censored_count(
+    frame: pd.DataFrame,
+    experiment: str,
+    language: str,
+    seeds,
+    rewire_rate: float | None = None,
+) -> int:
+    """How many of `seeds` were censored (t_echo = K + 1, echo_censored)
+    for this experiment/language(/rate) arm.
+
+    A `t_echo` difference built from censored runs depends on K: a run
+    that never formed reports K + 1, which is not a measured formation
+    time, so a contrast mixing censored and uncensored seeds is partly a
+    comparison against each run's own length. This is what the censored
+    columns on a t_echo contrast row exist to flag.
+    """
+    if not seeds:
+        return 0
+    arm = frame[(frame.experiment == experiment) & (frame.language == language)]
+    if rewire_rate is not None:
+        arm = arm[arm.rewire_rate == rewire_rate]
+    if "echo_censored" not in arm.columns:
+        return 0
+    censored_seeds = set(arm.loc[arm.echo_censored.astype(bool), "seed"])
+    return len(set(seeds) & censored_seeds)
+
+
 def bootstrap_ci(values: list[float], seed: int = BOOTSTRAP_SEED) -> tuple[float, float]:
     """A percentile bootstrap interval over the seeds, resampling seeds.
 
@@ -542,7 +595,8 @@ def wilcoxon_p(values: list[float]) -> float | None:
 NETWORK_COLUMNS = (
     "metric", "scope", "language", "contrast", "rewire_rate", "n",
     "mean_diff", "ci_low", "ci_high", "p_raw", "p_holm", "reject_at_05",
-    "family_size", "underpowered", "seeds",
+    "family_size", "underpowered", "seeds", "primary",
+    "n_censored_treatment", "n_censored_control", "censored_warning",
 )
 
 
@@ -594,17 +648,36 @@ def network_contrasts(
                 seed: treated[seed] - baseline[seed]
                 for seed in sorted(set(treated) & set(baseline))
             }
-            for scope, values, label in (
+            # Censoring only bears on t_echo: it alone can read K + 1, a
+            # run length rather than a measured formation time. Every other
+            # metric's rows carry None in both censored columns.
+            censored = metric == "t_echo"
+            for scope, values, label, treatment_seeds, control_seeds in (
                 (f"within_{treatment}", treated,
-                 f"{language} - {REFERENCE_LANGUAGE} ({treatment.upper()})"),
+                 f"{language} - {REFERENCE_LANGUAGE} ({treatment.upper()})",
+                 set(treated), set()),
                 (f"within_{control}", baseline,
-                 f"{language} - {REFERENCE_LANGUAGE} ({control.upper()})"),
+                 f"{language} - {REFERENCE_LANGUAGE} ({control.upper()})",
+                 set(), set(baseline)),
                 ("did", did,
                  f"({language} - {REFERENCE_LANGUAGE}), "
-                 f"{treatment.upper()} - {control.upper()}"),
+                 f"{treatment.upper()} - {control.upper()}",
+                 set(did), set(did)),
             ):
+                n_censored_treatment = (
+                    censored_count(frame, treatment, language, treatment_seeds, rewire_rate)
+                    if censored else None
+                )
+                n_censored_control = (
+                    censored_count(frame, control, language, control_seeds, rewire_rate)
+                    if censored else None
+                )
                 rows.append(
-                    _network_row(metric, scope, language, label, values, rewire_rate)
+                    _network_row(
+                        metric, scope, language, label, values, rewire_rate,
+                        n_censored_treatment=n_censored_treatment,
+                        n_censored_control=n_censored_control,
+                    )
                 )
     return holm_within_families(rows, key="_family")
 
@@ -616,10 +689,18 @@ def _network_row(
     label: str,
     values: dict[int, float],
     rewire_rate: float | None = None,
+    *,
+    n_censored_treatment: int | None = None,
+    n_censored_control: int | None = None,
 ) -> dict:
     ordered = [values[seed] for seed in sorted(values)]
     low, high = bootstrap_ci(ordered)
     p = wilcoxon_p(ordered)
+    censored_warning = (
+        None
+        if n_censored_treatment is None and n_censored_control is None
+        else bool((n_censored_treatment or 0) + (n_censored_control or 0) > 0)
+    )
     return {
         # Holm family: one metric, one scope, the three non-English
         # languages, at one rewire rate. That is the set of tests answering
@@ -644,6 +725,10 @@ def _network_row(
         "p_raw": 1.0 if p is None else p,
         "underpowered": len(ordered) < MIN_SEEDS_FOR_SIGNIFICANCE,
         "seeds": ";".join(str(seed) for seed in sorted(values)),
+        "primary": metric == PRIMARY_ECHO_METRIC,
+        "n_censored_treatment": n_censored_treatment,
+        "n_censored_control": n_censored_control,
+        "censored_warning": censored_warning,
     }
 
 
@@ -667,6 +752,83 @@ def warn_if_underpowered(rows: list[dict]) -> None:
         f"however large the effect. Run at least "
         f"{MIN_SEEDS_FOR_SIGNIFICANCE} seeds before reading the p values."
     )
+
+
+FORMATION_COLUMNS = (
+    "experiment", "language", "rewire_rate",
+    "n_runs", "n_formed", "share_formed", "median_t_echo",
+)
+
+
+def formation_summary(runs: pd.DataFrame) -> list[dict]:
+    """Per (experiment, language, rewire_rate): how many runs formed an
+    echo chamber at all, and the median t_echo among the ones that did.
+
+    The companion table to a t_echo contrast's censored rows: a contrast
+    says the difference depends on K when either arm has censored runs,
+    and this says, group by group, how often that is the case before any
+    contrast is read. median_t_echo is computed over FORMED runs only --
+    folding a censored run's K + 1 into the median would read as a real
+    (and the slowest possible) formation time.
+    """
+    rows: list[dict] = []
+    for keys, group in runs.groupby(["experiment", "language", "rewire_rate"], dropna=False):
+        experiment, language, rate = keys
+        n_runs = len(group)
+        formed = group[~group["echo_censored"].astype(bool)]
+        n_formed = len(formed)
+        rows.append({
+            "experiment": experiment,
+            "language": language,
+            "rewire_rate": rate,
+            "n_runs": n_runs,
+            "n_formed": n_formed,
+            "share_formed": n_formed / n_runs if n_runs else None,
+            "median_t_echo": float(formed["t_echo"].median()) if n_formed else None,
+        })
+    return sorted(
+        rows,
+        key=lambda r: (r["experiment"], r["language"], r["rewire_rate"] if pd.notna(r["rewire_rate"]) else -1.0),
+    )
+
+
+def _echo_contrasts_for_pair(
+    runs: pd.DataFrame, pair: tuple[str, str], metrics: tuple[str, ...]
+) -> list[dict]:
+    """network_contrasts(), once per rewire_rate present among `pair`'s
+    own runs -- the sweep-safe dispatch both the e5-vs-e6 and the e5-vs-e7
+    family need. [] (with a warning) when `pair`'s runs, or the metric
+    columns they need, are not in `runs` at all -- the same two guards
+    e5-vs-e6 always needed: a campaign with neither arm of `pair` must not
+    grow extra all-None, n=0 rows, and a run_metrics.csv written before a
+    metric existed is reported rather than raised against.
+    """
+    # BOTH members of the pair, not just one: network_contrasts() always
+    # emits all three scopes, so a pair with only its treatment present
+    # (e5 with no e7, say -- a perfectly normal campaign that never asked
+    # for e7) would otherwise produce a within-e5 row IDENTICAL to the one
+    # the e5-vs-e6 family already emits (same treatment, same metric), and
+    # all-empty within-e7/did rows beside it.
+    present = set(pair) <= set(runs.get("experiment", pd.Series(dtype=object)))
+    if not present:
+        return []
+    missing = [name for name in (*metrics, "rewire_rate") if name not in runs.columns]
+    if missing:
+        print(
+            f"  WARNING: {pair[0]}/{pair[1]} runs are present but "
+            f"run_metrics.csv has no {missing} column(s) -- re-run "
+            f"analysis.metrics to pick them up. Skipping the "
+            f"{pair[0]}-vs-{pair[1]} contrast."
+        )
+        return []
+    pair_runs = runs[runs.experiment.isin(list(pair))]
+    rates = sorted(pair_runs["rewire_rate"].dropna().unique())
+    rows: list[dict] = []
+    for rate in rates:
+        rows += network_contrasts(
+            runs, metrics=metrics, experiment_pair=pair, rewire_rate=float(rate)
+        )
+    return rows
 
 
 # --- entry point ----------------------------------------------------------
@@ -715,35 +877,33 @@ def main(argv: list[str] | None = None) -> int:
 
     runs = load_run_metrics(args.results)
     network = network_contrasts(runs)
-    # E5's echo-chamber contrast runs only when the campaign actually has
-    # e5/e6 runs in it. Two guards, not one: a campaign with no e5/e6 runs
-    # must not grow extra all-None, n=0 rows in network_contrasts.csv (every
-    # existing e3/e4-only campaign), and a run_metrics.csv written before
-    # this feature existed has no ECHO_METRICS columns to read at all --
-    # load_run_metrics only requires NETWORK_METRICS, so that case is
-    # reached, not raised, and is reported rather than silently skipped.
-    has_echo_runs = bool({"e5", "e6"} & set(runs.get("experiment", pd.Series(dtype=object))))
-    if has_echo_runs:
-        missing_echo = [m for m in (*ECHO_METRICS, "rewire_rate") if m not in runs.columns]
-        if missing_echo:
-            print(
-                f"  WARNING: e5/e6 runs are present but run_metrics.csv has no "
-                f"{missing_echo} column(s) -- re-run analysis.metrics to pick "
-                "up the echo-chamber metrics. Skipping the echo-chamber contrast."
-            )
-        else:
-            # One call per rewire_rate actually present among the e5/e6
-            # runs, so a campaign that swept --rewire-rate gets one
-            # contrast per rate instead of one that pools them. A campaign
-            # with a single rate (the common case) still gets exactly one
-            # call, at that rate.
-            echo_runs = runs[runs.experiment.isin(["e5", "e6"])]
-            rates = sorted(echo_runs["rewire_rate"].dropna().unique())
-            for rate in rates:
-                network += network_contrasts(
-                    runs, metrics=ECHO_METRICS, experiment_pair=("e5", "e6"),
-                    rewire_rate=float(rate),
-                )
+    # e5-vs-e6 (the shadow-item control, isolating delivery) and e5-vs-e7
+    # (rewiring to a random non-neighbour, isolating selection from
+    # rewiring as such) are two separate families: each is Holm-corrected
+    # on its own, inside network_contrasts, and each is skipped with a
+    # warning rather than run against a campaign or a run_metrics.csv that
+    # does not have it.
+    network += _echo_contrasts_for_pair(runs, ("e5", "e6"), ECHO_METRICS)
+    network += _echo_contrasts_for_pair(runs, ("e5", "e7"), E5_E7_METRICS)
+
+    has_echo_experiments = bool(
+        {"e5", "e6", "e7"} & set(runs.get("experiment", pd.Series(dtype=object)))
+    )
+    if has_echo_experiments and {"t_echo", "echo_censored"} <= set(runs.columns):
+        write_table(
+            args.out / "formation_summary.csv", formation_summary(runs), FORMATION_COLUMNS
+        )
+
+    censored_rows = [row for row in network if row.get("censored_warning")]
+    if censored_rows:
+        print(
+            f"\n  WARNING: {len(censored_rows)} t_echo contrast row(s) include "
+            "a censored run (t_echo = K + 1, formation never observed within "
+            "K rounds). A t_echo difference built from censored runs depends "
+            "on K; auc_nci_excess is defined for every run regardless and is "
+            "the primary echo-chamber outcome for exactly this reason."
+        )
+
     if not network:
         print("no non-English arms in run_metrics.csv to contrast", file=sys.stderr)
         return 1

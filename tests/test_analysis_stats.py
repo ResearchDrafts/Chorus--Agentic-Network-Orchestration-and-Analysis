@@ -183,8 +183,13 @@ def test_main_runs_one_echo_contrast_per_swept_rewire_rate(tmp_path):
     results.mkdir()
     rows = [
         {"experiment": e, "language": lang, "seed": seed, "rewire_rate": rate,
-         "t_echo": 5, "auc_assort_excess": 0.1, "final_assort_excess": 0.1,
-         "final_cross_side_edge_share": 0.2}
+         "t_echo": 5, "echo_censored": False,
+         "auc_assort_excess": 0.1, "final_assort_excess": 0.1,
+         "final_cross_side_edge_share": 0.2,
+         "auc_nci_excess": 0.1, "final_nci_excess": 0.1,
+         "final_disagreement_ratio": 0.9, "final_global_disagreement": 0.3,
+         "final_bimodality": 0.5, "final_mean_belief_shift": 0.2,
+         "total_side_switches": 3}
         for e in ("e5", "e6")
         for lang in ("english", "hindi")
         for seed in (1001, 1002)
@@ -202,6 +207,195 @@ def test_main_runs_one_echo_contrast_per_swept_rewire_rate(tmp_path):
     assert set(echo.rewire_rate.unique()) == {0.3, 0.1}
     # Each rate gets its own within_e5/within_e6/did rows for each metric.
     assert len(echo) == len(st.ECHO_METRICS) * 3 * 2
+
+
+# --- Fix 5: the e5-vs-e7 family, censoring, and formation_summary ---------
+
+
+def _echo_run(experiment, language, seed, *, rewire_rate=0.3, t_echo=5,
+              echo_censored=False, **extra) -> dict:
+    row = {
+        "experiment": experiment, "language": language, "seed": seed,
+        "rewire_rate": rewire_rate, "t_echo": t_echo,
+        "echo_censored": echo_censored,
+        "auc_assort_excess": 0.1, "final_assort_excess": 0.1,
+        "final_cross_side_edge_share": 0.2,
+        "auc_nci_excess": 0.1, "final_nci_excess": 0.1,
+        "final_disagreement_ratio": 0.9, "final_global_disagreement": 0.3,
+        "final_bimodality": 0.5, "final_mean_belief_shift": 0.2,
+        "total_side_switches": 3,
+    }
+    row.update(extra)
+    return row
+
+
+def test_echo_contrasts_for_pair_requires_both_experiments_present():
+    """e5 with no e7 at all must not emit a within_e5 row duplicating the
+    e5-vs-e6 family's own, or empty within_e7/did rows beside it."""
+    frame = _run_metrics([
+        _echo_run("e5", "hindi", 1001), _echo_run("e6", "hindi", 1001),
+    ])
+    assert st._echo_contrasts_for_pair(frame, ("e5", "e7"), st.E5_E7_METRICS) == []
+
+
+def test_echo_contrasts_for_pair_runs_when_both_are_present():
+    frame = _run_metrics([
+        _echo_run("e5", "hindi", 1001), _echo_run("e7", "hindi", 1001),
+    ])
+    rows = st._echo_contrasts_for_pair(frame, ("e5", "e7"), st.E5_E7_METRICS)
+    assert rows
+    assert {r["scope"] for r in rows} == {"within_e5", "within_e7", "did"}
+    assert all(r["metric"] in st.E5_E7_METRICS for r in rows)
+
+
+def test_e5_vs_e7_and_e5_vs_e6_are_computed_independently():
+    """Two separate families built from two separate network_contrasts()
+    calls: e6's and e7's differences from e5 must not leak into each
+    other even though both share e5 as the treatment and overlapping
+    metric names."""
+    frame = _run_metrics([
+        _echo_run("e5", "english", 1001, t_echo=10),
+        _echo_run("e5", "hindi", 1001, t_echo=14),    # e5 - english = +4
+        _echo_run("e6", "english", 1001, t_echo=10),
+        _echo_run("e6", "hindi", 1001, t_echo=11),    # e6 - english = +1
+        _echo_run("e7", "english", 1001, t_echo=10),
+        _echo_run("e7", "hindi", 1001, t_echo=20),    # e7 - english = +10
+    ])
+    e6_did = next(
+        r for r in st._echo_contrasts_for_pair(frame, ("e5", "e6"), st.ECHO_METRICS)
+        if r["scope"] == "did" and r["metric"] == "t_echo"
+    )
+    e7_did = next(
+        r for r in st._echo_contrasts_for_pair(frame, ("e5", "e7"), st.E5_E7_METRICS)
+        if r["scope"] == "did" and r["metric"] == "t_echo"
+    )
+    # e5-vs-e6 DiD: (14-10) - (11-10) = 4 - 1 = 3
+    # e5-vs-e7 DiD: (14-10) - (20-10) = 4 - 10 = -6
+    assert e6_did["mean_diff"] == pytest.approx(3.0)
+    assert e7_did["mean_diff"] == pytest.approx(-6.0)
+
+
+def test_network_row_marks_the_primary_echo_metric():
+    rows = st.network_contrasts(
+        _run_metrics([
+            _echo_run("e5", "hindi", 1001), _echo_run("e6", "hindi", 1001),
+        ]),
+        metrics=st.ECHO_METRICS, experiment_pair=("e5", "e6"),
+    )
+    primary = {r["primary"] for r in rows if r["metric"] == "auc_nci_excess"}
+    non_primary = {r["primary"] for r in rows if r["metric"] != "auc_nci_excess"}
+    assert primary == {True}
+    assert non_primary == {False}
+
+
+# --- censoring --------------------------------------------------------------
+
+
+def test_censored_count_counts_only_the_named_seeds():
+    frame = _run_metrics([
+        _echo_run("e5", "hindi", 1001, echo_censored=True),
+        _echo_run("e5", "hindi", 1002, echo_censored=False),
+        _echo_run("e5", "hindi", 1003, echo_censored=True),
+    ])
+    assert st.censored_count(frame, "e5", "hindi", {1001, 1002, 1003}) == 2
+    assert st.censored_count(frame, "e5", "hindi", {1002}) == 0
+    assert st.censored_count(frame, "e5", "hindi", set()) == 0
+
+
+def test_t_echo_contrast_rows_carry_censored_counts():
+    frame = _run_metrics([
+        _echo_run("e5", "english", 1001), _echo_run("e5", "english", 1002),
+        _echo_run("e6", "english", 1001), _echo_run("e6", "english", 1002),
+        _echo_run("e5", "hindi", 1001, echo_censored=True),
+        _echo_run("e5", "hindi", 1002, echo_censored=False),
+        _echo_run("e6", "hindi", 1001, echo_censored=False),
+        _echo_run("e6", "hindi", 1002, echo_censored=False),
+    ])
+    rows = st.network_contrasts(frame, metrics=st.ECHO_METRICS, experiment_pair=("e5", "e6"))
+    t_echo_did = next(r for r in rows if r["metric"] == "t_echo" and r["scope"] == "did")
+    assert t_echo_did["n_censored_treatment"] == 1
+    assert t_echo_did["n_censored_control"] == 0
+    assert t_echo_did["censored_warning"] is True
+
+    other_did = next(r for r in rows if r["metric"] == "auc_assort_excess" and r["scope"] == "did")
+    assert other_did["n_censored_treatment"] is None
+    assert other_did["n_censored_control"] is None
+    assert other_did["censored_warning"] is None
+
+
+def test_main_warns_when_a_t_echo_contrast_is_censored(tmp_path, capsys):
+    results = tmp_path / "results"
+    results.mkdir()
+    _run_metrics([
+        _echo_run("e5", "english", 1001), _echo_run("e6", "english", 1001),
+        _echo_run("e5", "hindi", 1001, echo_censored=True),
+        _echo_run("e6", "hindi", 1001, echo_censored=False),
+    ]).to_csv(results / "run_metrics.csv", index=False)
+
+    assert st.main([
+        "--e1", str(tmp_path / "absent.jsonl"),
+        "--results", str(results), "--out", str(results), "--skip-e1",
+    ]) == 0
+    assert "censored run" in capsys.readouterr().out
+
+
+# --- formation_summary.csv --------------------------------------------------
+
+
+def test_formation_summary_counts_formed_runs_and_medians_among_them():
+    frame = _run_metrics([
+        _echo_run("e5", "hindi", 1001, t_echo=3, echo_censored=False),
+        _echo_run("e5", "hindi", 1002, t_echo=5, echo_censored=False),
+        _echo_run("e5", "hindi", 1003, t_echo=99, echo_censored=True),
+    ])
+    rows = st.formation_summary(frame)
+    row = next(r for r in rows if r["experiment"] == "e5" and r["language"] == "hindi")
+    assert row["n_runs"] == 3
+    assert row["n_formed"] == 2
+    assert row["share_formed"] == pytest.approx(2 / 3)
+    # Median of the two FORMED runs' t_echo (3, 5), not the censored 99.
+    assert row["median_t_echo"] == pytest.approx(4.0)
+
+
+def test_formation_summary_is_grouped_by_experiment_language_and_rate():
+    frame = _run_metrics([
+        _echo_run("e5", "hindi", 1001, rewire_rate=0.3),
+        _echo_run("e5", "hindi", 1002, rewire_rate=0.1),
+        _echo_run("e5", "english", 1001, rewire_rate=0.3),
+    ])
+    rows = st.formation_summary(frame)
+    keys = {(r["experiment"], r["language"], r["rewire_rate"]) for r in rows}
+    assert keys == {("e5", "hindi", 0.3), ("e5", "hindi", 0.1), ("e5", "english", 0.3)}
+    assert all(r["n_runs"] == 1 for r in rows)
+
+
+def test_main_writes_formation_summary_when_echo_experiments_are_present(tmp_path):
+    results = tmp_path / "results"
+    results.mkdir()
+    _run_metrics([
+        _echo_run("e5", "hindi", 1001), _echo_run("e6", "hindi", 1001),
+    ]).to_csv(results / "run_metrics.csv", index=False)
+
+    assert st.main([
+        "--e1", str(tmp_path / "absent.jsonl"),
+        "--results", str(results), "--out", str(results), "--skip-e1",
+    ]) == 0
+    assert (results / "formation_summary.csv").exists()
+
+
+def test_main_writes_no_formation_summary_for_an_e3_e4_only_campaign(tmp_path):
+    results = tmp_path / "results"
+    results.mkdir()
+    _run_metrics([
+        {"experiment": "e3", "language": lang, "seed": 1001}
+        for lang in ("english", "hindi")
+    ]).to_csv(results / "run_metrics.csv", index=False)
+
+    assert st.main([
+        "--e1", str(tmp_path / "absent.jsonl"),
+        "--results", str(results), "--out", str(results), "--skip-e1",
+    ]) == 0
+    assert not (results / "formation_summary.csv").exists()
 
 
 # --- the bootstrap --------------------------------------------------------
