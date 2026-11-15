@@ -673,3 +673,108 @@ def test_run_row_rewiring_fields_are_none_when_the_config_lacks_them():
     assert row["rewire_rate"] is None
     assert row["rewire_target"] is None
     assert row["lean_assignment"] is None
+
+
+# --- Fix 9: the similarity recommender's round shape ------------------------
+
+
+def test_feed_size_and_empty_feed_share():
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 1, "x": 0.0, "feed_size": 2.0, "neighbor_agent_ids": "b|c"},
+        {"speaker_agent_id": "b", "turn": 1, "x": 0.1, "feed_size": 0.0, "neighbor_agent_ids": ""},
+        {"speaker_agent_id": "c", "turn": 1, "x": 0.2, "feed_size": 2.0, "neighbor_agent_ids": "a|b"},
+    ])
+    config = {**CONFIG, "M": 3}
+    probes = m.probe_rows(frame, config, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, config, None)
+    row = rounds[0]
+    assert row["mean_feed_size"] == pytest.approx((2 + 0 + 2) / 3)
+    assert row["share_empty_feed"] == pytest.approx(1 / 3)
+
+
+def test_feed_size_metrics_are_none_without_the_column():
+    """Every run before Fix 9 -- and every non-graph_similarity strategy --
+    never writes feed_size at all; "0 agents had an empty feed" would claim
+    a measurement nobody made."""
+    frame = _frame([{"speaker_agent_id": "a", "turn": 1, "x": 0.0}])
+    config = {**CONFIG, "M": 1}
+    probes = m.probe_rows(frame, config, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, config, None)
+    assert rounds[0]["mean_feed_size"] is None
+    assert rounds[0]["share_empty_feed"] is None
+
+
+def test_mean_feed_gap_is_the_mean_gap_over_delivered_pairs_only():
+    """a read b and c; c read a and b; b read nobody (empty feed). The mean
+    is over the four (reader, delivered sender) pairs that exist, not over
+    every possible pair in the population."""
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 1, "x": 0.0, "feed_size": 2.0, "neighbor_agent_ids": "b|c"},
+        {"speaker_agent_id": "b", "turn": 1, "x": 0.1, "feed_size": 0.0, "neighbor_agent_ids": ""},
+        {"speaker_agent_id": "c", "turn": 1, "x": 0.2, "feed_size": 2.0, "neighbor_agent_ids": "a|b"},
+    ])
+    config = {**CONFIG, "M": 3}
+    probes = m.probe_rows(frame, config, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, config, None)
+    # a's feed: |0.0-0.1|=0.1 (b), |0.0-0.2|=0.2 (c)
+    # c's feed: |0.2-0.0|=0.2 (a), |0.2-0.1|=0.1 (b)
+    assert rounds[0]["mean_feed_gap"] == pytest.approx((0.1 + 0.2 + 0.2 + 0.1) / 4)
+
+
+def test_mean_feed_gap_is_none_at_round_zero():
+    frame = _frame([{"speaker_agent_id": "a", "turn": 0, "x": 0.0, "neighbor_agent_ids": ""}])
+    probes = m.probe_rows(frame, {**CONFIG, "M": 1}, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, {**CONFIG, "M": 1}, None)
+    assert rounds[0]["mean_feed_gap"] is None
+
+
+def test_share_neighbors_filtered_and_mean_neighbor_gap_use_the_full_graph():
+    """Over the round's own graph -- the full candidate neighbourhood, not
+    the delivered feed -- one of the triangle's three edges exceeds the
+    threshold; mean_neighbor_gap is local_disagreement under a second name."""
+    graph = nx.Graph([("a", "b"), ("b", "c"), ("a", "c")])
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 1, "x": 0.0},
+        {"speaker_agent_id": "b", "turn": 1, "x": 0.1},
+        {"speaker_agent_id": "c", "turn": 1, "x": 0.2},
+    ])
+    config = {**CONFIG, "M": 3, "recsys_threshold": 0.15}
+    probes = m.probe_rows(frame, config, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, config, graph)
+    row = rounds[0]
+    # a-b: 0.1 (ok), b-c: 0.1 (ok), a-c: 0.2 (over 0.15) -> 1 of 3.
+    assert row["share_neighbors_filtered"] == pytest.approx(1 / 3)
+    assert row["mean_neighbor_gap"] == pytest.approx((0.1 + 0.1 + 0.2) / 3)
+    assert row["mean_neighbor_gap"] == row["local_disagreement"]
+
+
+def test_share_neighbors_filtered_is_none_without_a_threshold():
+    """A run logged before recsys_threshold existed: the metric needs a
+    denominator unit to compare against, and None means no such measurement
+    rather than a threshold of 0."""
+    graph = nx.Graph([("a", "b")])
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 1, "x": 0.0},
+        {"speaker_agent_id": "b", "turn": 1, "x": 0.5},
+    ])
+    config = {**CONFIG, "M": 2}
+    probes = m.probe_rows(frame, config, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, config, graph)
+    assert rounds[0]["share_neighbors_filtered"] is None
+
+
+def test_run_row_carries_recsys_threshold_through():
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 0, "x": 0.0},
+        {"speaker_agent_id": "a", "turn": 1, "x": 0.5},
+    ])
+    config = {**CONFIG, "recsys_threshold": 1.5}
+    probes = m.probe_rows(frame, config, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, config, None)
+    row = m.run_row(rounds, probes, config, EPSILON)
+    assert row["recsys_threshold"] == 1.5
+
+
+def test_e8_e9_are_recognized_experiments():
+    assert m.experiment_of("e8_english_ws_s01") == "e8"
+    assert m.experiment_of("e9_hindi_ws_s01") == "e9"

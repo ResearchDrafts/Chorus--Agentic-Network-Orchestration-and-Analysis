@@ -52,7 +52,12 @@ from sandbox.agent_manager import AgentManager, agent_id_for
 from sandbox.bank_manager import NEUTRAL_PREFIX, BankManager, NeutralBank
 from sandbox.checkpoint_manager import CheckpointManager
 from sandbox.cost_tracker import CostTracker
-from sandbox.interaction_engine import AlphaSampling, GraphSampling, RecommendationStrategy
+from sandbox.interaction_engine import (
+    AlphaSampling,
+    GraphSampling,
+    GraphSimilaritySampling,
+    RecommendationStrategy,
+)
 from sandbox.logging_writer import LoggingWriter
 from sandbox.meme_pool_manager import MemePoolManager
 from sandbox.model_gateway import BackendResponse, FatalGatewayError, ModelGateway
@@ -492,6 +497,13 @@ class SimulationOrchestrator:
             6. Phase B: every probe, concurrently
             7. one Interaction per agent, written, then applied
 
+        Fix 9: under neighbor_strategy="graph_similarity", step 3 can hand
+        an agent an empty feed (every candidate filtered by
+        recsys_threshold, or none to begin with). Such an agent skips Phase
+        A -- there is nothing to reply to -- but still runs Phase B, and its
+        row gets api_call_status="no_feed" rather than "success" or
+        "failed_logged_null": a real, applicable round, not a failure.
+
         Steps 1-4 touch no network and mutate nothing. Step 7 is the only
         place agent state, last posts, remembered rounds or bank cycle counts
         change.
@@ -593,6 +605,16 @@ class SimulationOrchestrator:
                 for n in senders
             ]
 
+        # Fix 9: a similarity-recommender reader whose feed came up empty
+        # (every candidate filtered out, or none to begin with) has nothing
+        # to reply to. Under every other strategy neighbor_map[agent_id] is
+        # never empty (GraphSampling and AlphaSampling always deliver
+        # exactly N), so this set is empty for them too and nothing below
+        # changes.
+        empty_feed_ids = {
+            agent.agent_id for agent in all_agents if not neighbor_map[agent.agent_id]
+        }
+
         # 5. Phase A. Run in both delivery modes: the control replies to the
         # neutral messages. It used to be skipped under delivery: off, which
         # made the control a different activity from the treatment rather
@@ -601,7 +623,9 @@ class SimulationOrchestrator:
         # changes, so the arm could not show drift even in principle.
         raw_replies = await asyncio.gather(
             *(
-                self._dispatch_reply(
+                _no_call()
+                if agent.agent_id in empty_feed_ids
+                else self._dispatch_reply(
                     agent,
                     turn,
                     delivered_texts[agent.agent_id],
@@ -614,14 +638,18 @@ class SimulationOrchestrator:
         replies: list[BackendResponse | None] = self._unwrap(raw_replies)
 
         # 6. Phase B. Each probe sees this round's reply, built in memory:
-        # _history is not touched until step 7.
+        # _history is not touched until step 7. An empty-feed agent wrote no
+        # reply -- there was nothing to reply to -- but is still probed: the
+        # recommender filtering its feed down to nothing is itself a real
+        # round, not a failure, and skipping the probe would silently drop
+        # it from every later round's "previous reading" too.
         probe_tasks = []
         for agent, reply in zip(all_agents, replies, strict=True):
-            if reply is None:
+            if reply is None and agent.agent_id not in empty_feed_ids:
                 # The reply failed, so this agent will not be applied this
                 # round whatever the probe says. Probing it anyway would spend
                 # a call on a reading nothing can consume.
-                probe_tasks.append(_no_probe())
+                probe_tasks.append(_no_call())
                 continue
             probe_tasks.append(
                 self._dispatch_probe(
@@ -641,9 +669,15 @@ class SimulationOrchestrator:
 
         # 7. Apply. One row per agent, always written; applied only when both
         # phases produced something.
+        recsys = self._interaction_engine
         probe_mean_map: dict[str, float | None] = {}
         for agent, reply, probe in zip(all_agents, replies, probes, strict=True):
             agent_id = agent.agent_id
+            feed = (
+                recsys.feed_info(agent_id)
+                if isinstance(recsys, GraphSimilaritySampling)
+                else None
+            )
             interaction = self._build_bank_interaction(
                 agent=agent,
                 turn=turn,
@@ -653,6 +687,10 @@ class SimulationOrchestrator:
                 posted_item_id=post_map[agent_id],
                 reply=reply,
                 probe=probe,
+                no_feed=agent_id in empty_feed_ids,
+                feed_size=feed.feed_size if feed else None,
+                n_neighbors_over_threshold=feed.n_neighbors_over_threshold if feed else None,
+                recsys_fallback=feed.fallback if feed else None,
             )
             await self._logger.write_interaction(interaction)
             # This round's own probe reading, win or lose: step 8 (rewiring)
@@ -1069,6 +1107,10 @@ class SimulationOrchestrator:
         shadow_items: list[str] | None = None,
         reply: BackendResponse | None,
         probe: tuple[BackendResponse, ProbeScore] | None,
+        no_feed: bool = False,
+        feed_size: int | None = None,
+        n_neighbors_over_threshold: int | None = None,
+        recsys_fallback: bool | None = None,
     ) -> Interaction:
         """One row. Token counts and latency are summed over both calls.
 
@@ -1082,20 +1124,29 @@ class SimulationOrchestrator:
         A failed row repeats stance_before as stance_after and leaves every
         probe column null, per Fix I: no fabricated stance, and nothing that
         could be mistaken for a reading.
+
+        `no_feed` (Fix 9): this reader's recommender feed came up empty, so
+        no reply call was ever dispatched for it. Round 0 has no reply by
+        construction either, but the two are not the same thing -- round 0
+        is never a no_feed row, and a no_feed row is never round 0, since
+        the recommender does not run until turn 1. A missing reply is a
+        failure in every OTHER case, which is what the `turn != ROUND_ZERO`
+        clause already carved out and `not no_feed` now also does.
         """
         stance_before = agent.current_stance()
         reply_text = _reply_text(reply)
-        # Round 0 has no reply by construction; every other round has one in
-        # both delivery modes, so a missing one is a failure.
-        failed = probe is None or (reply is None and turn != ROUND_ZERO)
+        failed = probe is None or (reply is None and turn != ROUND_ZERO and not no_feed)
 
         reply_prompt_tokens = reply.prompt_tokens if reply else 0
         probe_prompt_tokens = probe[0].prompt_tokens if probe else 0
         # Recorded from the same derivation the call used, on failed rows too:
         # the reply was dispatched and was seeded whether or not its result
-        # could be applied. None at round 0, where no reply was ever asked for.
+        # could be applied. None at round 0 and on a no_feed row, neither of
+        # which ever dispatches a reply call to have a seed.
         reply_seed = (
-            None if turn == ROUND_ZERO else self._reply_seed(turn, agent.agent_id)
+            None
+            if turn == ROUND_ZERO or no_feed
+            else self._reply_seed(turn, agent.agent_id)
         )
         prompt_tokens = reply_prompt_tokens + probe_prompt_tokens
         completion_tokens = (
@@ -1142,6 +1193,9 @@ class SimulationOrchestrator:
                 latency_ms=latency_ms,
                 api_call_status="failed_logged_null",
                 timestamp_utc=_now_utc_iso(),
+                feed_size=feed_size,
+                n_neighbors_over_threshold=n_neighbors_over_threshold,
+                recsys_fallback=recsys_fallback,
             )
 
         _, reading = probe
@@ -1175,8 +1229,11 @@ class SimulationOrchestrator:
             completion_token_count=completion_tokens,
             model_backend_id=self._run.model_backend_id,
             latency_ms=latency_ms,
-            api_call_status="success",
+            api_call_status="no_feed" if no_feed else "success",
             timestamp_utc=_now_utc_iso(),
+            feed_size=feed_size,
+            n_neighbors_over_threshold=n_neighbors_over_threshold,
+            recsys_fallback=recsys_fallback,
         )
 
     # --- bank regime: remembered rounds ---------------------------------
@@ -1518,6 +1575,15 @@ def _build_strategy(run: ExperimentRun, seeds: SeedManager) -> RecommendationStr
     exist yet at wiring time; the orchestrator verifies the two agree before
     it dispatches anything.
     """
+    if run.neighbor_strategy == "graph_similarity":
+        return GraphSimilaritySampling(
+            [agent_id_for(i) for i in range(run.M)],
+            degree=run.graph_degree,
+            rewire_p=run.graph_rewire_p,
+            k=run.N,
+            graph_seed=seeds.graph_seed,
+            threshold=run.recsys_threshold,
+        )
     if run.neighbor_strategy == "graph":
         return GraphSampling(
             [agent_id_for(i) for i in range(run.M)],
@@ -1529,11 +1595,13 @@ def _build_strategy(run: ExperimentRun, seeds: SeedManager) -> RecommendationStr
     return AlphaSampling(run.alpha, run.N)
 
 
-async def _no_probe() -> None:
-    """A placeholder coroutine for an agent whose reply already failed.
+async def _no_call() -> None:
+    """A placeholder coroutine for a position where no call is dispatched:
+    an agent whose reply already failed (so its probe is skipped), or an
+    empty-feed agent (so its reply is skipped; Fix 9).
 
     asyncio.gather needs an awaitable per position so the results line up
-    with the agent list; this returns the same None a failed probe does.
+    with the agent list; this returns the same None a failed call does.
     """
     return None
 

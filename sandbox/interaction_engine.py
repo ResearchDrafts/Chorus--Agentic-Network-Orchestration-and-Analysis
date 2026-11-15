@@ -1,7 +1,7 @@
 """Neighbor selection (full_design_doc.md Sec 3.3).
 
-Two strategies live here, both satisfying RecommendationStrategy and neither
-aware of the other.
+Three strategies live here, all satisfying RecommendationStrategy and none
+aware of the others.
 
 AlphaSampling is Ohagi's mechanism, below, and is unchanged.
 
@@ -12,6 +12,12 @@ and a selection effect cannot be separated afterwards: an agent that moved
 towards its feed and an agent whose feed moved towards it produce the same
 rows. A graph makes the candidate set a structural property of the run, held
 constant while language varies.
+
+GraphSimilaritySampling (Fix 9) is a third mechanism on top of the same
+graph: Jo et al.'s recommendation rule, which does not change who a reader's
+graph neighbours are (that is E5's rewiring, a separate mechanism the two
+are never combined with) but changes which of them it is actually shown,
+ranked by belief similarity within a threshold. See its own docstring.
 
 Ohagi's alpha-sampling mechanism: alpha in [0,1] blends uniform-random
 neighbor selection (alpha=0) with maximally homophilous, stance-distance-
@@ -26,11 +32,13 @@ from __future__ import annotations
 
 import math
 import random
+from dataclasses import dataclass
 from typing import Protocol
 
 import networkx as nx
 
 from sandbox.models import Agent
+from sandbox.probe_scorer import to_x
 
 
 class RecommendationStrategy(Protocol):
@@ -41,7 +49,10 @@ class RecommendationStrategy(Protocol):
         turn: int,
         rng: random.Random,
     ) -> list[Agent]:
-        """Must return exactly N distinct agents, never including speaker itself."""
+        """AlphaSampling and GraphSampling always return exactly N distinct
+        agents, never including speaker itself. GraphSimilaritySampling is
+        the one exception: it may return FEWER than N (its threshold has no
+        effect otherwise -- see its own docstring), including zero."""
         ...
 
 
@@ -409,3 +420,156 @@ class GraphSampling:
             )
         self._graph = graph
         self._neighbors = neighbors
+
+
+@dataclass(frozen=True)
+class RecsysFeedInfo:
+    """What GraphSimilaritySampling.select_neighbors decided for one reader
+    in one round -- logged onto that reader's Interaction row by the
+    orchestrator, which reads it back via feed_info() right after calling
+    select_neighbors."""
+
+    feed_size: int
+    n_neighbors_over_threshold: int | None
+    fallback: bool
+
+
+class GraphSimilaritySampling(GraphSampling):
+    """Jo et al.'s belief-similarity recommendation rule (Fix 9), over the
+    SAME Watts-Strogatz graph GraphSampling builds -- this subclasses it
+    rather than duplicating the construction, so a seed produces byte-
+    identical graphs under both strategies and only select_neighbors itself
+    differs.
+
+    Where GraphSampling samples k of a reader's graph neighbours at random,
+    this instead ranks them by belief similarity and delivers the closest
+    ones, within a threshold -- and, critically, does NOT pad a short feed
+    back up to k when fewer than k neighbours qualify. Filling it back up
+    with the next-closest candidates would make every feed exactly k long
+    regardless of the threshold, which would make the threshold invisible
+    in the output: "up to k" is what lets a tighter threshold show up as a
+    shorter average feed.
+
+    Rewiring (E5) and this rule are two different selection mechanisms --
+    one changes who is a neighbour, this changes which neighbours are read
+    -- and ExperimentRun.check_graph_similarity_requirements /
+    check_rewire_requirements refuse to combine them in one config, so this
+    class never has to reconcile a candidate set that rewire() has moved
+    mid-round.
+
+    Opinion comes from Agent.current_stance() -- the same field
+    _resolve_side reads in the orchestrator -- and NOT from the module-level
+    _current_stance() helper above, which AlphaSampling uses: that helper
+    special-cases turn == 1 to always return initial_stance, which is right
+    for the generated regime (Ohagi's own mechanism, which never probes
+    round 0) but wrong here. The bank regime probes every agent at round 0
+    and applies that reading before turn 1 ever runs, so by turn 1
+    Agent.current_stance() already returns the round-0 probe out of
+    stance_history -- which is exactly "the round 0 baseline probe in round
+    1" this rule is specified to use, and reading initial_stance instead
+    would silently use an unmeasured, configured value in its place.
+
+    current_stance() is on the raw 1-7 probe scale, the same units
+    stance_scale and MIDPOINT use -- but recsys_threshold is specified in x
+    units ([-1, 1], probe_scorer.to_x's signed scale, where 1.0 is Jo et
+    al.'s own 2.0). Every comparison below converts through to_x() before
+    measuring a distance, which is what makes a threshold of 1.0 mean "half
+    the scale's radius" regardless of which raw digits it is computed from.
+
+    "No valid probe" (step 6 of the design) means stance_history is empty:
+    this agent has never been successfully probed, not even at round 0 (Fix
+    I never applies a failed round, so a string of failures leaves
+    stance_history untouched and current_stance() falls back to
+    initial_stance -- a configured value, not a measurement). That is the
+    one case this class treats specially, both for the reader (whose
+    candidate ranking has nothing real to rank against) and, independently,
+    for each candidate (dropped from consideration rather than ranked
+    against an unmeasured value).
+
+    Nothing here reads language_condition, or any other condition.
+    """
+
+    def __init__(
+        self,
+        agent_ids: list[str],
+        degree: int,
+        rewire_p: float,
+        k: int,
+        graph_seed: int,
+        threshold: float,
+    ):
+        super().__init__(agent_ids, degree, rewire_p, k, graph_seed)
+        if not (math.isfinite(threshold) and threshold > 0.0):
+            raise ValueError(f"recsys_threshold must be > 0, got {threshold}")
+        self.threshold = threshold
+        self._feed_info: dict[str, RecsysFeedInfo] = {}
+
+    def feed_info(self, agent_id: str) -> RecsysFeedInfo:
+        """This round's selection diagnostics for one reader, read back by
+        the orchestrator right after select_neighbors ran for every agent.
+
+        Raises for an agent select_neighbors has not yet been called for
+        this round (or ever) -- there is no sensible default to hand back,
+        and a caller reaching this before step 3 has a bug.
+        """
+        if agent_id not in self._feed_info:
+            raise ValueError(
+                f"no feed info recorded for {agent_id!r}: select_neighbors "
+                "must run for this agent first"
+            )
+        return self._feed_info[agent_id]
+
+    def select_neighbors(
+        self,
+        speaker: Agent,
+        all_agents: list[Agent],
+        turn: int,
+        rng: random.Random,
+    ) -> list[Agent]:
+        """Up to k adjacent neighbours, closest belief first, within
+        self.threshold -- see the class docstring for the full rule.
+
+        Candidate order: shuffled with `rng`, then stably sorted by
+        |x_i - x_j| -- so ties at the same distance land in a seeded-random
+        relative order rather than always breaking toward whichever agent_id
+        sorts first. The chosen set is then shuffled again with the SAME
+        stream before being returned, so a post's position in the feed is
+        not itself a clue to how similar it was.
+        """
+        by_id = {a.agent_id: a for a in all_agents}
+        candidate_ids = self.neighbors_of(speaker.agent_id)
+
+        if not speaker.stance_history:
+            # No valid probe at all: rank against nothing, fall back to k
+            # random graph neighbours -- the same thing GraphSampling itself
+            # would deliver.
+            chosen_ids = rng.sample(candidate_ids, self.k)
+            self._feed_info[speaker.agent_id] = RecsysFeedInfo(
+                feed_size=len(chosen_ids),
+                n_neighbors_over_threshold=None,
+                fallback=True,
+            )
+            return [by_id[agent_id] for agent_id in chosen_ids]
+
+        x_i = to_x(speaker.current_stance())
+        with_probe = [
+            agent_id for agent_id in candidate_ids if by_id[agent_id].stance_history
+        ]
+        gap = {
+            agent_id: abs(x_i - to_x(by_id[agent_id].current_stance()))
+            for agent_id in with_probe
+        }
+        n_over_threshold = sum(1 for d in gap.values() if d > self.threshold)
+        eligible = [agent_id for agent_id in with_probe if gap[agent_id] <= self.threshold]
+
+        rng.shuffle(eligible)
+        eligible.sort(key=lambda agent_id: gap[agent_id])
+        chosen_ids = eligible[: self.k]
+        rng.shuffle(chosen_ids)
+
+        self._feed_info[speaker.agent_id] = RecsysFeedInfo(
+            feed_size=len(chosen_ids),
+            n_neighbors_over_threshold=n_over_threshold,
+            fallback=False,
+        )
+        return [by_id[agent_id] for agent_id in chosen_ids]

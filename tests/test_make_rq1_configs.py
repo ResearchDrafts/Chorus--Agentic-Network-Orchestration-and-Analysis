@@ -288,6 +288,73 @@ def test_rewire_rate_never_touches_e3_e4(campaign):
     assert config["rewire_rate"] == 0.0
 
 
+# --- Fix 9: e8/e9 and --recsys-threshold -----------------------------------
+
+
+def test_e8_uses_graph_similarity_e9_uses_random_neighbours(campaign):
+    out = campaign("--seeds", "1", "--experiments", "e8", "e9")
+    e8 = yaml.safe_load((out / "e8_english_ws_s01.yaml").read_text())
+    e9 = yaml.safe_load((out / "e9_english_ws_s01.yaml").read_text())
+    assert e8["neighbor_strategy"] == "graph_similarity"
+    assert e9["neighbor_strategy"] == "graph"
+    assert e8["N"] == e9["N"] == gen.RECSYS_N
+    assert e8["graph_degree"] == e9["graph_degree"] == gen.RECSYS_GRAPH_DEGREE
+
+
+def test_e8_e9_use_balanced_two_camps(campaign):
+    out = campaign("--seeds", "1", "--experiments", "e8", "e9")
+    for experiment in ("e8", "e9"):
+        config = yaml.safe_load((out / f"{experiment}_english_ws_s01.yaml").read_text())
+        assert config["lean_assignment"] == "balanced_two_camps"
+
+
+def test_e8_e9_share_the_same_seed_and_graph_as_e3(campaign):
+    """The matched-set guarantee extends to e8/e9: same seed index, same
+    base seed, so the same graph_seed -- the N/graph_degree difference from
+    e3 is the only structural change."""
+    out = campaign("--seeds", "1", "--experiments", "e3", "e8", "e9")
+    e3 = yaml.safe_load((out / "e3_english_ws_s01.yaml").read_text())
+    e8 = yaml.safe_load((out / "e8_english_ws_s01.yaml").read_text())
+    e9 = yaml.safe_load((out / "e9_english_ws_s01.yaml").read_text())
+    assert e3["seed"] == e8["seed"] == e9["seed"]
+
+
+def test_default_recsys_threshold_leaves_e8_filenames_unchanged(campaign):
+    out = campaign("--seeds", "1", "--experiments", "e8")
+    assert (out / "e8_english_ws_s01.yaml").exists()
+    config = yaml.safe_load((out / "e8_english_ws_s01.yaml").read_text())
+    assert config["recsys_threshold"] == gen.DEFAULT_RECSYS_THRESHOLD
+
+
+def test_a_non_default_recsys_threshold_appears_in_the_run_id(campaign):
+    out = campaign("--seeds", "1", "--experiments", "e8", "--recsys-threshold", "0.5")
+    assert (out / "e8_english_ws_t0p5_s01.yaml").exists()
+    config = yaml.safe_load((out / "e8_english_ws_t0p5_s01.yaml").read_text())
+    assert config["recsys_threshold"] == 0.5
+    assert config["run_id"] == "e8_english_ws_t0p5_s01"
+
+
+def test_recsys_threshold_never_touches_e9(campaign):
+    """e9 uses the "graph" strategy, where recsys_threshold is inert: base.yaml
+    does not set the key at all, and e9's own overrides must not add it either
+    -- its run_config.json would otherwise claim a filter it never applies.
+    (The schema default of 1.0 still applies once loaded; this checks the
+    written YAML, like test_rewire_rate_never_touches_e3_e4's own check.)"""
+    out = campaign("--seeds", "1", "--experiments", "e9", "--recsys-threshold", "0.5")
+    assert (out / "e9_english_ws_s01.yaml").exists()  # no threshold token
+    config = yaml.safe_load((out / "e9_english_ws_s01.yaml").read_text())
+    assert "recsys_threshold" not in config
+    assert load_run_config(out / "e9_english_ws_s01.yaml").recsys_threshold == (
+        gen.DEFAULT_RECSYS_THRESHOLD
+    )
+
+
+def test_recsys_threshold_never_touches_e3_e4(campaign):
+    out = campaign("--seeds", "1", "--experiments", "e3", "--recsys-threshold", "0.5")
+    config = yaml.safe_load((out / "e3_english_ws_s01.yaml").read_text())
+    assert "recsys_threshold" not in config
+
+
 # --- --rounds ----------------------------------------------------------
 
 
@@ -416,15 +483,16 @@ def test_the_shipped_campaign_directory_is_in_sync_with_the_generator(tmp_path):
     would leave a campaign nobody could reproduce.
 
     The shipped directory was generated with
-    `--experiments e3 e4 e5 e6 e7 --seeds 6 --rounds 20`, per the campaign's
-    own regeneration command -- a run with no flags no longer matches it,
-    since E5's three arms and the 20-round campaign are part of what is
-    checked in now.
+    `--experiments e3 e4 e5 e6 e7 e8 e9 --seeds 6 --rounds 20`, per the
+    campaign's own regeneration command -- a run with no flags no longer
+    matches it, since E5's three arms, Fix 9's e8/e9 and the 20-round
+    campaign are part of what is checked in now.
     """
     out = tmp_path / "campaign"
     assert gen.main(
         ["--base", str(BASE), "--probe-questions", str(QUESTIONS), "--out", str(out),
-         "--experiments", "e3", "e4", "e5", "e6", "e7", "--seeds", "6", "--rounds", "20"]
+         "--experiments", "e3", "e4", "e5", "e6", "e7", "e8", "e9",
+         "--seeds", "6", "--rounds", "20"]
     ) == 0
 
     produced = {p.name: p.read_text(encoding="utf-8") for p in out.iterdir()}

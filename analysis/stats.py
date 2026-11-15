@@ -106,6 +106,25 @@ E5_E7_METRICS = (
     "final_cross_side_edge_share",
 )
 
+# Fix 9: e8 (the similarity recommender) vs. e9 (random neighbours at the
+# same feed size N=5), contrasted the same way e5-vs-e6/e5-vs-e7 are:
+# language minus English within each, and the difference between them.
+# final_neighbor_corr is not its own column -- Wang et al.'s "correlation
+# between an agent's opinion and its neighbours' mean" is exactly what
+# analysis/metrics.py's nci() already computes (it follows their text
+# description, not their printed formula), and correlation is invariant to
+# the x-vs-v=2x rescaling, so final_nci IS final_neighbor_corr under this
+# codebase's naming. Listed here once, under the name the rest of this
+# module already uses, rather than duplicating the column.
+RECSYS_METRICS = (
+    "auc_nci_excess",
+    "final_nci",
+    "final_global_disagreement",
+    "final_polarization_index",
+    "final_mean_belief_shift",
+    "final_minority_share",
+)
+
 # Bootstrap settings. Seeded, so re-running the analysis reproduces the
 # interval: a confidence interval that moved between two runs of the same
 # script on the same data would be impossible to report.
@@ -492,6 +511,7 @@ def paired_differences(
     experiment: str,
     language: str,
     rewire_rate: float | None = None,
+    recsys_threshold: float | None = None,
 ) -> dict[int, float]:
     """`metric` for `language` minus the same for English, per shared seed.
 
@@ -504,11 +524,17 @@ def paired_differences(
     `rewire_rate`, when given, also restricts the arm to that rate -- a
     campaign that swept --rewire-rate has e5/e6/e7 runs at more than one
     rate, and pooling them would average a difference across two different
-    experiments in substance, not just in name.
+    experiments in substance, not just in name. `recsys_threshold` is the
+    same idea for a --recsys-threshold sweep of e8/e9; the two are mutually
+    exclusive in practice (e5/e6/e7 never set recsys_threshold away from its
+    schema default, e8/e9 never set rewire_rate above 0), but both are
+    accepted so a caller never has to know which experiment it is filtering.
     """
     arm = frame[frame.experiment == experiment]
     if rewire_rate is not None:
         arm = arm[arm.rewire_rate == rewire_rate]
+    if recsys_threshold is not None:
+        arm = arm[arm.recsys_threshold == recsys_threshold]
     reference = arm[arm.language == REFERENCE_LANGUAGE].set_index("seed")[metric]
     other = arm[arm.language == language].set_index("seed")[metric]
     shared = sorted(set(reference.index) & set(other.index))
@@ -525,6 +551,7 @@ def censored_count(
     language: str,
     seeds,
     rewire_rate: float | None = None,
+    recsys_threshold: float | None = None,
 ) -> int:
     """How many of `seeds` were censored (t_echo = K + 1, echo_censored)
     for this experiment/language(/rate) arm.
@@ -540,6 +567,8 @@ def censored_count(
     arm = frame[(frame.experiment == experiment) & (frame.language == language)]
     if rewire_rate is not None:
         arm = arm[arm.rewire_rate == rewire_rate]
+    if recsys_threshold is not None:
+        arm = arm[arm.recsys_threshold == recsys_threshold]
     if "echo_censored" not in arm.columns:
         return 0
     censored_seeds = set(arm.loc[arm.echo_censored.astype(bool), "seed"])
@@ -593,7 +622,7 @@ def wilcoxon_p(values: list[float]) -> float | None:
 
 
 NETWORK_COLUMNS = (
-    "metric", "scope", "language", "contrast", "rewire_rate", "n",
+    "metric", "scope", "language", "contrast", "rewire_rate", "recsys_threshold", "n",
     "mean_diff", "ci_low", "ci_high", "p_raw", "p_holm", "reject_at_05",
     "family_size", "underpowered", "seeds", "primary",
     "n_censored_treatment", "n_censored_control", "censored_warning",
@@ -605,6 +634,7 @@ def network_contrasts(
     metrics: tuple[str, ...] = NETWORK_METRICS,
     experiment_pair: tuple[str, str] = ("e3", "e4"),
     rewire_rate: float | None = None,
+    recsys_threshold: float | None = None,
 ) -> list[dict]:
     """Three scopes per metric per language: within the treatment, within
     the control, and the difference-in-differences between them.
@@ -631,7 +661,8 @@ def network_contrasts(
     `rewire_rate`, when given, is threaded into every paired_differences call
     and into each row's Holm family, so a campaign that swept --rewire-rate
     never pools two rates into one contrast: main() calls this once per rate
-    present among the echo-chamber runs.
+    present among the echo-chamber runs. `recsys_threshold` does the same
+    for a --recsys-threshold sweep of e8/e9.
     """
     treatment, control = experiment_pair
     languages = [
@@ -642,8 +673,12 @@ def network_contrasts(
     rows: list[dict] = []
     for metric in metrics:
         for language in languages:
-            treated = paired_differences(frame, metric, treatment, language, rewire_rate)
-            baseline = paired_differences(frame, metric, control, language, rewire_rate)
+            treated = paired_differences(
+                frame, metric, treatment, language, rewire_rate, recsys_threshold
+            )
+            baseline = paired_differences(
+                frame, metric, control, language, rewire_rate, recsys_threshold
+            )
             did = {
                 seed: treated[seed] - baseline[seed]
                 for seed in sorted(set(treated) & set(baseline))
@@ -665,16 +700,23 @@ def network_contrasts(
                  set(did), set(did)),
             ):
                 n_censored_treatment = (
-                    censored_count(frame, treatment, language, treatment_seeds, rewire_rate)
+                    censored_count(
+                        frame, treatment, language, treatment_seeds,
+                        rewire_rate, recsys_threshold,
+                    )
                     if censored else None
                 )
                 n_censored_control = (
-                    censored_count(frame, control, language, control_seeds, rewire_rate)
+                    censored_count(
+                        frame, control, language, control_seeds,
+                        rewire_rate, recsys_threshold,
+                    )
                     if censored else None
                 )
                 rows.append(
                     _network_row(
                         metric, scope, language, label, values, rewire_rate,
+                        recsys_threshold,
                         n_censored_treatment=n_censored_treatment,
                         n_censored_control=n_censored_control,
                     )
@@ -689,6 +731,7 @@ def _network_row(
     label: str,
     values: dict[int, float],
     rewire_rate: float | None = None,
+    recsys_threshold: float | None = None,
     *,
     n_censored_treatment: int | None = None,
     n_censored_control: int | None = None,
@@ -701,18 +744,25 @@ def _network_row(
         if n_censored_treatment is None and n_censored_control is None
         else bool((n_censored_treatment or 0) + (n_censored_control or 0) > 0)
     )
+    family = f"{metric}|{scope}"
+    if rewire_rate is not None:
+        family += f"|rate={rewire_rate}"
+    if recsys_threshold is not None:
+        family += f"|threshold={recsys_threshold}"
     return {
         # Holm family: one metric, one scope, the three non-English
-        # languages, at one rewire rate. That is the set of tests answering
-        # one question, which is what a correction family is -- folding the
-        # rate in here means two rates are never pooled even if a caller
-        # later concatenates rows from multiple network_contrasts() calls.
-        "_family": f"{metric}|{scope}" if rewire_rate is None else f"{metric}|{scope}|rate={rewire_rate}",
+        # languages, at one rewire rate (or recsys threshold). That is the
+        # set of tests answering one question, which is what a correction
+        # family is -- folding the rate/threshold in here means two sweep
+        # points are never pooled even if a caller later concatenates rows
+        # from multiple network_contrasts() calls.
+        "_family": family,
         "metric": metric,
         "scope": scope,
         "language": language,
         "contrast": label,
         "rewire_rate": rewire_rate,
+        "recsys_threshold": recsys_threshold,
         # Stated in every row: a mean difference over three seeds and one
         # over twenty are not the same claim, and the column is the only
         # place that shows it.
@@ -831,6 +881,38 @@ def _echo_contrasts_for_pair(
     return rows
 
 
+def _recsys_contrasts_for_pair(
+    runs: pd.DataFrame, pair: tuple[str, str], metrics: tuple[str, ...]
+) -> list[dict]:
+    """network_contrasts(), once per recsys_threshold present among `pair`'s
+    own runs -- Fix 9's e8-vs-e9 family, built the same way
+    _echo_contrasts_for_pair builds e5-vs-e6/e5-vs-e7, grouping by
+    recsys_threshold instead of rewire_rate. [] (with a warning) under the
+    same two guards: neither arm of `pair` present, or a run_metrics.csv
+    written before a needed column existed.
+    """
+    present = set(pair) <= set(runs.get("experiment", pd.Series(dtype=object)))
+    if not present:
+        return []
+    missing = [name for name in (*metrics, "recsys_threshold") if name not in runs.columns]
+    if missing:
+        print(
+            f"  WARNING: {pair[0]}/{pair[1]} runs are present but "
+            f"run_metrics.csv has no {missing} column(s) -- re-run "
+            f"analysis.metrics to pick them up. Skipping the "
+            f"{pair[0]}-vs-{pair[1]} contrast."
+        )
+        return []
+    pair_runs = runs[runs.experiment.isin(list(pair))]
+    thresholds = sorted(pair_runs["recsys_threshold"].dropna().unique())
+    rows: list[dict] = []
+    for threshold in thresholds:
+        rows += network_contrasts(
+            runs, metrics=metrics, experiment_pair=pair, recsys_threshold=float(threshold)
+        )
+    return rows
+
+
 # --- entry point ----------------------------------------------------------
 
 
@@ -885,6 +967,11 @@ def main(argv: list[str] | None = None) -> int:
     # does not have it.
     network += _echo_contrasts_for_pair(runs, ("e5", "e6"), ECHO_METRICS)
     network += _echo_contrasts_for_pair(runs, ("e5", "e7"), E5_E7_METRICS)
+    # Fix 9: e8 (the similarity recommender) vs. e9 (its same-feed-size
+    # random control), its own Holm-corrected family, skipped with a
+    # warning the same way the two E5 families are when neither arm of the
+    # pair is present in this campaign.
+    network += _recsys_contrasts_for_pair(runs, ("e8", "e9"), RECSYS_METRICS)
 
     has_echo_experiments = bool(
         {"e5", "e6", "e7"} & set(runs.get("experiment", pd.Series(dtype=object)))

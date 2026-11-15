@@ -856,3 +856,84 @@ def test_main_survives_a_sweep_with_too_few_items(tmp_path, e1_path, monkeypatch
     contrasts = pd.read_csv(results / "e1_contrasts.csv")
     assert contrasts.p_raw.isna().all()
     assert not contrasts.reject_at_05.any()
+
+
+# --- Fix 9: the e8-vs-e9 family --------------------------------------------
+
+
+def _recsys_run(experiment, language, seed, *, recsys_threshold=1.0, **extra) -> dict:
+    row = {
+        "experiment": experiment, "language": language, "seed": seed,
+        "recsys_threshold": recsys_threshold,
+        "auc_nci_excess": 0.1, "final_nci": 0.2,
+        "final_global_disagreement": 0.3, "final_polarization_index": 0.4,
+        "final_mean_belief_shift": 0.1, "final_minority_share": 0.4,
+    }
+    row.update(extra)
+    return row
+
+
+def test_recsys_contrasts_for_pair_requires_both_experiments_present():
+    frame = _run_metrics([_recsys_run("e8", "hindi", 1001)])
+    assert st._recsys_contrasts_for_pair(frame, ("e8", "e9"), st.RECSYS_METRICS) == []
+
+
+def test_recsys_contrasts_for_pair_runs_when_both_are_present():
+    frame = _run_metrics([
+        _recsys_run("e8", "hindi", 1001), _recsys_run("e9", "hindi", 1001),
+    ])
+    rows = st._recsys_contrasts_for_pair(frame, ("e8", "e9"), st.RECSYS_METRICS)
+    assert rows
+    assert {r["scope"] for r in rows} == {"within_e8", "within_e9", "did"}
+    assert all(r["metric"] in st.RECSYS_METRICS for r in rows)
+    assert all(r["recsys_threshold"] == 1.0 for r in rows)
+    # Never pooled with rewire_rate: e8/e9 never carry one.
+    assert all(r["rewire_rate"] is None for r in rows)
+
+
+def test_recsys_contrasts_are_grouped_by_threshold():
+    """A --recsys-threshold sweep must never average two thresholds'
+    results into one contrast, the same sweep-safety rewire_rate gets."""
+    frame = _run_metrics([
+        _recsys_run("e8", "english", 1001, recsys_threshold=1.0, final_nci=0.1),
+        _recsys_run("e8", "hindi", 1001, recsys_threshold=1.0, final_nci=0.3),
+        _recsys_run("e9", "english", 1001, recsys_threshold=1.0, final_nci=0.1),
+        _recsys_run("e9", "hindi", 1001, recsys_threshold=1.0, final_nci=0.2),
+        _recsys_run("e8", "english", 1001, recsys_threshold=0.5, final_nci=0.1),
+        _recsys_run("e8", "hindi", 1001, recsys_threshold=0.5, final_nci=0.9),
+        _recsys_run("e9", "english", 1001, recsys_threshold=0.5, final_nci=0.1),
+        _recsys_run("e9", "hindi", 1001, recsys_threshold=0.5, final_nci=0.2),
+    ])
+    rows = st._recsys_contrasts_for_pair(frame, ("e8", "e9"), st.RECSYS_METRICS)
+    thresholds = {r["recsys_threshold"] for r in rows}
+    assert thresholds == {1.0, 0.5}
+    did_at_1 = next(
+        r for r in rows
+        if r["scope"] == "did" and r["metric"] == "final_nci" and r["recsys_threshold"] == 1.0
+    )
+    did_at_half = next(
+        r for r in rows
+        if r["scope"] == "did" and r["metric"] == "final_nci" and r["recsys_threshold"] == 0.5
+    )
+    # threshold=1.0: e8 DiD (0.3-0.1) - e9 DiD (0.2-0.1) = 0.2 - 0.1 = 0.1
+    assert did_at_1["mean_diff"] == pytest.approx(0.1)
+    # threshold=0.5: e8 DiD (0.9-0.1) - e9 DiD (0.2-0.1) = 0.8 - 0.1 = 0.7
+    assert did_at_half["mean_diff"] == pytest.approx(0.7)
+
+
+def test_recsys_family_is_independent_of_the_echo_families():
+    """A campaign carrying both e5/e6 and e8/e9 rows must produce the same
+    e5-vs-e6 contrast it would alone -- the two families are computed from
+    two separate network_contrasts() calls and must not leak into each
+    other despite overlapping metric names (auc_nci_excess is in both)."""
+    echo_only = _run_metrics([
+        _echo_run("e5", "hindi", 1001), _echo_run("e6", "hindi", 1001),
+    ])
+    mixed = _run_metrics([
+        _echo_run("e5", "hindi", 1001), _echo_run("e6", "hindi", 1001),
+        _recsys_run("e8", "hindi", 1001), _recsys_run("e9", "hindi", 1001),
+    ])
+    echo_alone = st._echo_contrasts_for_pair(echo_only, ("e5", "e6"), st.ECHO_METRICS)
+    echo_mixed = st._echo_contrasts_for_pair(mixed, ("e5", "e6"), st.ECHO_METRICS)
+    key = lambda r: (r["metric"], r["scope"], r["language"])
+    assert sorted(echo_alone, key=key) == sorted(echo_mixed, key=key)

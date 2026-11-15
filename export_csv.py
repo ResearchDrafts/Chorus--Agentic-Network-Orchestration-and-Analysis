@@ -79,6 +79,11 @@ RUN_FIELDS = (
     # happened not to move anybody.
     "regime", "delivery", "neighbor_strategy", "graph_degree", "graph_rewire_p",
     "bank_path", "probe_mass_floor", "memory_rounds",
+    # Fix 9: the similarity recommender's own filter. Present (at its
+    # schema default of 1.0) on every run, not only graph_similarity ones,
+    # the same "empty rather than absent" convention every other optional
+    # bank column here follows.
+    "recsys_threshold",
 )
 
 # Fix 7: the structured persona attributes, joined from agents_final.jsonl
@@ -267,6 +272,13 @@ def _derive_bank_columns(df: pd.DataFrame) -> pd.DataFrame:
     # happened) are all preserved rather than None collapsing to NaN under a
     # bool dtype.
     df["reply_truncated"] = _column(df, "reply_truncated", object)
+    # Fix 9: the similarity recommender's per-row diagnostics. Empty (not
+    # absent) outside neighbor_strategy="graph_similarity" and for any run
+    # logged before this field existed, like every other optional bank
+    # column above.
+    df["feed_size"] = _column(df, "feed_size", float)
+    df["n_neighbors_over_threshold"] = _column(df, "n_neighbors_over_threshold", float)
+    df["recsys_fallback"] = _column(df, "recsys_fallback", object)
     return _derive_exposure_columns(df, items)
 
 

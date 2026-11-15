@@ -85,6 +85,16 @@ ECHO_EXPERIMENT_LABELS = {
     "e5": "E5 (rewiring on)", "e6": "E6 (control)", "e7": "E7 (random rewiring)",
 }
 
+# Fix 9's similarity-recommender arm (e8, solid) and its same-feed-size
+# random control (e9, dashed) -- a separate dict from ECHO_EXPERIMENT_STYLES
+# rather than added into it, since e8/e9 never rewire and folding them into
+# the E5-family dict would silently add their lines to figures captioned
+# "solid: E5 · dashed: E6 · dotted: E7".
+RECSYS_EXPERIMENT_STYLES = {"e8": "-", "e9": "--"}
+RECSYS_EXPERIMENT_LABELS = {
+    "e8": "E8 (similarity recommender)", "e9": "E9 (random, same feed size)",
+}
+
 # Side categories for the network-snapshot figure, by sign of x -- the same
 # three-way split cross_side_edge_share and minority_share use upstream in
 # analysis/metrics.py, computed here rather than imported, since that

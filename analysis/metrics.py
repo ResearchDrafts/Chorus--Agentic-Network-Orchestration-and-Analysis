@@ -407,8 +407,9 @@ def _float_or_none(value) -> float | None:
 # arms (treatment, the shadow-item control, and the rewiring-without-
 # selection control); recognizing them here is what lets t_echo and
 # assort_excess find them by run_id the same way e3/e4 already are, and lets
-# stats.py's e5-vs-e6 contrast find its two arms.
-EXPERIMENT_PREFIXES = ("e3", "e4", "e5", "e6", "e7")
+# stats.py's e5-vs-e6 contrast find its two arms. e8/e9 are Fix 9's
+# similarity-recommender arm and its same-feed-size random control.
+EXPERIMENT_PREFIXES = ("e3", "e4", "e5", "e6", "e7", "e8", "e9")
 
 
 def experiment_of(run_id: str) -> str:
@@ -438,6 +439,12 @@ ROUND_COLUMNS = (
     "nci", "nci_null_mean", "nci_null_hi", "nci_excess", "bimodality",
     "mean_belief_shift", "mean_signed_shift",
     "n_rewires", "n_side_switches",
+    # Fix 9: the similarity recommender's own round shape. All None for a
+    # round with no feed_size column at all (every pre-Fix-9 run, and every
+    # non-graph_similarity strategy) -- "no such measurement", the same
+    # convention every other optional metric here follows.
+    "mean_feed_size", "share_empty_feed", "share_neighbors_filtered",
+    "mean_feed_gap", "mean_neighbor_gap",
     *(f"share_{name}" for name in OUTCOMES),
     "n_valid", "n_failed",
     "mean_reply_prompt_tokens", "mean_probe_prompt_tokens",
@@ -576,6 +583,13 @@ def round_rows(
             "mean_signed_shift": sum(shifts) / len(shifts) if shifts else None,
             "n_rewires": (rewires or {}).get(turn, 0),
             "n_side_switches": n_side_switches,
+            "mean_feed_size": _mean_or_none(turn_frame.get("feed_size", pd.Series(dtype=float))),
+            "share_empty_feed": _share_empty_feed(turn_frame),
+            "share_neighbors_filtered": share_neighbors_filtered(
+                round_graph, known, config.get("recsys_threshold")
+            ),
+            "mean_feed_gap": mean_feed_gap(turn_frame, known),
+            "mean_neighbor_gap": local_dis,
             "n_valid": len(rows),
             "n_failed": population - len(rows),
             "mean_reply_prompt_tokens": _mean_or_none(
@@ -817,6 +831,85 @@ def disagreement_ratio(local: float | None, pairwise: float | None) -> float | N
     return local / pairwise
 
 
+# --- Fix 9: the similarity recommender's own round shape -------------------
+#
+# These three ask whether the recommender did anything, independent of
+# whether it moved any opinion: mean_feed_size/share_empty_feed are a
+# property of the FEED (what was actually delivered, under any strategy --
+# GraphSampling and AlphaSampling never deliver fewer than N, so these two
+# are a no-op everywhere but neighbor_strategy="graph_similarity");
+# share_neighbors_filtered and mean_feed_gap are a property of the graph the
+# feed was drawn from and compare it against mean_neighbor_gap, which is
+# local_disagreement under a second name -- the round's own full
+# neighbourhood, filtered by nothing -- so the two numbers side by side show
+# whether the recommender's feed disagreed less than the raw graph would
+# have.
+
+
+def _share_empty_feed(turn_frame: pd.DataFrame) -> float | None:
+    """Share of this round's rows whose feed_size is exactly 0.
+
+    None when the column is absent or every value is null -- a run with no
+    feed_size column never ran the similarity recommender, and "0 agents had
+    an empty feed" would claim a measurement that was never made.
+    """
+    if "feed_size" not in turn_frame.columns:
+        return None
+    col = turn_frame["feed_size"].dropna()
+    if col.empty:
+        return None
+    return float((col == 0).mean())
+
+
+def mean_feed_gap(turn_frame: pd.DataFrame, x_by_agent: dict[str, float]) -> float | None:
+    """Mean |x_i - x_j| over every (reader, delivered post's sender) pair
+    actually assembled this round -- whatever the strategy, since every
+    strategy logs neighbor_agent_ids as the feed it delivered.
+
+    Under GraphSampling/AlphaSampling this is the same N posts every reader
+    always gets; under graph_similarity it is the (up to N) posts the
+    recommender actually chose, which is the number mean_neighbor_gap (the
+    round's full candidate neighbourhood, filtered by nothing) is the
+    baseline for.
+
+    None when no pair has both ends known -- round 0, where nothing was
+    delivered, and any round with no usable readings at all.
+    """
+    gaps: list[float] = []
+    for row in turn_frame.itertuples():
+        reader = row.speaker_agent_id
+        if reader not in x_by_agent:
+            continue
+        raw = getattr(row, "neighbor_agent_ids", "") or ""
+        for sender in str(raw).split("|"):
+            if sender and sender in x_by_agent:
+                gaps.append(abs(x_by_agent[reader] - x_by_agent[sender]))
+    if not gaps:
+        return None
+    return sum(gaps) / len(gaps)
+
+
+def share_neighbors_filtered(
+    graph: nx.Graph | None, x_by_agent: dict[str, float], threshold: float | None
+) -> float | None:
+    """Share of this round's graph edges -- the full candidate
+    neighbourhood, not the delivered feed -- whose two known ends disagree
+    by more than `threshold`.
+
+    None when there is no graph, no threshold (a run logged before
+    recsys_threshold existed), or no edge survives with both ends known --
+    the same "not defined" answer every other graph metric here gives.
+    """
+    if graph is None or threshold is None:
+        return None
+    known = {a: x for a, x in x_by_agent.items() if a in graph}
+    edges = [(a, b) for a, b in graph.edges if a in known and b in known]
+    if not edges:
+        return None
+    over = sum(1 for a, b in edges if abs(known[a] - known[b]) > threshold)
+    return over / len(edges)
+
+
 def _pearson(a: list[float], b: list[float]) -> float | None:
     """The Pearson correlation of `a` and `b`, or None below two
     observations or when either has zero variance -- a correlation needs
@@ -967,7 +1060,7 @@ def reply_truncated_rate(frame: pd.DataFrame) -> float | None:
 RUN_COLUMNS = (
     "run_id", "experiment", "language", "seed", "delivery", "K", "M", "N",
     "topic", "model_backend_id", "neighbor_strategy",
-    "rewire_rate", "rewire_target", "lean_assignment",
+    "rewire_rate", "rewire_target", "lean_assignment", "recsys_threshold",
     "final_turn", "final_mean_x", "final_var_x", "final_extremity",
     "final_assortativity",
     "final_assort_excess", "final_cross_side_edge_share", "final_minority_share",
@@ -1030,6 +1123,7 @@ def run_row(
         "rewire_rate": config.get("rewire_rate"),
         "rewire_target": config.get("rewire_target"),
         "lean_assignment": config.get("lean_assignment"),
+        "recsys_threshold": config.get("recsys_threshold"),
         "final_turn": final["turn"],
         "final_mean_x": final["mean_x"],
         "final_var_x": final["var_x"],

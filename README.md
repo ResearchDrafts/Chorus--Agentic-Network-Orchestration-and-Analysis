@@ -433,7 +433,8 @@ rewire is applied if it would drop a neighbour below `N`.
 overrides `K` for every experiment generated, and `--probe-language` pins
 every arm's probe question to one language while posts stay in each arm's
 own (an E1-style control). The shipped `configs/rq1/campaign/` was generated
-with `--experiments e3 e4 e5 e6 e7 --seeds 6 --rounds 20`.
+with `--experiments e3 e4 e5 e6 e7 e8 e9 --seeds 6 --rounds 20` (e8/e9 are
+Fix 9's similarity recommender, below).
 
 **Metrics**, per round in `round_metrics.csv` and as `final_*`/run-level
 values in `run_metrics.csv` (`analysis/metrics.py`). Wang et al.,
@@ -493,6 +494,88 @@ languages, and writes `calibration/starts.csv`; `--suggest` prints the mix
 closest to each target lean and writes a ready-to-paste `starter_counts`
 block. The `(0, 0)` row doubles as a check for whether the model carries a
 prior on the topic that no starter-post mix could correct.
+
+### E8, E9: a similarity-based recommender, as a third selection mechanism
+
+E5's rewiring changes **who is a neighbour**. Jo et al., "Model-Specific Echo
+Chamber Formation Patterns in Repeated LLM Agent Networks" (IAIT 2026), ask a
+different question over a *fixed* graph: what if a recommender decides
+**which of a reader's existing neighbours it actually sees**? `neighbor_strategy:
+graph_similarity` (`GraphSimilaritySampling` in `sandbox/interaction_engine.py`,
+a subclass of `GraphSampling` so a seed builds byte-identical graphs under
+both) implements their rule: among a reader's adjacent graph neighbours whose
+belief differs from its own by at most `recsys_threshold` (in `x` units,
+`[-1, 1]`; their own threshold is 2.0 on `[-2, 2]`, i.e. `1.0` here), deliver
+up to `N` of the closest, ranked by `|x_i - x_j|` with ties and final delivery
+order broken by the round's own neighbour RNG stream. **Fewer than `N`
+qualify: deliver what there is, never pad back up with the next-closest** --
+that is the only way the threshold has a visible effect; filling a short feed
+back up would make every feed exactly `N` long regardless of the threshold.
+A reader with no valid probe reading of its own (never successfully probed,
+not even at round 0) falls back to `N` random graph neighbours, logged as
+`recsys_fallback`. An empty feed skips that reader's reply call for the round
+-- there is nothing to reply to -- but still runs its probe, logged as
+`api_call_status="no_feed"`, a real, applicable round rather than a failure.
+
+Opinion comes from `Agent.current_stance()`, the same field `_resolve_side`
+reads for E5's side assignment -- not the module-level `_current_stance()`
+helper `AlphaSampling` uses, which special-cases turn 1 to `initial_stance`
+and would read an unmeasured, configured value instead of the round-0 probe
+the bank regime has already applied by then.
+
+Rewiring (E5) and this rule are two different selection mechanisms and are
+never combined in one run: `graph_similarity` requires `regime="bank"`
+unconditionally, and `rewire_rate > 0` requires `neighbor_strategy="graph"`
+exactly, so a `graph_similarity` config with rewiring asked for is rejected
+at load time either way.
+
+| Experiment | `neighbor_strategy` | `N` | What it is |
+|---|---|---|---|
+| E8 | `graph_similarity` | 5 | The recommender: up to 5 of the closest-belief neighbours within `recsys_threshold`. |
+| E9 | `graph` (random neighbours) | 5 | The control, at the same feed size E8 reads -- E3's `N=3` cannot serve that role. |
+
+Both use `balanced_two_camps` and the same graph seed as every other
+experiment of a seed index; `scripts/make_rq1_configs.py --experiments e8
+e9` adds them (`RECSYS_N=5`, `RECSYS_GRAPH_DEGREE=6`, overridden only for
+e8/e9 so e3 through e7's own files are unaffected -- see Known Limitations
+for a smoke-scale graph-construction edge case this combination hits at one
+seed index), and `--recsys-threshold` sweeps E8's own threshold the same way
+`--rewire-rate` sweeps E5/E6/E7's rate, appearing in the run_id only when it
+differs from the `1.0` default (`e8_english_ws_t0p5_s01`).
+
+**Logging.** Per `Interaction`: `feed_size` (0 to `N`, not always `N`),
+`n_neighbors_over_threshold` (how many of the reader's current graph
+neighbours it would have excluded, `None` when the reader itself had no
+valid probe to compare against), `recsys_fallback`. Per round, in
+`round_metrics.csv`: `mean_feed_size`, `share_empty_feed`,
+`share_neighbors_filtered` (share of the round's own graph edges -- the
+full candidate neighbourhood, not the delivered feed -- over threshold),
+`mean_feed_gap` (mean `|x_i - x_j|` over every delivered reader/sender pair
+this round, under whichever strategy actually ran) and `mean_neighbor_gap`
+(the same over every graph edge regardless of delivery -- `local_disagreement`
+under a second name, so the two numbers side by side show whether the
+recommender's feed disagreed less than the raw graph would have). All five
+are `None` for a pre-Fix-9 run or a non-`graph_similarity` strategy, the
+"empty rather than absent" convention every other optional bank column here
+follows.
+
+**Statistics.** `analysis.stats` runs E8-vs-E9 as its own Holm-corrected
+family -- language minus English within each, and the difference between
+them, paired by seed -- over `auc_nci_excess`, `final_nci`,
+`final_global_disagreement`, `final_polarization_index`,
+`final_mean_belief_shift`, `final_minority_share`. (Jo et al.'s "neighbour
+correlation" is, by construction, the same Pearson correlation `nci` already
+computes -- correlation is invariant to the `x`-vs-`v=2x` rescaling -- so
+there is no separate `final_neighbor_corr` column; `final_nci` is it.)
+Grouped by `recsys_threshold` the same way the E5 family is grouped by
+`rewire_rate`, so a threshold sweep is never pooled into one contrast.
+
+**How this differs from Jo et al. and Wang et al.** Both reference papers
+have agents write their own opinion text and self-report a belief number.
+Here, agents post items from a fixed argument bank (so the argument is held
+identical across language conditions) and belief is read by a private probe
+that never reaches any agent's history -- the same instrument E3 through E7
+use, just with a third rule for who ends up in the feed.
 
 ### Structured persona attributes (off by default)
 
@@ -606,13 +689,15 @@ python scripts/calibrate_starts.py --runs-dir runs --sample 200 \
 
 # 1. Expand one base config into matched sets for all four languages
 python scripts/make_rq1_configs.py --seeds 5 --out configs/rq1/campaign
-#    --experiments e3 e4 e5 e6 e7 also generates E5/E6/E7's echo-chamber arms
-#    (the default stays e3 e4, so a bare invocation is unchanged);
-#    --rewire-rate sweeps E5/E6/E7's rewire_rate (appears in the run_id only
-#    when it differs from the 0.3 default, so a sweep can share one runs
-#    folder); --rounds overrides K for every experiment generated;
-#    --probe-language pins every arm's probe question to one language while
-#    posts stay in each arm's own, for an E1-style control.
+#    --experiments e3 e4 e5 e6 e7 e8 e9 also generates E5/E6/E7's echo-chamber
+#    arms and Fix 9's recommender arms (the default stays e3 e4, so a bare
+#    invocation is unchanged); --rewire-rate sweeps E5/E6/E7's rewire_rate
+#    (appears in the run_id only when it differs from the 0.3 default, so a
+#    sweep can share one runs folder); --recsys-threshold does the same for
+#    E8's recsys_threshold (default 1.0); --rounds overrides K for every
+#    experiment generated; --probe-language pins every arm's probe question
+#    to one language while posts stay in each arm's own, for an E1-style
+#    control.
 
 # 2. Check that the model can read each bank item in each language.
 #    This writes runs/comprehension/failed_items.txt.
@@ -631,7 +716,7 @@ python scripts/calibrate_tau.py --runs-dir runs
 # 4. Run the single-exposure experiment, on readers with no starting position
 python scripts/run_e1.py --runs-dir runs --start-mode none
 
-# 5. Run the network campaign (e3/e4 only; see Known Limitations for E5/E6/E7)
+# 5. Run the network campaign (e3/e4 only; see Known Limitations for E5/E6/E7/E8/E9)
 python scripts/run_campaign.py configs/rq1/campaign --runs-dir runs
 
 # 6. Turn runs into tidy tables, classified against each arm's tau
@@ -835,13 +920,29 @@ and 8,000 interactions. In general, completed campaigns should be stored under
   `max_prompt_tokens` raises rather than letting one arm quietly overflow.
 - **The persona pools are small.** `test_pool.jsonl` has 4 personas and
   `pool_20.jsonl` has 20. At `M=100`, each persona is shared by several agents.
-- **`run_campaign.py` does not yet dispatch E5/E6/E7.** Its `EXPERIMENT_ORDER`
-  and `--experiments` choices are still `e3`/`e4` only, so
-  `make_rq1_configs.py --experiments e5 e6 e7`'s configs have to be launched
-  one at a time with `python run_simulation.py` until that script's
-  experiment list is extended. Nothing about generating, running or
-  analysing an individual E5/E6/E7 config depends on `run_campaign.py` --
-  only running them as an unattended batch does.
+- **`run_campaign.py` does not yet dispatch E5/E6/E7/E8/E9.** Its
+  `EXPERIMENT_ORDER` and `--experiments` choices are still `e3`/`e4` only, so
+  those configs have to be launched one at a time with `python
+  run_simulation.py` until that script's experiment list is extended.
+  Nothing about generating, running or analysing an individual config
+  depends on `run_campaign.py` -- only running them as an unattended batch
+  does.
+- **E8/E9's shipped smoke configs can fail graph construction at seed index
+  5.** `configs/rq1/base.yaml`'s population is `M=8` (a smoke-test
+  placeholder, not a campaign value), and E8/E9 need `N=5` (Jo et al.'s "up
+  to five") with `graph_degree=6` to satisfy it -- `graph_degree` must be
+  even and below `M`, so `6` is the most this population can offer at all.
+  Watts-Strogatz rewiring at `graph_rewire_p=0.1` moves edges around rather
+  than guaranteeing every node keeps `degree` of them, and at this
+  population size `e8_*_s05`/`e9_*_s05` land on a graph where one node has
+  only 4: `GraphSampling`/`GraphSimilaritySampling` raise at construction
+  (not at `--dry-run`, which never builds the graph) rather than silently
+  running one agent short. E3 through E7 do not hit this at their own
+  `N=3`/`graph_degree=4`. This is a property of the smoke-scale placeholder
+  `M`, not of E8/E9's own logic -- a real campaign's `M` (100+) make it
+  vanishingly unlikely -- and raising `M` or picking a different seed for
+  that index is a one-line config change whenever this campaign stops being
+  smoke-scale.
 - **`check_comprehension.py` ignores two of its own flags.** It takes
   `--sample` and `--start-mode` from the shared argument parser but acts on
   neither, so both are accepted silently and do nothing. Use `--limit` to

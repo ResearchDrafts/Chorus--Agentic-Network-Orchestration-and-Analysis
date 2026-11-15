@@ -72,6 +72,19 @@ STRUCTURE = "ws"
 # already live, rather than in the base config.
 DEFAULT_REWIRE_RATE = 0.3
 
+# e8/e9's own N and graph_degree, overridable only by a future flag -- the
+# design calls for N=5 specifically (Jo et al.'s "up to five") and a WS
+# graph of degree 6 (their k=6), neither of which base.yaml's own smoke-test
+# N=3/graph_degree=4 can satisfy (N cannot exceed graph_degree). Raising
+# graph_degree only for e8/e9 -- rather than in base.yaml, which every other
+# experiment also inherits -- is what keeps e3 through e7's generated files
+# byte-identical to before this feature existed.
+RECSYS_N = 5
+RECSYS_GRAPH_DEGREE = 6
+
+# Default recsys_threshold for e8, overridable with --recsys-threshold.
+DEFAULT_RECSYS_THRESHOLD = 1.0
+
 # delivery / rewire_target per experiment. e3/e4 are unchanged: neither key
 # is in their overrides, so build_config leaves base.yaml's own
 # rewire_rate=0.0 in place, byte for byte. e5/e6/e7 are E5's echo-chamber
@@ -92,12 +105,35 @@ EXPERIMENTS: dict[str, dict] = {
     "e5": {"delivery": "on", "rewire_target": "same_side"},
     "e6": {"delivery": "off", "rewire_target": "same_side"},
     "e7": {"delivery": "on", "rewire_target": "random"},
+    # Fix 9: Jo et al.'s similarity recommender (e8) and its same-feed-size
+    # random control (e9). Both read N=5 posts a round instead of the
+    # smoke-scale base config's N=3, which needs graph_degree raised to 6
+    # (Jo et al.'s own k=6) so N=5 <= graph_degree still holds -- e3/e4/e5/
+    # e6/e7 are untouched and keep base.yaml's graph_degree. e9 needs no
+    # neighbor_strategy override: base.yaml's own "graph" is already the
+    # random-neighbours strategy e3/e5/e7 use, just at a different N and
+    # graph_degree, so it IS the "same feed size" control for e8.
+    "e8": {
+        "delivery": "on", "neighbor_strategy": "graph_similarity",
+        "N": RECSYS_N, "graph_degree": RECSYS_GRAPH_DEGREE,
+    },
+    "e9": {
+        "delivery": "on",
+        "N": RECSYS_N, "graph_degree": RECSYS_GRAPH_DEGREE,
+    },
 }
 
 # Experiments that set rewire_rate/rewire_target at all. e3/e4 never read
 # rewire_rate from here regardless of what --rewire-rate was passed, since
 # the design holds rewiring absent from the pre-E5 arms.
 REWIRE_EXPERIMENTS = frozenset({"e5", "e6", "e7"})
+
+# e8 is the only experiment whose recsys_threshold is ever set to anything
+# but the schema default -- e9 uses the "graph" strategy, where the field is
+# inert, so leaving it at the default there (rather than copying --recsys-
+# threshold onto e9 too) keeps e9's run_config.json from claiming a filter
+# it never applies.
+RECSYS_EXPERIMENTS = frozenset({"e8"})
 
 # Experiments whose starting leans are balanced into two equal camps rather
 # than drawn uniformly at random (see ExperimentRun.lean_assignment): every
@@ -108,8 +144,9 @@ REWIRE_EXPERIMENTS = frozenset({"e5", "e6", "e7"})
 # "balanced_two_camps", not plain "balanced": M=20 over a 7-point scale
 # under "balanced" gives lean 4 three agents of its own and splits the
 # remaining 17 as 9 below and 8 above, a 9-vs-11 population a weaker camp
-# could be absorbed out of before it ever sorts.
-BALANCED_LEAN_EXPERIMENTS = frozenset({"e5", "e6", "e7"})
+# could be absorbed out of before it ever sorts. e8/e9 need the same
+# guarantee for the same reason, even though neither one rewires.
+BALANCED_LEAN_EXPERIMENTS = frozenset({"e5", "e6", "e7", "e8", "e9"})
 
 # The default --experiments: unchanged from before E5 existed, so a
 # generator invocation with no flag produces exactly the E3/E4 campaign it
@@ -140,6 +177,16 @@ def rewire_rate_token(rate: float) -> str:
     return "_r" + f"{rate:g}".replace(".", "p").replace("-", "neg")
 
 
+def recsys_threshold_token(threshold: float) -> str:
+    """'' at the default threshold, so the default campaign's filenames are
+    unaffected; '_t0p5' etc. otherwise -- the same pattern
+    rewire_rate_token uses, so a --recsys-threshold sweep can share one runs
+    folder without filenames colliding."""
+    if threshold == DEFAULT_RECSYS_THRESHOLD:
+        return ""
+    return "_t" + f"{threshold:g}".replace(".", "p").replace("-", "neg")
+
+
 def probe_language_token(probe_language: str | None) -> str:
     """'' when the probe asks in each arm's own language (the default);
     '_probe-<lang>' when every arm's probe is pinned to one language
@@ -153,6 +200,7 @@ def run_id_for(
     seed_index: int,
     *,
     rewire_rate: float = DEFAULT_REWIRE_RATE,
+    recsys_threshold: float = DEFAULT_RECSYS_THRESHOLD,
     probe_language: str | None = None,
 ) -> str:
     """The file stem, which is also the run_id.
@@ -162,12 +210,17 @@ def run_id_for(
     analysis/metrics.py reads the experiment off the prefix. Three readers of
     a format that was written in a fourth place would drift.
 
-    rewire_rate is only consulted for e5/e6/e7 (see REWIRE_EXPERIMENTS); e3/e4
-    never carry a rate token, since they never set rewire_rate at all.
+    rewire_rate is only consulted for e5/e6/e7 (see REWIRE_EXPERIMENTS);
+    recsys_threshold only for e8 (see RECSYS_EXPERIMENTS); every other
+    experiment never carries that token, since it never sets the field away
+    from its default at all.
     """
     rate_token = rewire_rate_token(rewire_rate) if experiment in REWIRE_EXPERIMENTS else ""
+    threshold_token = (
+        recsys_threshold_token(recsys_threshold) if experiment in RECSYS_EXPERIMENTS else ""
+    )
     return (
-        f"{experiment}_{language}_{STRUCTURE}{rate_token}"
+        f"{experiment}_{language}_{STRUCTURE}{rate_token}{threshold_token}"
         f"{probe_language_token(probe_language)}_s{seed_index:02d}"
     )
 
@@ -236,6 +289,7 @@ def build_config(
     seed_index: int,
     base_seed: int,
     rewire_rate: float = DEFAULT_REWIRE_RATE,
+    recsys_threshold: float = DEFAULT_RECSYS_THRESHOLD,
     rounds: int | None = None,
     probe_language: str | None = None,
 ) -> dict:
@@ -245,7 +299,9 @@ def build_config(
     probe_question, delivery, seed, trial_number, per GENERATED_FIELDS),
     plus -- for e5/e6/e7 only -- rewire_rate, rewire_target and
     lean_assignment, which base.yaml does not set at all (rewire_rate stays
-    its schema default of 0.0 there, and e3/e4 inherit that unchanged).
+    its schema default of 0.0 there, and e3/e4 inherit that unchanged); and
+    -- for e8/e9 only -- N, graph_degree and (e8 alone) neighbor_strategy
+    and recsys_threshold, per EXPERIMENTS' own overrides.
 
     rounds, when given, overrides K for every experiment -- not only
     e5/e6/e7 -- since K is a campaign-wide dimension, not an echo-chamber
@@ -257,7 +313,8 @@ def build_config(
     overrides = EXPERIMENTS[experiment]
     config["run_id"] = run_id_for(
         experiment, language, seed_index,
-        rewire_rate=rewire_rate, probe_language=probe_language,
+        rewire_rate=rewire_rate, recsys_threshold=recsys_threshold,
+        probe_language=probe_language,
     )
     config["language_condition"] = language
     config["probe_question"] = probe_question
@@ -270,6 +327,14 @@ def build_config(
     if experiment in REWIRE_EXPERIMENTS:
         config["rewire_rate"] = rewire_rate
         config["rewire_target"] = overrides["rewire_target"]
+    if "neighbor_strategy" in overrides:
+        config["neighbor_strategy"] = overrides["neighbor_strategy"]
+    if "N" in overrides:
+        config["N"] = overrides["N"]
+    if "graph_degree" in overrides:
+        config["graph_degree"] = overrides["graph_degree"]
+    if experiment in RECSYS_EXPERIMENTS:
+        config["recsys_threshold"] = recsys_threshold
     if experiment in BALANCED_LEAN_EXPERIMENTS:
         config["lean_assignment"] = "balanced_two_camps"
     if rounds is not None:
@@ -344,6 +409,7 @@ def generate(
     base_seed: int,
     experiments: list[str] = DEFAULT_EXPERIMENTS,
     rewire_rate: float = DEFAULT_REWIRE_RATE,
+    recsys_threshold: float = DEFAULT_RECSYS_THRESHOLD,
     rounds: int | None = None,
     probe_language: str | None = None,
 ) -> list[dict]:
@@ -406,6 +472,7 @@ def generate(
                     seed_index=seed_index,
                     base_seed=base_seed,
                     rewire_rate=rewire_rate,
+                    recsys_threshold=recsys_threshold,
                     rounds=rounds,
                     probe_language=probe_language,
                 )
@@ -493,7 +560,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="which experiments to generate "
              f"(default: {' '.join(DEFAULT_EXPERIMENTS)}). Add e5/e6/e7 for "
              "E5's echo-chamber arms: e5 (rewiring on), e6 (its shadow-item "
-             "control) and e7 (rewiring without selection).",
+             "control) and e7 (rewiring without selection). Add e8/e9 for "
+             "Fix 9's similarity recommender (e8) and its same-feed-size "
+             "random control (e9).",
     )
     parser.add_argument(
         "--rewire-rate", type=float, default=DEFAULT_REWIRE_RATE,
@@ -501,6 +570,13 @@ def build_parser() -> argparse.ArgumentParser:
              "Appears in the run_id only when it differs from the default, "
              "so the default campaign's filenames are unaffected and a "
              "sweep over rates can share one runs folder.",
+    )
+    parser.add_argument(
+        "--recsys-threshold", type=float, default=DEFAULT_RECSYS_THRESHOLD,
+        help=f"recsys_threshold for e8 (default: {DEFAULT_RECSYS_THRESHOLD}), "
+             "in x units. Appears in the run_id only when it differs from "
+             "the default, so a --recsys-threshold sweep can share one runs "
+             "folder the same way --rewire-rate's sweep does.",
     )
     parser.add_argument(
         "--rounds", type=int, default=None,
@@ -527,6 +603,7 @@ def main(argv: list[str] | None = None) -> int:
         base_seed=args.base_seed,
         experiments=args.experiments,
         rewire_rate=args.rewire_rate,
+        recsys_threshold=args.recsys_threshold,
         rounds=args.rounds,
         probe_language=args.probe_language,
     )

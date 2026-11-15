@@ -126,7 +126,12 @@ class Interaction(BaseModel):
     completion_token_count: int = Field(ge=0)
     model_backend_id: str
     latency_ms: int = Field(ge=0)
-    api_call_status: str = Field(pattern="^(success|retried_success|failed_logged_null)$")
+    # "no_feed" (Fix 9): the similarity recommender filtered every candidate
+    # out and delivered nothing. Distinct from failed_logged_null -- no call
+    # failed, there was simply nothing to reply to -- so is_valid_for_analysis
+    # treats it as a real, applicable round: the probe still ran and the
+    # reading still counts.
+    api_call_status: str = Field(pattern="^(success|retried_success|failed_logged_null|no_feed)$")
     timestamp_utc: str
 
     # --- bank regime (RQ1) ------------------------------------------------
@@ -197,6 +202,29 @@ class Interaction(BaseModel):
     # regime row that sent no cap, or a row whose reply call failed before a
     # completion token count was ever reported).
     reply_truncated: bool | None = None
+
+    # --- the similarity recommender (Fix 9, neighbor_strategy="graph_similarity") ---
+    #
+    # All None outside that strategy, like every other optional bank column
+    # above: nothing here changes meaning for a run that never asked for it.
+    #
+    # How many posts this agent's feed actually held this round -- 0 to N,
+    # not always N, since the recommender delivers "up to N" rather than
+    # padding a short feed back up (that would make the threshold do
+    # nothing; see GraphSimilaritySampling). Redundant with
+    # len(neighbor_agent_ids) but logged explicitly so an export does not
+    # have to recompute it.
+    feed_size: int | None = None
+    # How many of this reader's CURRENT graph neighbours had a valid probe
+    # reading more than recsys_threshold away from its own -- the ones the
+    # rule filtered out. None when the reader itself had no valid probe to
+    # compare against (see recsys_fallback), where the comparison was never
+    # made.
+    n_neighbors_over_threshold: int | None = None
+    # True when this reader had no valid probe reading at all (an empty
+    # stance_history) and the recommender fell back to N random graph
+    # neighbours instead of ranking by similarity.
+    recsys_fallback: bool | None = None
 
     @model_validator(mode="after")
     def check_meme_id_consistency(self) -> "Interaction":
@@ -404,13 +432,28 @@ class ExperimentRun(BaseModel):
     # of everyone's current stance. RQ1 needs the latter: with alpha sampling,
     # who you read depends on where you already stand, and a stance effect and
     # a selection effect become impossible to separate.
-    neighbor_strategy: str = Field(default="alpha", pattern="^(alpha|graph)$")
+    # "graph_similarity" (Fix 9, Jo et al.'s recommendation rule) keeps the
+    # same fixed graph but, instead of sampling N graph neighbours at
+    # random each round, delivers the N adjacent neighbours whose belief is
+    # closest to the reader's own -- within recsys_threshold -- and nothing
+    # else. It is a third, independent selection mechanism alongside E5's
+    # rewiring: rewiring changes WHO is a neighbour, this changes WHICH
+    # neighbours are read, so the two must never be combined in one run
+    # (see check_graph_similarity_requirements).
+    neighbor_strategy: str = Field(default="alpha", pattern="^(alpha|graph|graph_similarity)$")
     # WS(M, graph_degree, graph_rewire_p). Even because the ring lattice the
     # construction starts from connects each node to degree/2 neighbours on
     # each side; an odd degree is not representable and networkx would round
     # it silently.
     graph_degree: int = Field(default=6, ge=2)
     graph_rewire_p: float = Field(default=0.1, ge=0.0, le=1.0)
+    # The similarity recommender's candidate filter, in x units ([-1, 1]).
+    # 1.0 on x is 2.0 on Jo et al.'s own [-2, 2] scale, which is their
+    # threshold. Unused outside neighbor_strategy="graph_similarity"; kept as
+    # a plain float with a schema default (rather than nullable) so a
+    # non-recsys config's run_config.json still records a definite value
+    # instead of a null that looks like a missing setting.
+    recsys_threshold: float = Field(default=1.0, gt=0.0)
 
     # --- E5: echo-chamber formation (RQ1, graph strategy only) ------------
     #
@@ -636,7 +679,7 @@ class ExperimentRun(BaseModel):
                 f"graph_degree must be even, got {self.graph_degree} "
                 "(the Watts-Strogatz ring connects degree/2 neighbours per side)"
             )
-        if self.neighbor_strategy == "graph":
+        if self.neighbor_strategy in ("graph", "graph_similarity"):
             if self.graph_degree >= self.M:
                 raise ValueError(
                     f"graph_degree ({self.graph_degree}) must be less than M ({self.M})"
@@ -785,6 +828,30 @@ class ExperimentRun(BaseModel):
                 f"rewire_rate > 0 requires neighbor_strategy='graph' "
                 f"(got {self.neighbor_strategy!r}): there is no fixed "
                 "structure to rewire under alpha sampling"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_graph_similarity_requirements(self) -> "ExperimentRun":
+        """The similarity recommender needs a probe to read a belief from.
+
+        Only the bank regime takes one, which is what check_rewire_requirements
+        already establishes for rewire_rate: there, `neighbor_strategy !=
+        'graph'` catches a `graph_similarity` config for free the moment
+        rewire_rate > 0, because graph_similarity is never equal to the
+        literal string 'graph'. What that check does NOT catch is
+        rewire_rate == 0 (its own default) under a generated-regime run, so
+        this validator exists for exactly that gap: regime='bank' is
+        required here unconditionally, not only when rewiring is also asked
+        for.
+        """
+        if self.neighbor_strategy != "graph_similarity":
+            return self
+        if self.regime != "bank":
+            raise ValueError(
+                f"neighbor_strategy='graph_similarity' requires regime='bank' "
+                f"(got {self.regime!r}): the rule reads each agent's own "
+                "probe reading, which only the bank regime has"
             )
         return self
 

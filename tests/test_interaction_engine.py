@@ -414,3 +414,258 @@ def test_turn_does_not_change_the_draw_for_a_fixed_rng():
     first = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(11))
     second = strategy.select_neighbors(speaker, population, turn=9, rng=random.Random(11))
     assert [a.agent_id for a in first] == [a.agent_id for a in second]
+
+
+# --- Fix 9: GraphSimilaritySampling ---------------------------------------
+
+
+def _similarity(n=10, degree=4, rewire_p=0.1, k=2, graph_seed=7, threshold=1.0):
+    from sandbox.interaction_engine import GraphSimilaritySampling
+
+    return GraphSimilaritySampling(
+        _ids(n), degree=degree, rewire_p=rewire_p, k=k, graph_seed=graph_seed,
+        threshold=threshold,
+    )
+
+
+def _probed(agent_id: str, raw_stance: float) -> Agent:
+    """An agent with a valid probe reading -- current_stance() then returns
+    this round's measurement rather than falling back to initial_stance."""
+    return _make_agent(
+        agent_id, raw_stance,
+        stance_history=[
+            StanceRecord(turn=0, stance_value=raw_stance, reason_text="", interaction_id="x")
+        ],
+    )
+
+
+def test_construction_rejects_non_positive_threshold():
+    from sandbox.interaction_engine import GraphSimilaritySampling
+
+    with pytest.raises(ValueError, match="threshold"):
+        GraphSimilaritySampling(_ids(10), degree=4, rewire_p=0.1, k=2, graph_seed=1, threshold=0.0)
+    with pytest.raises(ValueError, match="threshold"):
+        GraphSimilaritySampling(_ids(10), degree=4, rewire_p=0.1, k=2, graph_seed=1, threshold=-1.0)
+
+
+def test_shares_byte_identical_graph_construction_with_graph_sampling():
+    """A seed must produce the same graph under both strategies -- e8 and e9
+    are only a meaningful comparison if they read from the same structure."""
+    from sandbox.interaction_engine import GraphSampling
+
+    plain = GraphSampling(_ids(20), degree=6, rewire_p=0.1, k=3, graph_seed=99)
+    similarity = _similarity(n=20, degree=6, rewire_p=0.1, k=3, graph_seed=99)
+    assert plain.edges() == similarity.edges()
+
+
+def test_never_delivers_a_non_neighbour():
+    """A huge threshold filters nobody, so the only agents that can appear
+    at all are the reader's own graph neighbours."""
+    strategy = _similarity(n=10, degree=4, k=2, threshold=10.0, graph_seed=7)
+    population = [_probed(agent_id, 4.0) for agent_id in _ids(10)]
+    by_id = {a.agent_id: a for a in population}
+    speaker = by_id["agent_0000"]
+
+    chosen = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(5))
+    candidates = set(strategy.neighbors_of(speaker.agent_id))
+    assert {a.agent_id for a in chosen} <= candidates
+    assert speaker.agent_id not in {a.agent_id for a in chosen}
+
+
+def test_threshold_of_two_in_x_filters_nobody():
+    """x is in [-1, 1], so no two readings can differ by more than 2.0 --
+    a threshold that wide must filter out none of the reader's graph
+    neighbours, however far apart their readings are (n_neighbors_over_
+    threshold stays 0), even though only k of them are actually delivered."""
+    strategy = _similarity(n=10, degree=4, k=2, threshold=2.0, graph_seed=7)
+    candidates = strategy.neighbors_of("agent_0000")
+    raws = {candidates[0]: 1.0, candidates[1]: 7.0, candidates[2]: 1.0, candidates[3]: 7.0}
+    population = [_probed(agent_id, raws.get(agent_id, 4.0)) for agent_id in _ids(10)]
+    by_id = {a.agent_id: a for a in population}
+    speaker = by_id["agent_0000"]
+
+    chosen = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(5))
+    assert len(chosen) == 2
+    assert strategy.feed_info(speaker.agent_id).n_neighbors_over_threshold == 0
+
+
+def test_a_neighbour_over_the_threshold_is_never_delivered():
+    """threshold=0.5 in x units is a raw-scale gap of 1.5 (x = (raw-4)/3):
+    a neighbour 3 full scale points away must never appear in the feed, and
+    must be counted in n_neighbors_over_threshold."""
+    strategy = _similarity(n=10, degree=4, k=2, threshold=0.5, graph_seed=7)
+    candidates = strategy.neighbors_of("agent_0000")
+    population = [_probed(agent_id, 4.0) for agent_id in _ids(10)]
+    by_id = {a.agent_id: a for a in population}
+    far_id = candidates[0]
+    by_id[far_id] = _probed(far_id, 7.0)  # x = 1.0, 1.0 away from the speaker's 0.0
+    population = [by_id[agent_id] for agent_id in _ids(10)]
+    speaker = by_id["agent_0000"]
+
+    chosen = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(2))
+    assert far_id not in {a.agent_id for a in chosen}
+    assert strategy.feed_info("agent_0000").n_neighbors_over_threshold == 1
+
+
+def test_the_closest_neighbours_are_chosen():
+    """Among graph neighbours within the threshold, the k closest by |x_i -
+    x_j| are delivered -- not merely "some that qualify"."""
+    strategy = _similarity(n=10, degree=4, k=2, threshold=2.0, graph_seed=7)
+    candidates = strategy.neighbors_of("agent_0000")
+    assert len(candidates) == 4
+    # Speaker at x=0 (raw 4.0); candidates at x = 0.1, 0.5, 0.9, -0.2 via raw
+    # stances 4.3, 5.5, 6.7, 3.4 -- the two closest are the first and last.
+    raws = {candidates[0]: 4.3, candidates[1]: 5.5, candidates[2]: 6.7, candidates[3]: 3.4}
+    population = [
+        _probed(agent_id, raws.get(agent_id, 4.0)) for agent_id in _ids(10)
+    ]
+    by_id = {a.agent_id: a for a in population}
+    speaker = by_id["agent_0000"]
+
+    chosen = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(3))
+    assert {a.agent_id for a in chosen} == {candidates[0], candidates[3]}
+
+
+def test_ties_are_reproducible_from_the_seed():
+    """Candidates equidistant from the reader break ties off `rng`, not off
+    agent_id order -- so the same seed must always produce the same pick,
+    and (empirically, across many seeds) not always the same one."""
+    strategy = _similarity(n=10, degree=4, k=1, threshold=2.0, graph_seed=7)
+    candidates = strategy.neighbors_of("agent_0000")
+    # All four candidates equidistant from the speaker (x = 0.5 for every one).
+    population = [
+        _probed(agent_id, 5.5 if agent_id in candidates else 4.0) for agent_id in _ids(10)
+    ]
+    by_id = {a.agent_id: a for a in population}
+    speaker = by_id["agent_0000"]
+
+    picks = set()
+    for seed in range(20):
+        chosen = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(seed))
+        picks.add(chosen[0].agent_id)
+        # Reproducible: the same seed, run again, picks the same one.
+        again = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(seed))
+        assert chosen[0].agent_id == again[0].agent_id
+    assert len(picks) > 1
+
+
+def test_short_feed_delivers_fewer_than_k_without_backfilling():
+    """Fewer qualifying candidates than k: deliver what there is, never pad
+    back up with the next-closest -- that is what lets a tighter threshold
+    show up as a shorter average feed."""
+    strategy = _similarity(n=10, degree=4, k=2, threshold=0.5, graph_seed=7)
+    candidates = strategy.neighbors_of("agent_0000")
+    # Only one candidate within threshold; the rest are far away.
+    raws = {candidates[0]: 4.2}
+    population = [
+        _probed(agent_id, raws.get(agent_id, 7.0) if agent_id in candidates else 4.0)
+        for agent_id in _ids(10)
+    ]
+    by_id = {a.agent_id: a for a in population}
+    speaker = by_id["agent_0000"]
+
+    chosen = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(4))
+    assert [a.agent_id for a in chosen] == [candidates[0]]
+    assert strategy.feed_info("agent_0000").feed_size == 1
+
+
+def test_empty_feed_when_every_candidate_is_filtered_out():
+    strategy = _similarity(n=10, degree=4, k=2, threshold=0.1, graph_seed=7)
+    candidates = strategy.neighbors_of("agent_0000")
+    population = [
+        _probed(agent_id, 7.0) if agent_id in candidates else _probed(agent_id, 4.0)
+        for agent_id in _ids(10)
+    ]
+    by_id = {a.agent_id: a for a in population}
+    speaker = by_id["agent_0000"]
+
+    chosen = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(4))
+    assert chosen == []
+    assert strategy.feed_info("agent_0000").feed_size == 0
+    assert strategy.feed_info("agent_0000").fallback is False
+
+
+def test_a_candidate_with_no_valid_probe_is_dropped_not_ranked():
+    """A graph neighbour that has never been successfully probed has no x
+    to rank against, so it is excluded from the candidate set entirely
+    rather than treated as "infinitely far"."""
+    strategy = _similarity(n=10, degree=4, k=2, threshold=2.0, graph_seed=7)
+    candidates = strategy.neighbors_of("agent_0000")
+    population = [
+        _make_agent(agent_id, 4.0)  # no stance_history: never probed
+        if agent_id == candidates[0]
+        else _probed(agent_id, 4.0)
+        for agent_id in _ids(10)
+    ]
+    by_id = {a.agent_id: a for a in population}
+    speaker = by_id["agent_0000"]
+
+    chosen = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(4))
+    assert candidates[0] not in {a.agent_id for a in chosen}
+    # Only 3 of the speaker's 4 neighbours had a valid probe to compare; the
+    # unprobed one is not counted as "over threshold" either.
+    assert strategy.feed_info("agent_0000").n_neighbors_over_threshold == 0
+
+
+def test_a_reader_with_no_valid_probe_falls_back_to_random_neighbours():
+    """stance_history empty: there is nothing to rank candidates against, so
+    the rule falls back to k random graph neighbours, same as GraphSampling,
+    and says so in feed_info."""
+    strategy = _similarity(n=10, degree=4, k=2, threshold=0.1, graph_seed=7)
+    candidates = set(strategy.neighbors_of("agent_0000"))
+    population = [
+        _make_agent(agent_id, 4.0) if agent_id == "agent_0000" else _probed(agent_id, 7.0)
+        for agent_id in _ids(10)
+    ]
+    by_id = {a.agent_id: a for a in population}
+    speaker = by_id["agent_0000"]
+    assert not speaker.stance_history
+
+    chosen = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(6))
+    assert len(chosen) == 2
+    assert {a.agent_id for a in chosen} <= candidates
+    info = strategy.feed_info("agent_0000")
+    assert info.fallback is True
+    assert info.n_neighbors_over_threshold is None
+
+
+def test_feed_order_is_shuffled_after_ranking():
+    """Delivery order is not itself a clue to similarity: the two chosen
+    candidates (one clearly closest, one clearly second) are reshuffled
+    before delivery, so the closest is not always first in the feed."""
+    strategy = _similarity(n=10, degree=4, k=2, threshold=2.0, graph_seed=7)
+    candidates = strategy.neighbors_of("agent_0000")
+    raws = {candidates[0]: 4.1, candidates[1]: 4.5, candidates[2]: 6.0, candidates[3]: 7.0}
+    population = [_probed(agent_id, raws.get(agent_id, 4.0)) for agent_id in _ids(10)]
+    by_id = {a.agent_id: a for a in population}
+    speaker = by_id["agent_0000"]
+
+    orders = set()
+    for seed in range(30):
+        chosen = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(seed))
+        assert {a.agent_id for a in chosen} == {candidates[0], candidates[1]}
+        orders.add(tuple(a.agent_id for a in chosen))
+    assert len(orders) > 1
+
+
+def test_nothing_in_the_class_reads_language():
+    """Selection must be identical regardless of each agent's
+    language_condition -- the rule is specified over opinions alone."""
+    strategy = _similarity(n=10, degree=4, k=2, threshold=2.0, graph_seed=7)
+    candidates = strategy.neighbors_of("agent_0000")
+    raws = {candidates[0]: 4.1, candidates[1]: 4.9, candidates[2]: 6.0, candidates[3]: 3.0}
+
+    def population_in(language: str) -> list[Agent]:
+        return [
+            _probed(agent_id, raws.get(agent_id, 4.0) if agent_id != "agent_0000" else 4.0)
+            for agent_id in _ids(10)
+        ]
+
+    english = [a.model_copy(update={"language_condition": "english"}) for a in population_in("english")]
+    hindi = [a.model_copy(update={"language_condition": "hindi"}) for a in population_in("hindi")]
+    speaker_en = next(a for a in english if a.agent_id == "agent_0000")
+    speaker_hi = next(a for a in hindi if a.agent_id == "agent_0000")
+
+    chosen_en = strategy.select_neighbors(speaker_en, english, turn=1, rng=random.Random(9))
+    chosen_hi = strategy.select_neighbors(speaker_hi, hindi, turn=1, rng=random.Random(9))
+    assert [a.agent_id for a in chosen_en] == [a.agent_id for a in chosen_hi]
