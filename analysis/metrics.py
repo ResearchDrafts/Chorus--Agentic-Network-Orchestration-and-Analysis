@@ -692,6 +692,7 @@ def reply_truncated_rate(frame: pd.DataFrame) -> float | None:
 RUN_COLUMNS = (
     "run_id", "experiment", "language", "seed", "delivery", "K", "M", "N",
     "topic", "model_backend_id", "neighbor_strategy",
+    "rewire_rate", "rewire_target", "lean_assignment",
     "final_turn", "final_mean_x", "final_var_x", "final_extremity",
     "final_assortativity",
     "final_assort_excess", "final_cross_side_edge_share", "final_minority_share",
@@ -744,6 +745,9 @@ def run_row(
         "topic": config["topic"],
         "model_backend_id": config["model_backend_id"],
         "neighbor_strategy": config.get("neighbor_strategy"),
+        "rewire_rate": config.get("rewire_rate"),
+        "rewire_target": config.get("rewire_target"),
+        "lean_assignment": config.get("lean_assignment"),
         "final_turn": final["turn"],
         "final_mean_x": final["mean_x"],
         "final_var_x": final["var_x"],

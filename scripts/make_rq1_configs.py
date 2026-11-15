@@ -60,34 +60,44 @@ DEFAULT_BASE_SEED = 1000
 # The graph the campaign runs on, as it appears in a filename.
 STRUCTURE = "ws"
 
-# rewire_rate for E5's three arms. 0.3 is the one number the design asks
-# the generator to set, named after base.yaml's own comment on rewire_rate
-# ("the campaign's echo_rewire_rate") -- it cannot be a literal key IN
-# base.yaml, because base.yaml validates as a complete ExperimentRun on its
-# own (ExperimentRun.model_config forbids unknown fields, and
+# Default rewire_rate for E5's three arms, overridable with --rewire-rate.
+# 0.3 is the one number the design originally asked the generator to set,
+# named after base.yaml's own comment on rewire_rate ("the campaign's
+# echo_rewire_rate") -- it cannot be a literal key IN base.yaml, because
+# base.yaml validates as a complete ExperimentRun on its own
+# (ExperimentRun.model_config forbids unknown fields, and
 # test_the_shipped_base_config_is_a_valid_bank_regime_run loads it exactly
 # that way), and an echo_rewire_rate field the schema does not define would
 # fail that load. So it lives here, where e3/e4's own delivery values
 # already live, rather than in the base config.
-ECHO_REWIRE_RATE = 0.3
+DEFAULT_REWIRE_RATE = 0.3
 
-# delivery / rewire_rate / rewire_target per experiment. e3/e4 are
-# unchanged: rewire_rate and rewire_target are simply absent from their
-# overrides, so build_config leaves base.yaml's own rewire_rate=0.0 in
-# place, byte for byte. e5/e6/e7 are E5's echo-chamber arms: e5 is the
-# treatment (rewiring on, delivery on), e6 is its control (rewiring on the
-# shadow items under delivery off -- the same mirror E4 is for E3), and e7
-# is rewiring without selection (rewire_target="random"), a control for
-# whether rewiring ALONE -- without choosing same-side neighbours --
-# produces any sorting. analysis/metrics.py reads the experiment back off
-# the run_id prefix for all five.
+# delivery / rewire_target per experiment. e3/e4 are unchanged: neither key
+# is in their overrides, so build_config leaves base.yaml's own
+# rewire_rate=0.0 in place, byte for byte. e5/e6/e7 are E5's echo-chamber
+# arms: e5 is the treatment (rewiring on, delivery on), e6 is its control
+# (rewiring on the shadow items under delivery off -- the same mirror E4 is
+# for E3), and e7 is rewiring without selection (rewire_target="random"), a
+# control for whether rewiring ALONE -- without choosing same-side
+# neighbours -- produces any sorting. analysis/metrics.py reads the
+# experiment back off the run_id prefix for all five.
+#
+# rewire_rate itself is NOT in this dict: every one of these three shares
+# whatever --rewire-rate the generator invocation asked for (see
+# REWIRE_EXPERIMENTS below and build_config), so a sweep over rates does not
+# require three separate entries that would drift from each other.
 EXPERIMENTS: dict[str, dict] = {
     "e3": {"delivery": "on"},
     "e4": {"delivery": "off"},
-    "e5": {"delivery": "on", "rewire_rate": ECHO_REWIRE_RATE, "rewire_target": "same_side"},
-    "e6": {"delivery": "off", "rewire_rate": ECHO_REWIRE_RATE, "rewire_target": "same_side"},
-    "e7": {"delivery": "on", "rewire_rate": ECHO_REWIRE_RATE, "rewire_target": "random"},
+    "e5": {"delivery": "on", "rewire_target": "same_side"},
+    "e6": {"delivery": "off", "rewire_target": "same_side"},
+    "e7": {"delivery": "on", "rewire_target": "random"},
 }
+
+# Experiments that set rewire_rate/rewire_target at all. e3/e4 never read
+# rewire_rate from here regardless of what --rewire-rate was passed, since
+# the design holds rewiring absent from the pre-E5 arms.
+REWIRE_EXPERIMENTS = frozenset({"e5", "e6", "e7"})
 
 # Experiments whose starting leans are balanced across stance_scale rather
 # than drawn uniformly at random (see ExperimentRun.lean_assignment): every
@@ -116,19 +126,49 @@ GENERATED_FIELDS = (
 )
 
 
-def run_id_for(experiment: str, language: str, seed_index: int) -> str:
+def rewire_rate_token(rate: float) -> str:
+    """'' at the default rate, so the default campaign's filenames are
+    unaffected; '_r0p1' etc. otherwise, so a sweep over rates can share one
+    runs folder without filenames colliding."""
+    if rate == DEFAULT_REWIRE_RATE:
+        return ""
+    return "_r" + f"{rate:g}".replace(".", "p").replace("-", "neg")
+
+
+def probe_language_token(probe_language: str | None) -> str:
+    """'' when the probe asks in each arm's own language (the default);
+    '_probe-<lang>' when every arm's probe is pinned to one language
+    regardless of what it posts in."""
+    return f"_probe-{probe_language}" if probe_language else ""
+
+
+def run_id_for(
+    experiment: str,
+    language: str,
+    seed_index: int,
+    *,
+    rewire_rate: float = DEFAULT_REWIRE_RATE,
+    probe_language: str | None = None,
+) -> str:
     """The file stem, which is also the run_id.
 
     One string, one function: the campaign runner parses the experiment, the
     language and the seed index back out of this to order its runs, and
     analysis/metrics.py reads the experiment off the prefix. Three readers of
     a format that was written in a fourth place would drift.
+
+    rewire_rate is only consulted for e5/e6/e7 (see REWIRE_EXPERIMENTS); e3/e4
+    never carry a rate token, since they never set rewire_rate at all.
     """
-    return f"{experiment}_{language}_{STRUCTURE}_s{seed_index:02d}"
+    rate_token = rewire_rate_token(rewire_rate) if experiment in REWIRE_EXPERIMENTS else ""
+    return (
+        f"{experiment}_{language}_{STRUCTURE}{rate_token}"
+        f"{probe_language_token(probe_language)}_s{seed_index:02d}"
+    )
 
 
-def single_run_id_for(language: str) -> str:
-    return f"single_{language}"
+def single_run_id_for(language: str, *, probe_language: str | None = None) -> str:
+    return f"single_{language}{probe_language_token(probe_language)}"
 
 
 def load_probe_questions(path: Path, languages: list[str]) -> dict[str, str]:
@@ -190,6 +230,9 @@ def build_config(
     probe_question: str,
     seed_index: int,
     base_seed: int,
+    rewire_rate: float = DEFAULT_REWIRE_RATE,
+    rounds: int | None = None,
+    probe_language: str | None = None,
 ) -> dict:
     """One campaign config: the base, with the generated fields set.
 
@@ -198,10 +241,19 @@ def build_config(
     plus -- for e5/e6/e7 only -- rewire_rate, rewire_target and
     lean_assignment, which base.yaml does not set at all (rewire_rate stays
     its schema default of 0.0 there, and e3/e4 inherit that unchanged).
+
+    rounds, when given, overrides K for every experiment -- not only
+    e5/e6/e7 -- since K is a campaign-wide dimension, not an echo-chamber
+    one. probe_language, when given, is passed straight through to
+    run_id_for; the caller is responsible for resolving probe_question to
+    that language's question (see generate()).
     """
     config = dict(base)
     overrides = EXPERIMENTS[experiment]
-    config["run_id"] = run_id_for(experiment, language, seed_index)
+    config["run_id"] = run_id_for(
+        experiment, language, seed_index,
+        rewire_rate=rewire_rate, probe_language=probe_language,
+    )
     config["language_condition"] = language
     config["probe_question"] = probe_question
     config["delivery"] = overrides["delivery"]
@@ -210,11 +262,13 @@ def build_config(
     # makes them a matched set.
     config["seed"] = base_seed + seed_index
     config["trial_number"] = seed_index
-    if "rewire_rate" in overrides:
-        config["rewire_rate"] = overrides["rewire_rate"]
+    if experiment in REWIRE_EXPERIMENTS:
+        config["rewire_rate"] = rewire_rate
         config["rewire_target"] = overrides["rewire_target"]
     if experiment in BALANCED_LEAN_EXPERIMENTS:
         config["lean_assignment"] = "balanced"
+    if rounds is not None:
+        config["K"] = rounds
     if config["delivery"] == "on":
         # A delivery-on run never opens the neutral bank, so recording one in
         # its run_config.json would claim it read something it did not. A
@@ -224,7 +278,12 @@ def build_config(
 
 
 def build_single_config(
-    base: dict, *, language: str, probe_question: str, base_seed: int
+    base: dict,
+    *,
+    language: str,
+    probe_question: str,
+    base_seed: int,
+    probe_language: str | None = None,
 ) -> dict:
     """The base config for the three single-reader scripts, per language.
 
@@ -239,7 +298,7 @@ def build_single_config(
     share a seed for no reason.
     """
     config = dict(base)
-    config["run_id"] = single_run_id_for(language)
+    config["run_id"] = single_run_id_for(language, probe_language=probe_language)
     config["language_condition"] = language
     config["probe_question"] = probe_question
     config["delivery"] = "on"
@@ -279,6 +338,9 @@ def generate(
     seeds: int,
     base_seed: int,
     experiments: list[str] = DEFAULT_EXPERIMENTS,
+    rewire_rate: float = DEFAULT_REWIRE_RATE,
+    rounds: int | None = None,
+    probe_language: str | None = None,
 ) -> list[dict]:
     """Writes every config, validates each, and returns the manifest rows.
 
@@ -291,6 +353,15 @@ def generate(
     them; every seed index still shares one seed across whichever
     experiments are requested, the same matched-set guarantee e3/e4 already
     give.
+
+    `rewire_rate` defaults to DEFAULT_REWIRE_RATE, so an invocation that
+    never passes --rewire-rate produces byte-identical e5/e6/e7 files to
+    before this flag existed. `rounds` defaults to None, meaning "whatever
+    K the base config says" -- every experiment's K, not only e5/e6/e7's.
+    `probe_language`, when given, pins every arm's probe_question to that
+    one language's question (an E1 control: posts stay in the arm's own
+    language, the opinion question does not) and is folded into every
+    run_id so the campaign directory cannot confuse it with the default.
     """
     if seeds < 1:
         raise ValueError(f"--seeds must be >= 1, got {seeds}")
@@ -301,7 +372,11 @@ def generate(
             f"{list(EXPERIMENTS)}"
         )
     base = load_base(base_path)
-    questions = load_probe_questions(probe_questions_path, languages)
+    # probe_language may name a language outside `languages` (an English
+    # probe over a Hindi-only generation, say), so its question is loaded
+    # even when that language's own arm is not being generated.
+    needed_languages = sorted(set(languages) | ({probe_language} if probe_language else set()))
+    questions = load_probe_questions(probe_questions_path, needed_languages)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # The exact original phrasing when experiments is the original default,
@@ -322,9 +397,12 @@ def generate(
                     base,
                     experiment=experiment,
                     language=language,
-                    probe_question=questions[language],
+                    probe_question=questions[probe_language or language],
                     seed_index=seed_index,
                     base_seed=base_seed,
+                    rewire_rate=rewire_rate,
+                    rounds=rounds,
+                    probe_language=probe_language,
                 )
                 path = out_dir / f"{config['run_id']}.yaml"
                 write_config(
@@ -348,8 +426,9 @@ def generate(
         config = build_single_config(
             base,
             language=language,
-            probe_question=questions[language],
+            probe_question=questions[probe_language or language],
             base_seed=base_seed,
+            probe_language=probe_language,
         )
         path = out_dir / f"{config['run_id']}.yaml"
         write_config(
@@ -411,6 +490,23 @@ def build_parser() -> argparse.ArgumentParser:
              "E5's echo-chamber arms: e5 (rewiring on), e6 (its shadow-item "
              "control) and e7 (rewiring without selection).",
     )
+    parser.add_argument(
+        "--rewire-rate", type=float, default=DEFAULT_REWIRE_RATE,
+        help=f"rewire_rate for e5/e6/e7 (default: {DEFAULT_REWIRE_RATE}). "
+             "Appears in the run_id only when it differs from the default, "
+             "so the default campaign's filenames are unaffected and a "
+             "sweep over rates can share one runs folder.",
+    )
+    parser.add_argument(
+        "--rounds", type=int, default=None,
+        help="override K for every generated config (default: base.yaml's own K).",
+    )
+    parser.add_argument(
+        "--probe-language", choices=list(LANGUAGE_CONDITIONS), default=None,
+        help="ask every arm's probe in this one language instead of its own "
+             "(posts still render in each arm's own language). Adds "
+             "'_probe-<lang>' to every run_id. For an E1 control arm.",
+    )
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     return parser
 
@@ -425,6 +521,9 @@ def main(argv: list[str] | None = None) -> int:
         seeds=args.seeds,
         base_seed=args.base_seed,
         experiments=args.experiments,
+        rewire_rate=args.rewire_rate,
+        rounds=args.rounds,
+        probe_language=args.probe_language,
     )
     manifest_path = args.out / "manifest.csv"
     write_manifest(manifest_path, manifest)

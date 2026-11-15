@@ -131,6 +131,79 @@ def test_every_metric_and_language_gets_all_three_scopes():
     assert {r["scope"] for r in rows} == {"within_e3", "within_e4", "did"}
 
 
+# --- rewire_rate grouping (a sweep must never pool two rates) -------------
+
+
+def test_paired_differences_restricts_to_one_rewire_rate():
+    """A sweep over --rewire-rate puts e5 runs at two different rates in the
+    same run_metrics.csv; a rate filter is what keeps them from averaging
+    together into a comparison that is not really one experiment."""
+    frame = _run_metrics([
+        {"experiment": "e5", "language": "english", "seed": 1001,
+         "rewire_rate": 0.3, "final_var_x": 0.10},
+        {"experiment": "e5", "language": "hindi", "seed": 1001,
+         "rewire_rate": 0.3, "final_var_x": 0.30},
+        {"experiment": "e5", "language": "english", "seed": 1001,
+         "rewire_rate": 0.1, "final_var_x": 0.50},
+        {"experiment": "e5", "language": "hindi", "seed": 1001,
+         "rewire_rate": 0.1, "final_var_x": 0.52},
+    ])
+    at_03 = st.paired_differences(frame, "final_var_x", "e5", "hindi", rewire_rate=0.3)
+    at_01 = st.paired_differences(frame, "final_var_x", "e5", "hindi", rewire_rate=0.1)
+    assert at_03 == {1001: pytest.approx(0.20)}
+    assert at_01 == {1001: pytest.approx(0.02)}
+
+
+def test_network_contrasts_rewire_rate_is_a_separate_holm_family():
+    """Two rates must not be corrected together: a rate column on every row,
+    and a Holm family keyed on the rate as well as the metric and scope."""
+    frame = _run_metrics([
+        {"experiment": e, "language": lang, "seed": 1001, "rewire_rate": rate}
+        for e in ("e5", "e6")
+        for lang in ("english", "hindi")
+        for rate in (0.3, 0.1)
+    ])
+    rows_03 = st.network_contrasts(
+        frame, metrics=("final_var_x",), experiment_pair=("e5", "e6"), rewire_rate=0.3
+    )
+    rows_01 = st.network_contrasts(
+        frame, metrics=("final_var_x",), experiment_pair=("e5", "e6"), rewire_rate=0.1
+    )
+    assert all(r["rewire_rate"] == 0.3 for r in rows_03)
+    assert all(r["rewire_rate"] == 0.1 for r in rows_01)
+    families_03 = {r["_family"] for r in rows_03}
+    families_01 = {r["_family"] for r in rows_01}
+    assert families_03.isdisjoint(families_01)
+
+
+def test_main_runs_one_echo_contrast_per_swept_rewire_rate(tmp_path):
+    """main()'s echo-chamber dispatch must not pool a --rewire-rate sweep
+    into one contrast: one call (and one set of rows) per rate present."""
+    results = tmp_path / "results"
+    results.mkdir()
+    rows = [
+        {"experiment": e, "language": lang, "seed": seed, "rewire_rate": rate,
+         "t_echo": 5, "auc_assort_excess": 0.1, "final_assort_excess": 0.1,
+         "final_cross_side_edge_share": 0.2}
+        for e in ("e5", "e6")
+        for lang in ("english", "hindi")
+        for seed in (1001, 1002)
+        for rate in (0.3, 0.1)
+    ]
+    _run_metrics(rows).to_csv(results / "run_metrics.csv", index=False)
+
+    assert st.main([
+        "--e1", str(tmp_path / "absent.jsonl"),
+        "--results", str(results), "--out", str(results), "--skip-e1",
+    ]) == 0
+
+    network = pd.read_csv(results / "network_contrasts.csv")
+    echo = network[network.metric.isin(st.ECHO_METRICS)]
+    assert set(echo.rewire_rate.unique()) == {0.3, 0.1}
+    # Each rate gets its own within_e5/within_e6/did rows for each metric.
+    assert len(echo) == len(st.ECHO_METRICS) * 3 * 2
+
+
 # --- the bootstrap --------------------------------------------------------
 
 

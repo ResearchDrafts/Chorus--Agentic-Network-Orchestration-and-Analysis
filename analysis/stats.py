@@ -461,7 +461,11 @@ def load_run_metrics(results_dir: Path) -> pd.DataFrame:
 
 
 def paired_differences(
-    frame: pd.DataFrame, metric: str, experiment: str, language: str
+    frame: pd.DataFrame,
+    metric: str,
+    experiment: str,
+    language: str,
+    rewire_rate: float | None = None,
 ) -> dict[int, float]:
     """`metric` for `language` minus the same for English, per shared seed.
 
@@ -470,8 +474,15 @@ def paired_differences(
     by seed, and only seeds where BOTH arms produced a value: an unpaired
     seed contributes nothing to a paired test, and silently dropping the pair
     is right where silently filling in the missing half would not be.
+
+    `rewire_rate`, when given, also restricts the arm to that rate -- a
+    campaign that swept --rewire-rate has e5/e6/e7 runs at more than one
+    rate, and pooling them would average a difference across two different
+    experiments in substance, not just in name.
     """
     arm = frame[frame.experiment == experiment]
+    if rewire_rate is not None:
+        arm = arm[arm.rewire_rate == rewire_rate]
     reference = arm[arm.language == REFERENCE_LANGUAGE].set_index("seed")[metric]
     other = arm[arm.language == language].set_index("seed")[metric]
     shared = sorted(set(reference.index) & set(other.index))
@@ -529,7 +540,7 @@ def wilcoxon_p(values: list[float]) -> float | None:
 
 
 NETWORK_COLUMNS = (
-    "metric", "scope", "language", "contrast", "n",
+    "metric", "scope", "language", "contrast", "rewire_rate", "n",
     "mean_diff", "ci_low", "ci_high", "p_raw", "p_holm", "reject_at_05",
     "family_size", "underpowered", "seeds",
 )
@@ -539,6 +550,7 @@ def network_contrasts(
     frame: pd.DataFrame,
     metrics: tuple[str, ...] = NETWORK_METRICS,
     experiment_pair: tuple[str, str] = ("e3", "e4"),
+    rewire_rate: float | None = None,
 ) -> list[dict]:
     """Three scopes per metric per language: within the treatment, within
     the control, and the difference-in-differences between them.
@@ -561,6 +573,11 @@ def network_contrasts(
     with `metrics=ECHO_METRICS, experiment_pair=("e5", "e6")` for E5's
     echo-chamber contrast -- treatment e5 (rewiring on) against e6, which
     runs the same rewiring rule over shadow items instead of delivered ones.
+
+    `rewire_rate`, when given, is threaded into every paired_differences call
+    and into each row's Holm family, so a campaign that swept --rewire-rate
+    never pools two rates into one contrast: main() calls this once per rate
+    present among the echo-chamber runs.
     """
     treatment, control = experiment_pair
     languages = [
@@ -571,8 +588,8 @@ def network_contrasts(
     rows: list[dict] = []
     for metric in metrics:
         for language in languages:
-            treated = paired_differences(frame, metric, treatment, language)
-            baseline = paired_differences(frame, metric, control, language)
+            treated = paired_differences(frame, metric, treatment, language, rewire_rate)
+            baseline = paired_differences(frame, metric, control, language, rewire_rate)
             did = {
                 seed: treated[seed] - baseline[seed]
                 for seed in sorted(set(treated) & set(baseline))
@@ -587,26 +604,34 @@ def network_contrasts(
                  f"{treatment.upper()} - {control.upper()}"),
             ):
                 rows.append(
-                    _network_row(metric, scope, language, label, values)
+                    _network_row(metric, scope, language, label, values, rewire_rate)
                 )
     return holm_within_families(rows, key="_family")
 
 
 def _network_row(
-    metric: str, scope: str, language: str, label: str, values: dict[int, float]
+    metric: str,
+    scope: str,
+    language: str,
+    label: str,
+    values: dict[int, float],
+    rewire_rate: float | None = None,
 ) -> dict:
     ordered = [values[seed] for seed in sorted(values)]
     low, high = bootstrap_ci(ordered)
     p = wilcoxon_p(ordered)
     return {
         # Holm family: one metric, one scope, the three non-English
-        # languages. That is the set of tests answering one question, which
-        # is what a correction family is.
-        "_family": f"{metric}|{scope}",
+        # languages, at one rewire rate. That is the set of tests answering
+        # one question, which is what a correction family is -- folding the
+        # rate in here means two rates are never pooled even if a caller
+        # later concatenates rows from multiple network_contrasts() calls.
+        "_family": f"{metric}|{scope}" if rewire_rate is None else f"{metric}|{scope}|rate={rewire_rate}",
         "metric": metric,
         "scope": scope,
         "language": language,
         "contrast": label,
+        "rewire_rate": rewire_rate,
         # Stated in every row: a mean difference over three seeds and one
         # over twenty are not the same claim, and the column is the only
         # place that shows it.
@@ -699,7 +724,7 @@ def main(argv: list[str] | None = None) -> int:
     # reached, not raised, and is reported rather than silently skipped.
     has_echo_runs = bool({"e5", "e6"} & set(runs.get("experiment", pd.Series(dtype=object))))
     if has_echo_runs:
-        missing_echo = [m for m in ECHO_METRICS if m not in runs.columns]
+        missing_echo = [m for m in (*ECHO_METRICS, "rewire_rate") if m not in runs.columns]
         if missing_echo:
             print(
                 f"  WARNING: e5/e6 runs are present but run_metrics.csv has no "
@@ -707,9 +732,18 @@ def main(argv: list[str] | None = None) -> int:
                 "up the echo-chamber metrics. Skipping the echo-chamber contrast."
             )
         else:
-            network += network_contrasts(
-                runs, metrics=ECHO_METRICS, experiment_pair=("e5", "e6")
-            )
+            # One call per rewire_rate actually present among the e5/e6
+            # runs, so a campaign that swept --rewire-rate gets one
+            # contrast per rate instead of one that pools them. A campaign
+            # with a single rate (the common case) still gets exactly one
+            # call, at that rate.
+            echo_runs = runs[runs.experiment.isin(["e5", "e6"])]
+            rates = sorted(echo_runs["rewire_rate"].dropna().unique())
+            for rate in rates:
+                network += network_contrasts(
+                    runs, metrics=ECHO_METRICS, experiment_pair=("e5", "e6"),
+                    rewire_rate=float(rate),
+                )
     if not network:
         print("no non-English arms in run_metrics.csv to contrast", file=sys.stderr)
         return 1

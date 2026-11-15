@@ -518,3 +518,34 @@ def test_reply_truncated_rate_counts_only_rows_with_a_reply_call():
 
 def test_reply_truncated_rate_is_none_without_the_column():
     assert m.reply_truncated_rate(pd.DataFrame([{"x": 1.0}])) is None
+
+
+def test_run_row_carries_rewiring_config_fields():
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 0, "x": 0.0},
+        {"speaker_agent_id": "a", "turn": 1, "x": 0.5},
+    ])
+    config = {
+        **CONFIG, "rewire_rate": 0.3, "rewire_target": "same_side",
+        "lean_assignment": "balanced",
+    }
+    probes = m.probe_rows(frame, config, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, config, None)
+    row = m.run_row(rounds, probes, config, EPSILON)
+    assert row["rewire_rate"] == 0.3
+    assert row["rewire_target"] == "same_side"
+    assert row["lean_assignment"] == "balanced"
+
+
+def test_run_row_rewiring_fields_are_none_when_the_config_lacks_them():
+    """Every e3/e4 run_config.json predates rewiring having any of these."""
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 0, "x": 0.0},
+        {"speaker_agent_id": "a", "turn": 1, "x": 0.5},
+    ])
+    probes = m.probe_rows(frame, CONFIG, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, CONFIG, None)
+    row = m.run_row(rounds, probes, CONFIG, EPSILON)
+    assert row["rewire_rate"] is None
+    assert row["rewire_target"] is None
+    assert row["lean_assignment"] is None

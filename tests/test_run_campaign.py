@@ -377,9 +377,12 @@ def test_the_launcher_and_the_check_default_to_run_simulations_own():
 
 
 def test_the_shipped_campaign_is_discoverable_in_order():
+    # 6 seed indices x 2 experiments x 4 languages: the shipped campaign was
+    # regenerated with --seeds 6 (alongside e5/e6/e7, which EXPERIMENT_ORDER
+    # excludes from discovery regardless of how many files exist for them).
     configs = rc.discover(Path("configs/rq1/campaign"), ["e3", "e4"])
-    assert len(configs) == 40
+    assert len(configs) == 48
     assert configs[0].stem == "e3_english_ws_s01"
-    assert configs[-1].stem == "e4_hindi_ws_s05"
+    assert configs[-1].stem == "e4_hindi_ws_s06"
     for path in configs:
         assert load_run_config(path).regime == "bank"
