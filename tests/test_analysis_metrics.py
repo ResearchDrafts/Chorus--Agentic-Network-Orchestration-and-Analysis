@@ -742,18 +742,28 @@ def test_feed_size_metrics_are_none_without_the_column():
 def test_mean_feed_gap_is_the_mean_gap_over_delivered_pairs_only():
     """a read b and c; c read a and b; b read nobody (empty feed). The mean
     is over the four (reader, delivered sender) pairs that exist, not over
-    every possible pair in the population."""
+    every possible pair in the population.
+
+    Fix 6: the recommender chose this feed from round 0's readings, so
+    mean_feed_gap at round 1 must use THOSE values (0.0/0.1/0.2), not round
+    1's own (0.9/0.9/0.9, where every gap would be 0) -- a hand-built round
+    where opinions change after selection, per Fix 6's own acceptance test.
+    """
     frame = _frame([
-        {"speaker_agent_id": "a", "turn": 1, "x": 0.0, "feed_size": 2.0, "neighbor_agent_ids": "b|c"},
-        {"speaker_agent_id": "b", "turn": 1, "x": 0.1, "feed_size": 0.0, "neighbor_agent_ids": ""},
-        {"speaker_agent_id": "c", "turn": 1, "x": 0.2, "feed_size": 2.0, "neighbor_agent_ids": "a|b"},
+        {"speaker_agent_id": "a", "turn": 0, "x": 0.0},
+        {"speaker_agent_id": "b", "turn": 0, "x": 0.1},
+        {"speaker_agent_id": "c", "turn": 0, "x": 0.2},
+        {"speaker_agent_id": "a", "turn": 1, "x": 0.9, "feed_size": 2.0, "neighbor_agent_ids": "b|c"},
+        {"speaker_agent_id": "b", "turn": 1, "x": 0.9, "feed_size": 0.0, "neighbor_agent_ids": ""},
+        {"speaker_agent_id": "c", "turn": 1, "x": 0.9, "feed_size": 2.0, "neighbor_agent_ids": "a|b"},
     ])
     config = {**CONFIG, "M": 3}
     probes = m.probe_rows(frame, config, TAU, TAU_CONF)
     rounds = m.round_rows(frame, probes, config, None)
-    # a's feed: |0.0-0.1|=0.1 (b), |0.0-0.2|=0.2 (c)
-    # c's feed: |0.2-0.0|=0.2 (a), |0.2-0.1|=0.1 (b)
-    assert rounds[0]["mean_feed_gap"] == pytest.approx((0.1 + 0.2 + 0.2 + 0.1) / 4)
+    by_turn = {r["turn"]: r for r in rounds}
+    # Using round 0's values: a's feed |0.0-0.1|=0.1 (b), |0.0-0.2|=0.2 (c);
+    # c's feed |0.2-0.0|=0.2 (a), |0.2-0.1|=0.1 (b).
+    assert by_turn[1]["mean_feed_gap"] == pytest.approx((0.1 + 0.2 + 0.2 + 0.1) / 4)
 
 
 def test_mean_feed_gap_is_none_at_round_zero():
@@ -766,38 +776,93 @@ def test_mean_feed_gap_is_none_at_round_zero():
 def test_share_neighbors_filtered_and_mean_neighbor_gap_use_the_full_graph():
     """Over the round's own graph -- the full candidate neighbourhood, not
     the delivered feed -- one of the triangle's three edges exceeds the
-    threshold. Fix 2: mean_neighbor_gap stays on x (recsys_threshold is in
-    x), so it is no longer local_disagreement under a second name -- that
-    moved to v = 2x and is exactly double."""
+    threshold.
+
+    Fix 2: mean_neighbor_gap stays on x (recsys_threshold is in x).
+
+    Fix 6: share_neighbors_filtered and mean_neighbor_gap must reflect
+    round 0's values (0.0/0.1/0.2, what the recommender actually saw),
+    not round 1's own (5.0/5.0/5.0, where every edge agrees and both
+    columns would read 0 if the bug were still present) -- the hand-built
+    round this fix's acceptance test asks for. local_disagreement, by
+    contrast, is still the POST-round state (round 1's), so it is no
+    longer simply 2x mean_neighbor_gap now that the two describe
+    different moments as well as different scales.
+    """
     graph = nx.Graph([("a", "b"), ("b", "c"), ("a", "c")])
     frame = _frame([
-        {"speaker_agent_id": "a", "turn": 1, "x": 0.0},
-        {"speaker_agent_id": "b", "turn": 1, "x": 0.1},
-        {"speaker_agent_id": "c", "turn": 1, "x": 0.2},
+        {"speaker_agent_id": "a", "turn": 0, "x": 0.0},
+        {"speaker_agent_id": "b", "turn": 0, "x": 0.1},
+        {"speaker_agent_id": "c", "turn": 0, "x": 0.2},
+        {"speaker_agent_id": "a", "turn": 1, "x": 5.0},
+        {"speaker_agent_id": "b", "turn": 1, "x": 5.0},
+        {"speaker_agent_id": "c", "turn": 1, "x": 5.0},
     ])
     config = {**CONFIG, "M": 3, "recsys_threshold": 0.15}
     probes = m.probe_rows(frame, config, TAU, TAU_CONF)
     rounds = m.round_rows(frame, probes, config, graph)
-    row = rounds[0]
-    # a-b: 0.1 (ok), b-c: 0.1 (ok), a-c: 0.2 (over 0.15) -> 1 of 3.
+    by_turn = {r["turn"]: r for r in rounds}
+    row = by_turn[1]
+    # a-b: 0.1 (ok), b-c: 0.1 (ok), a-c: 0.2 (over 0.15) -> 1 of 3, all from
+    # round 0's values.
     assert row["share_neighbors_filtered"] == pytest.approx(1 / 3)
     assert row["mean_neighbor_gap"] == pytest.approx((0.1 + 0.1 + 0.2) / 3)
-    assert row["local_disagreement"] == pytest.approx(2 * row["mean_neighbor_gap"])
+    # local_disagreement is round 1's own (post-round) state: everyone at
+    # 5.0, so every edge agrees exactly.
+    assert row["local_disagreement"] == pytest.approx(0.0)
+
+
+def test_share_neighbors_filtered_agrees_with_logged_n_neighbors_over_threshold():
+    """Fix 6's own acceptance test: share_neighbors_filtered (a fraction of
+    EDGES) and the logged per-reader n_neighbors_over_threshold (a count per
+    READER) must describe the same selection-time state. On an undirected
+    graph where every reader's candidates are its full graph neighbourhood
+    (GraphSimilaritySampling), summing n_neighbors_over_threshold over every
+    reader counts each over-threshold edge exactly twice (once from each
+    end), so it must equal 2 * share_neighbors_filtered * n_edges.
+
+    Round 0: a=0.0, b=0.1, c=0.2 (triangle, threshold 0.15) -- a-c is the
+    one edge over threshold. a's neighbours (b, c): c is over -> 1. b's
+    neighbours (a, c): neither is -> 0. c's neighbours (a, b): a is
+    over -> 1. Sum = 2 = 2 * (1/3) * 3 edges.
+    """
+    graph = nx.Graph([("a", "b"), ("b", "c"), ("a", "c")])
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 0, "x": 0.0},
+        {"speaker_agent_id": "b", "turn": 0, "x": 0.1},
+        {"speaker_agent_id": "c", "turn": 0, "x": 0.2},
+        {"speaker_agent_id": "a", "turn": 1, "x": 5.0, "n_neighbors_over_threshold": 1.0},
+        {"speaker_agent_id": "b", "turn": 1, "x": 5.0, "n_neighbors_over_threshold": 0.0},
+        {"speaker_agent_id": "c", "turn": 1, "x": 5.0, "n_neighbors_over_threshold": 1.0},
+    ])
+    config = {**CONFIG, "M": 3, "recsys_threshold": 0.15}
+    probes = m.probe_rows(frame, config, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, config, graph)
+    by_turn = {r["turn"]: r for r in rounds}
+    logged_total = frame[frame.turn == 1]["n_neighbors_over_threshold"].sum()
+    assert logged_total == pytest.approx(2 * by_turn[1]["share_neighbors_filtered"] * graph.number_of_edges())
 
 
 def test_share_neighbors_filtered_is_none_without_a_threshold():
     """A run logged before recsys_threshold existed: the metric needs a
     denominator unit to compare against, and None means no such measurement
-    rather than a threshold of 0."""
+    rather than a threshold of 0.
+
+    A round-0 baseline is included (Fix 6: share_neighbors_filtered reads
+    previously_known, which is otherwise empty and would make this pass
+    for the wrong reason)."""
     graph = nx.Graph([("a", "b")])
     frame = _frame([
-        {"speaker_agent_id": "a", "turn": 1, "x": 0.0},
-        {"speaker_agent_id": "b", "turn": 1, "x": 0.5},
+        {"speaker_agent_id": "a", "turn": 0, "x": 0.0},
+        {"speaker_agent_id": "b", "turn": 0, "x": 0.5},
+        {"speaker_agent_id": "a", "turn": 1, "x": 0.1},
+        {"speaker_agent_id": "b", "turn": 1, "x": 0.6},
     ])
     config = {**CONFIG, "M": 2}
     probes = m.probe_rows(frame, config, TAU, TAU_CONF)
     rounds = m.round_rows(frame, probes, config, graph)
-    assert rounds[0]["share_neighbors_filtered"] is None
+    by_turn = {r["turn"]: r for r in rounds}
+    assert by_turn[1]["share_neighbors_filtered"] is None
 
 
 def test_run_row_carries_recsys_threshold_through():

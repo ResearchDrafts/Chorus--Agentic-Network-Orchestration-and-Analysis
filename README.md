@@ -568,10 +568,15 @@ valid probe to compare against), `recsys_fallback`. Per round, in
 full candidate neighbourhood, not the delivered feed -- over threshold),
 `mean_feed_gap` (mean `|x_i - x_j|` over every delivered reader/sender pair
 this round, under whichever strategy actually ran) and `mean_neighbor_gap`
-(the same over every graph edge regardless of delivery -- `local_disagreement`
-under a second name, so the two numbers side by side show whether the
-recommender's feed disagreed less than the raw graph would have). All five
-are `None` for a pre-Fix-9 run or a non-`graph_similarity` strategy, the
+(the same over every graph edge regardless of delivery). **Fix 6:** all
+three of these are computed from the state BEFORE this round's own probes
+are folded in, matching what the recommender actually saw when it chose
+the feed (`select_neighbors` runs before this round's reply/probe) --
+`None` at round 0, where there is no earlier state. `mean_neighbor_gap` is
+no longer `local_disagreement` under a second name: Fix 2 moved
+`local_disagreement` to `v = 2x` and kept it on the POST-round state, so
+the two now differ in both scale and timing. All five columns are `None`
+for a pre-Fix-9 run or a non-`graph_similarity` strategy, the
 "empty rather than absent" convention every other optional bank column here
 follows.
 

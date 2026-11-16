@@ -540,7 +540,16 @@ def round_rows(
         )
         local_dis = local_disagreement(round_graph, known)
         pairwise_dis = pairwise_disagreement(known)
-        mean_neighbor_gap_x = _mean_abs_diff_over_known_edges(round_graph, known)
+        # Fix 6: the recommender chose this round's feed from the PREVIOUS
+        # round's readings (select_neighbors runs before this round's own
+        # reply/probe), so the diagnostic that asks "how well did the
+        # selection do" must be computed from that same pre-round state
+        # (previously_known), not from `known`, which already carries this
+        # round's just-finished probes -- otherwise the column mixes
+        # selection with the persuasion that followed it in the same round.
+        # previously_known is empty at round 0 (nothing was known before
+        # it), so all three are None there with no extra branch needed.
+        mean_neighbor_gap_x = _mean_abs_diff_over_known_edges(round_graph, previously_known)
 
         # Fix 2: v = 2x, Jo et al.'s own [-2, 2] scale. shifts_v is the
         # individual per-agent change since round 0, on v, restricted to
@@ -632,12 +641,15 @@ def round_rows(
             "n_side_switches": n_side_switches,
             "mean_feed_size": _mean_or_none(turn_frame.get("feed_size", pd.Series(dtype=float))),
             "share_empty_feed": _share_empty_feed(turn_frame),
+            # Fix 6: previously_known, not known -- see mean_neighbor_gap_x's
+            # own note just above.
             "share_neighbors_filtered": share_neighbors_filtered(
-                round_graph, known, config.get("recsys_threshold")
+                round_graph, previously_known, config.get("recsys_threshold")
             ),
-            "mean_feed_gap": mean_feed_gap(turn_frame, known),
+            "mean_feed_gap": mean_feed_gap(turn_frame, previously_known),
             # Fix 2: no longer an alias of local_disagreement -- that moved
             # to v, and this stays on x (see mean_feed_gap's own note).
+            # Fix 6: also no longer computed from this round's own readings.
             "mean_neighbor_gap": mean_neighbor_gap_x,
             "n_valid": len(rows),
             "n_failed": population - len(rows),
@@ -919,11 +931,16 @@ def disagreement_ratio(local: float | None, pairwise: float | None) -> float | N
 # GraphSampling and AlphaSampling never deliver fewer than N, so these two
 # are a no-op everywhere but neighbor_strategy="graph_similarity");
 # share_neighbors_filtered and mean_feed_gap are a property of the graph the
-# feed was drawn from and compare it against mean_neighbor_gap, which is
-# local_disagreement under a second name -- the round's own full
-# neighbourhood, filtered by nothing -- so the two numbers side by side show
-# whether the recommender's feed disagreed less than the raw graph would
-# have.
+# feed was drawn from and compare it against mean_neighbor_gap -- the
+# round's own full neighbourhood, filtered by nothing -- so the two numbers
+# side by side show whether the recommender's feed disagreed less than the
+# raw graph would have. Fix 2 moved local_disagreement to v = 2x, so
+# mean_neighbor_gap (which stays on x) is no longer that column under a
+# second name; Fix 6 made all three of these -- mean_feed_gap,
+# share_neighbors_filtered, mean_neighbor_gap -- read the state BEFORE this
+# round's own probes are folded in (previously_known), matching what the
+# recommender actually saw when it chose the feed, rather than mixing that
+# selection with the persuasion that followed it in the same round.
 
 
 def _share_empty_feed(turn_frame: pd.DataFrame) -> float | None:
@@ -958,8 +975,15 @@ def mean_feed_gap(turn_frame: pd.DataFrame, x_by_agent: dict[str, float]) -> flo
     round's full candidate neighbourhood, filtered by nothing) is the
     baseline for.
 
-    None when no pair has both ends known -- round 0, where nothing was
-    delivered, and any round with no usable readings at all.
+    Fix 6: `x_by_agent` must be the state BEFORE this round's own readings
+    are folded in (round_rows' `previously_known`) -- the recommender
+    selected this round's feed from that state (select_neighbors runs
+    before this round's reply/probe), so scoring the selection against
+    readings it could not have seen would mix selection with the
+    persuasion that followed it in the same round.
+
+    None when no pair has both ends known -- round 0 (previously_known is
+    always empty there), and any round with no usable readings at all.
     """
     gaps: list[float] = []
     for row in turn_frame.itertuples():
@@ -985,6 +1009,12 @@ def share_neighbors_filtered(
     Fix 2: stays on x, like mean_feed_gap, for the same reason --
     recsys_threshold is in x units, and this is the share of edges that
     fall on either side of it.
+
+    Fix 6: `x_by_agent` must be the pre-round state (`previously_known`),
+    the same reason mean_feed_gap takes it -- this is what the logged
+    per-reader `n_neighbors_over_threshold` already measures (computed at
+    selection time, before this round's probe), so the two now describe
+    the same moment rather than two different ones.
 
     None when there is no graph, no threshold (a run logged before
     recsys_threshold existed), or no edge survives with both ends known --
