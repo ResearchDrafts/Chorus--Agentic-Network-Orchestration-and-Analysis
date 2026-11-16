@@ -268,6 +268,44 @@ def test_balanced_two_camps_splits_evenly_and_excludes_the_midpoint():
     assert sorted(pro.count(p) for p in (5, 6, 7)) == [3, 3, 4]
 
 
+def test_balanced_two_camps_pro_camp_mirrors_con_camp_for_m20():
+    """Fix 7: before this fix, _evenly_repeated's remainder landed on 1
+    (farthest from the midpoint) for con but on 5 (closest to it) for pro,
+    so con was more extreme than pro. The pro camp must now be con's exact
+    mirror image about the midpoint."""
+    run = make_run(M=20, persona_pool_id="pool_20", lean_assignment="balanced_two_camps")
+    leans = _population_leans(run, seed=7)
+    con = sorted(lean for lean in leans if lean < 4)
+    pro = sorted((lean for lean in leans if lean > 4), reverse=True)
+    assert con == [1, 1, 1, 1, 2, 2, 2, 3, 3, 3]
+    assert pro == [7, 7, 7, 7, 6, 6, 6, 5, 5, 5]
+
+
+def test_balanced_two_camps_is_symmetric_about_the_midpoint_for_every_even_m():
+    """Fix 7's own acceptance test: for every even M from 4 to 50, the
+    multiset of leans mirrors exactly about the midpoint, on every seed."""
+    for m in range(4, 51, 2):
+        run = make_run(
+            M=m, N=1, persona_pool_id="pool_20", lean_assignment="balanced_two_camps",
+        )
+        for seed in (1, 2, 3):
+            leans = _population_leans(run, seed=seed)
+            assert sorted(4 - lean for lean in leans if lean < 4) == sorted(
+                lean - 4 for lean in leans if lean > 4
+            )
+
+
+def test_balanced_two_camps_rejects_an_asymmetric_scale():
+    # midpoint 4; below = [1, 2], above = [5, 8]. Mirroring below about 4
+    # gives {7, 6}, neither of which is in the scale's own above set.
+    run = make_run(
+        M=4, N=1, persona_pool_id="test_pool", lean_assignment="balanced_two_camps",
+        stance_scale=[1, 2, 4, 5, 8],
+    )
+    with pytest.raises(ValueError, match="symmetric about the midpoint"):
+        _population_leans(run, seed=1)
+
+
 def test_balanced_two_camps_gives_the_same_multiset_on_every_seed_for_even_m():
     """Even M: camp sizes are fixed at M/2 each with no RNG involved, so the
     multiset -- not just the shuffle -- must be identical across seeds."""

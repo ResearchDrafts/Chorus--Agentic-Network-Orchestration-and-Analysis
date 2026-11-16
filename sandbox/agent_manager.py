@@ -271,8 +271,9 @@ class AgentManager:
 
     def _balanced_two_camps_leans(self) -> list[float]:
         """M leans split into two equal-sized camps, one drawn evenly from
-        the scale points strictly below the midpoint and one strictly
-        above it, with nobody at the midpoint itself.
+        the scale points strictly below the midpoint and the other its
+        mirror image about the midpoint, with nobody at the midpoint
+        itself.
 
         "balanced" alone can leave a population at 9 agents on one side and
         11 on the other (M=20 over a 7-point scale gives lean 4, the
@@ -282,12 +283,28 @@ class AgentManager:
         measurement that depends on two roughly matched camps existing at
         all needs to rule both of those out before round 1.
 
+        Fix 7: the pro camp is NOT drawn independently from `above` by its
+        own call to _evenly_repeated. _evenly_repeated's remainder always
+        favours the first point of whichever list it is given, and `below`
+        and `above` are each sorted ascending -- so the con camp's extra
+        agent landed on 1 (farthest from the midpoint) while the pro camp's
+        landed on 5 (closest to it), making con systematically more
+        extreme than pro on every even M. Mirroring con's own leans about
+        the midpoint (lean L <-> 2*midpoint - L) instead guarantees the two
+        camps are exact reflections of each other, independent of seed.
+        This assumes the configured stance_scale is itself symmetric about
+        its midpoint (true of every Likert-style scale this codebase uses);
+        a scale where a mirrored point does not exist raises rather than
+        silently producing an out-of-scale lean.
+
         Camp sizes are M // 2 each; for odd M, the RNG stream this method
         itself shuffles with decides which camp gets the extra agent, which
         means -- unlike "balanced"'s own deterministic remainder -- an odd
         M's exact camp sizes are the one part of this multiset that is
-        allowed to depend on the seed. Within a camp, points are drawn
-        evenly the same way "balanced" draws from the whole scale.
+        allowed to depend on the seed. The extra agent's own lean is drawn
+        from `below`/`above` directly (not mirrored -- there is no partner
+        to mirror against for an unpaired agent), the same way it always
+        has been.
         """
         scale = sorted(self._run.stance_scale)
         midpoint = scale[len(scale) // 2]
@@ -300,7 +317,17 @@ class AgentManager:
                 f"got {scale}"
             )
         half, remainder = divmod(self._run.M, 2)
-        leans = _evenly_repeated(below, half) + _evenly_repeated(above, half)
+        con_leans = _evenly_repeated(below, half)
+        pro_leans = [2 * midpoint - lean for lean in con_leans]
+        unmirrored = sorted(set(pro_leans) - set(above))
+        if unmirrored:
+            raise ValueError(
+                "lean_assignment='balanced_two_camps' needs stance_scale "
+                f"symmetric about the midpoint {midpoint} to mirror the con "
+                f"camp into a pro camp, but {unmirrored} (below's mirror) "
+                f"is not in the scale's own above-midpoint points {above}"
+            )
+        leans = con_leans + pro_leans
         if remainder:
             extra_side = below if self._rng.choice(["con", "pro"]) == "con" else above
             leans += _evenly_repeated(extra_side, 1)
