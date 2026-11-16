@@ -481,7 +481,11 @@ roughly the "no neighbour alignment" baseline this index sits around.
 `analysis.stats` runs two contrast families: e5-vs-e6 (delivery) and
 e5-vs-e7 (selection versus rewiring as such), each Holm-corrected on its own
 and, when a campaign swept `--rewire-rate`, once per rate so two rates are
-never pooled. Every `t_echo` contrast row carries
+never pooled. **Fix 10:** the e5-vs-e7 call emits only its `within_e7` and
+difference-in-differences rows, not `within_e5` -- that row is already
+emitted by the e5-vs-e6 call (the same treatment arm), and emitting it
+twice gave the same underlying comparison two different Holm-corrected p
+values, one per family's own composition. Every `t_echo` contrast row carries
 `n_censored_treatment`/`n_censored_control`/`censored_warning`, since a
 difference built from censored runs (`echo_censored`, `t_echo = K + 1`)
 depends on `K`; every `auc_nci_excess` contrast row carries

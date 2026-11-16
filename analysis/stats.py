@@ -678,6 +678,7 @@ def network_contrasts(
     experiment_pair: tuple[str, str] = ("e3", "e4"),
     rewire_rate: float | None = None,
     recsys_threshold: float | None = None,
+    include_treatment_scope: bool = True,
 ) -> list[dict]:
     """Three scopes per metric per language: within the treatment, within
     the control, and the difference-in-differences between them.
@@ -707,6 +708,13 @@ def network_contrasts(
     present among the echo-chamber runs. `recsys_threshold` does the same
     for a --recsys-threshold sweep of e8/e9.
 
+    `include_treatment_scope=False` (Fix 10) drops the `within_{treatment}`
+    row entirely -- used for the e5-vs-e7 call, whose treatment (e5) is the
+    SAME run as the e5-vs-e6 call's own treatment. Emitting it twice gave
+    two differently Holm-corrected p-values for one underlying comparison,
+    once per family's own composition. With this False, e5-vs-e7 contributes
+    only its within-e7 and difference-in-differences rows, and Holm
+    correction (applied per call, below) runs over just those.
     """
     treatment, control = experiment_pair
     languages = [
@@ -755,6 +763,8 @@ def network_contrasts(
                  f"{treatment.upper()} - {control.upper()}",
                  set(did), set(did)),
             ):
+                if scope == f"within_{treatment}" and not include_treatment_scope:
+                    continue
                 n_censored_treatment = (
                     censored_count(
                         frame, treatment, language, treatment_seeds,
@@ -950,7 +960,10 @@ def formation_summary(runs: pd.DataFrame) -> list[dict]:
 
 
 def _echo_contrasts_for_pair(
-    runs: pd.DataFrame, pair: tuple[str, str], metrics: tuple[str, ...]
+    runs: pd.DataFrame,
+    pair: tuple[str, str],
+    metrics: tuple[str, ...],
+    include_treatment_scope: bool = True,
 ) -> list[dict]:
     """network_contrasts(), once per rewire_rate present among `pair`'s
     own runs -- the sweep-safe dispatch both the e5-vs-e6 and the e5-vs-e7
@@ -978,12 +991,18 @@ def _echo_contrasts_for_pair(
             f"{pair[0]}-vs-{pair[1]} contrast."
         )
         return []
+    # Fix 10: main() passes include_treatment_scope=False for the e5-vs-e7
+    # call, since e5-vs-e6's own call already emits every within-e5 row --
+    # the SAME treatment arm -- and emitting it twice gave the same
+    # underlying comparison two different Holm-corrected p-values, one per
+    # family's own composition.
     pair_runs = runs[runs.experiment.isin(list(pair))]
     rates = sorted(pair_runs["rewire_rate"].dropna().unique())
     rows: list[dict] = []
     for rate in rates:
         rows += network_contrasts(
-            runs, metrics=metrics, experiment_pair=pair, rewire_rate=float(rate)
+            runs, metrics=metrics, experiment_pair=pair, rewire_rate=float(rate),
+            include_treatment_scope=include_treatment_scope,
         )
     return rows
 
@@ -1080,7 +1099,12 @@ def main(argv: list[str] | None = None) -> int:
     # warning rather than run against a campaign or a run_metrics.csv that
     # does not have it.
     network += _echo_contrasts_for_pair(runs, ("e5", "e6"), ECHO_METRICS)
-    network += _echo_contrasts_for_pair(runs, ("e5", "e7"), E5_E7_METRICS)
+    # Fix 10: e5-vs-e7 shares its treatment (e5) with the e5-vs-e6 call just
+    # above, so it must not re-emit within-e5 rows -- only within-e7 and
+    # the difference-in-differences, Holm-corrected over just those.
+    network += _echo_contrasts_for_pair(
+        runs, ("e5", "e7"), E5_E7_METRICS, include_treatment_scope=False
+    )
     # Fix 9: e8 (the similarity recommender) vs. e9 (its same-feed-size
     # random control), its own Holm-corrected family, skipped with a
     # warning the same way the two E5 families are when neither arm of the

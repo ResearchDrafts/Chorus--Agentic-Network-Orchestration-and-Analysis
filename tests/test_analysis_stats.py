@@ -277,6 +277,44 @@ def test_e5_vs_e7_and_e5_vs_e6_are_computed_independently():
     assert e7_did["mean_diff"] == pytest.approx(-6.0)
 
 
+def test_e5_vs_e7_excludes_within_e5_when_asked():
+    """Fix 10: main()'s own usage -- include_treatment_scope=False drops
+    the within_e5 row the e5-vs-e6 call already emits for the same
+    treatment arm."""
+    frame = _run_metrics([
+        _echo_run("e5", "hindi", 1001), _echo_run("e7", "hindi", 1001),
+    ])
+    rows = st._echo_contrasts_for_pair(
+        frame, ("e5", "e7"), st.E5_E7_METRICS, include_treatment_scope=False
+    )
+    assert rows
+    assert {r["scope"] for r in rows} == {"within_e7", "did"}
+    assert all(r["metric"] in st.E5_E7_METRICS for r in rows)
+
+
+def test_main_does_not_duplicate_within_e5_rows_across_the_two_echo_families(tmp_path):
+    """Fix 10's own acceptance test: before this fix, t_echo|within_e5 (one
+    of E5_E7_METRICS' metrics, shared with ECHO_METRICS) was emitted once
+    by the e5-vs-e6 call and again by the e5-vs-e7 call, with two different
+    Holm-corrected p-values for the same underlying comparison."""
+    results = tmp_path / "results"
+    results.mkdir()
+    rows = [
+        _echo_run("e5", "english", 1001), _echo_run("e5", "hindi", 1001),
+        _echo_run("e6", "english", 1001), _echo_run("e6", "hindi", 1001),
+        _echo_run("e7", "english", 1001), _echo_run("e7", "hindi", 1001),
+    ]
+    _run_metrics(rows).to_csv(results / "run_metrics.csv", index=False)
+
+    assert st.main([
+        "--e1", str(tmp_path / "absent.jsonl"),
+        "--results", str(results), "--out", str(results), "--skip-e1",
+    ]) == 0
+    network = pd.read_csv(results / "network_contrasts.csv")
+    within_e5_t_echo = network[(network.scope == "within_e5") & (network.metric == "t_echo")]
+    assert len(within_e5_t_echo) == 1
+
+
 def test_network_row_marks_the_primary_echo_metric():
     rows = st.network_contrasts(
         _run_metrics([
