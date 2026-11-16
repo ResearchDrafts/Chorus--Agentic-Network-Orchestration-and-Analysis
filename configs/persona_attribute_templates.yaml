@@ -1,3 +1,14 @@
+# UNVERIFIED machine translations. Needs a native-speaker check before use.
+#
+# Fix 9: with persona_attributes != "none", the four language arms differ
+# in a FOURTH thing beyond the bank text, the probe question and the one
+# directive line -- this sentence, appended to every persona's description.
+# The persona description itself (the free-text or demographic-row content
+# `_persona_section` substitutes INTO this template) stays in English in
+# every arm; only the template wording translated here varies by language,
+# and it has not been reviewed by a native speaker of hinglish,
+# romanized_hindi or hindi.
+#
 # Fix 7: structured persona attributes (off by default via
 # ExperimentRun.persona_attributes="none").
 #

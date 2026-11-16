@@ -616,7 +616,14 @@ five Big Five traits drawn high or low with probability 0.5, keyed by
 persona index so the same persona draws the same traits in every language
 arm of a seed. The sentence's template lives in
 [`configs/persona_attribute_templates.yaml`](configs/persona_attribute_templates.yaml),
-not in code, and is rendered in the run's own language. With the default
+not in code, and is rendered in the run's own language. **Fix 9: that
+template is a machine translation nobody has native-speaker-reviewed.**
+Turning `persona_attributes` on therefore adds a FOURTH thing that varies
+by language, beyond the bank regime's own three (the bank text, the probe
+question, and the one directive line) -- the persona description itself
+stays in English in every arm; only this template's wording around it
+varies, and `load_run_config` prints a warning naming this every time
+`persona_attributes != "none"`. With the default
 `"none"`, every prompt is byte-identical to before this existed. A
 demographic-mode persona pool is read as one JSON object per line
 (`{"persona": ..., "age": ..., "gender": ..., "education": ...}`) rather than

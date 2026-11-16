@@ -100,6 +100,20 @@ def load_run_config(path: Path) -> ExperimentRun:
         raise ConfigLoadError(path, errors)
 
     assert run is not None
+    # Fix 9: configs/persona_attribute_templates.yaml is a machine
+    # translation that has not had a native-speaker review. With
+    # persona_attributes on, every language arm's persona description
+    # carries this template's own sentence, so the four arms differ in a
+    # fourth thing beyond the bank text, probe question and directive line
+    # -- unreviewed translated text, not just unreviewed-but-matched text.
+    if run.persona_attributes != "none":
+        print(
+            "  WARNING: persona_attributes="
+            f"{run.persona_attributes!r} renders "
+            "configs/persona_attribute_templates.yaml into every agent's "
+            "persona -- those translations are UNVERIFIED and need a "
+            "native-speaker check before use."
+        )
     return run
 
 

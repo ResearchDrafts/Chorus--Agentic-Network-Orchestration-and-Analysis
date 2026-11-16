@@ -247,11 +247,30 @@ def test_a_demographic_config_with_a_complete_pool_loads(tmp_path):
     assert run.persona_attributes == "demographic"
 
 
+def test_demographic_mode_warns_that_the_templates_are_unverified(tmp_path, capsys):
+    """Fix 9: configs/persona_attribute_templates.yaml is a machine
+    translation nobody has native-speaker-reviewed, and turning
+    persona_attributes on adds a fourth language-varying element (this
+    template's own sentence) beyond the bank text, probe question and
+    directive line."""
+    load_run_config(_config(
+        tmp_path, persona_attributes="demographic", persona_pool_id=DEMOGRAPHIC_POOL,
+    ))
+    out = capsys.readouterr().out
+    assert "UNVERIFIED" in out
+    assert "native-speaker" in out
+
+
 def test_none_mode_never_parses_the_pool_as_json(tmp_path):
     """Every existing config points at a plain-text pool; persona_attributes
     defaulting to "none" must not try to JSON-parse it."""
     run = load_run_config(_config(tmp_path))  # smoke.yaml's own plain-text pool_20
     assert run.persona_attributes == "none"
+
+
+def test_none_mode_prints_no_translation_warning(tmp_path, capsys):
+    load_run_config(_config(tmp_path))
+    assert "UNVERIFIED" not in capsys.readouterr().out
 
 
 def test_demographic_mode_against_a_plain_text_pool_is_refused(tmp_path):
