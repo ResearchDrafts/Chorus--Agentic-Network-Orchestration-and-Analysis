@@ -85,7 +85,7 @@ stance_high_label: remote work should always be the default
 # per line (NOT JSON, despite the extension). pool_20 is a 20-entry
 # placeholder; with M=100 it cycles, giving 5 agents per persona. A real run
 # wants a real pool.
-persona_pool_id: pool_20
+persona_pool_id: pool_100
 
 # RQ3's manipulated variable. Set enabled: true and compare convergence
 # speed against an otherwise identical enabled: false run. The rate applies

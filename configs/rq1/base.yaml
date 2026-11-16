@@ -45,7 +45,7 @@ lean_assignment: random
 alpha: 0.5
 
 M: 100                       # num of agents
-K: 3                       # num of rounds
+K: 20                       # num of rounds
 trial_number: 1            # overwritten: the generator uses the seed index
 
 # --- what agents post ----------------------------------------------------
@@ -59,7 +59,7 @@ delivery: "on"             # sees content posted by neighbours if on. if off, se
 neutral_bank_path: data/bank/test_neutral.csv
 
 start_mode: posts
-starter_bank_path: data/bank/test_starter.csv
+starter_bank_path: data/bank/test_starter.csv # pre-written (by human) one sided posts for another experiment later on
 exclude_items_path: null
 
 language_condition: english
