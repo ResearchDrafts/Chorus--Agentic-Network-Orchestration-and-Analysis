@@ -3,7 +3,7 @@
 # smoke-test values, not campaign values.
 
 run_id: opinion_smoke
-topic: Should city bus fares stay subsidised?
+topic: Is there such a thing as a paradox of free speech?
 
 # null = use every persona in the pool. Set to a small number for a cheap
 # smoke run.

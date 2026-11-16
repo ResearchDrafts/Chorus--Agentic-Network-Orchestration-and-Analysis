@@ -24,12 +24,18 @@ _BELIEF_PATTERN = re.compile(r"BELIEF:\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE)
 _CONFIDENCE_PATTERN = re.compile(r"CONFIDENCE:\s*(\d+)", re.IGNORECASE)
 
 _RESPONSE_FORMAT_INSTRUCTIONS = (
-    "Write your opinion as a short paragraph. Then, on their own lines at "
-    "the end, report:\n"
+    "First, on their own lines, report:\n"
     "BELIEF: <a number from -2 to 2, where -2 means strongly against and "
     "2 means strongly in favor>\n"
     "CONFIDENCE: <a whole number from 1 to 5, where 1 means you barely "
-    "hold this view and 5 means you are completely certain of it>"
+    "hold this view and 5 means you are completely certain of it>\n"
+    "Then write your opinion as a short paragraph explaining your reasoning.\n"
+    # Putting BELIEF:/CONFIDENCE: first, not last, is deliberate: a response
+    # cut off by max_reply_tokens is always truncated from the end, and a
+    # verbose free-text paragraph (worse in languages that tokenize less
+    # efficiently than English, e.g. Hindi) can consume the whole budget
+    # before ever reaching trailing tags. Tags first means truncation only
+    # ever costs the reasoning text, never the measurement.
 )
 
 

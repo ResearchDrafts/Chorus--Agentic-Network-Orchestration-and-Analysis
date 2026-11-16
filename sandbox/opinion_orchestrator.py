@@ -102,7 +102,8 @@ async def run(config: OpinionExperimentConfig) -> Path:
     initial_belief = {aid: belief_rng.uniform(-2.0, 2.0) for aid in agent_ids}
 
     graph = GraphSampling(
-        agent_ids, config.graph_degree, config.graph_rewire_p, config.N, seed_mgr.graph_seed
+        agent_ids, config.graph_degree, config.graph_rewire_p, config.N, seed_mgr.graph_seed,
+        allow_short_feed=config.allow_short_feed,
     )
     metrics_graph = build_graph(agent_ids, graph.edges())
 

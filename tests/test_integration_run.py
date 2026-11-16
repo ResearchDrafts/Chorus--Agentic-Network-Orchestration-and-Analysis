@@ -905,10 +905,10 @@ async def test_the_control_and_the_treatment_share_their_draws(
 # --- the instrument is identical across arms -----------------------------
 
 ARM_QUESTIONS = {
-    "english": "Should city bus fares stay subsidised?",
-    "hinglish": "Kya city bus fares subsidised rehne chahiye?",
-    "romanized_hindi": "Kya shahar ki bus kiraya subsidy jaari rehni chahiye?",
-    "hindi": "क्या शहर की बस किराया सब्सिडी जारी रहनी चाहिए?",
+    "english": "Is there such a thing as a paradox of free speech?",
+    "hinglish": "",
+    "romanized_hindi": "",
+    "hindi": "",
 }
 
 

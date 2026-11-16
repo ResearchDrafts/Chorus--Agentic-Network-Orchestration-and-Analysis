@@ -45,6 +45,14 @@ class OpinionExperimentConfig(BaseModel):
     N: int = Field(ge=1)
     graph_degree: int = Field(ge=2)
     graph_rewire_p: float = Field(ge=0.0, le=1.0)
+    # Off by default, matching every pre-existing graph-strategy config in
+    # this repo (e3-e7): GraphSampling normally refuses to start if any node
+    # ends up with fewer than N neighbours after Watts-Strogatz rewiring.
+    # True opts into delivering fewer than N for just the short nodes
+    # instead -- the same escape hatch e9 already uses for this exact
+    # problem, which gets more likely to bite as M grows even with 1 slack
+    # (degree = N + 1).
+    allow_short_feed: bool = False
 
     seed: int
     model_backend_id: str = Field(min_length=1)
