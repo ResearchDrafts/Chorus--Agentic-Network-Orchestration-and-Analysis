@@ -526,10 +526,19 @@ def test_the_closest_neighbours_are_chosen():
     assert {a.agent_id for a in chosen} == {candidates[0], candidates[3]}
 
 
-def test_ties_are_reproducible_from_the_seed():
-    """Candidates equidistant from the reader break ties off `rng`, not off
-    agent_id order -- so the same seed must always produce the same pick,
-    and (empirically, across many seeds) not always the same one."""
+def test_ties_are_reproducible_from_graph_seed_turn_and_reader_not_the_shared_rng():
+    """Fix 11: candidates equidistant from the reader break ties off a
+    private stream keyed by (graph_seed, turn, reader id), NOT off the
+    shared `rng` parameter the orchestrator hands every strategy -- so
+    varying `rng` must not move the pick at all for a fixed turn, while
+    varying turn (part of the private key) does, empirically, pick
+    differently across enough turns.
+
+    Before this fix, the tie-break came off `rng` itself: the shared
+    per-round stream, whose position by the time this reader's own turn
+    came up depended on how many draws every earlier-processed agent's own
+    selection had consumed -- a function of opinions, which differ by
+    language after round 1."""
     strategy = _similarity(n=10, degree=4, k=1, threshold=2.0, graph_seed=7)
     candidates = strategy.neighbors_of("agent_0000")
     # All four candidates equidistant from the speaker (x = 0.5 for every one).
@@ -539,14 +548,44 @@ def test_ties_are_reproducible_from_the_seed():
     by_id = {a.agent_id: a for a in population}
     speaker = by_id["agent_0000"]
 
-    picks = set()
-    for seed in range(20):
-        chosen = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(seed))
-        picks.add(chosen[0].agent_id)
-        # Reproducible: the same seed, run again, picks the same one.
-        again = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(seed))
+    picks_by_turn = set()
+    for turn in range(1, 20):
+        chosen = strategy.select_neighbors(speaker, population, turn=turn, rng=random.Random(999))
+        # The shared rng parameter must not affect the pick at all.
+        again = strategy.select_neighbors(speaker, population, turn=turn, rng=random.Random(1))
         assert chosen[0].agent_id == again[0].agent_id
-    assert len(picks) > 1
+        picks_by_turn.add(chosen[0].agent_id)
+    assert len(picks_by_turn) > 1
+
+
+def test_tie_break_order_is_independent_of_other_agents_opinions():
+    """Fix 11's own acceptance test: two populations sharing a graph_seed
+    but differing in every OTHER agent's opinion must give this reader the
+    same tie-break order, as long as this reader's own candidate gaps are
+    identical in both -- the shared per-round `rng` stream's position would
+    have depended on those other agents' own selections, which the private
+    per-reader stream this fix introduces does not."""
+    strategy = _similarity(n=10, degree=4, k=4, threshold=2.0, graph_seed=7)
+    candidates = strategy.neighbors_of("agent_0000")
+    assert len(candidates) == 4
+    population_a = [
+        _probed(agent_id, 5.5 if agent_id in candidates else 4.0) for agent_id in _ids(10)
+    ]
+    population_b = [
+        _probed(agent_id, 5.5 if agent_id in candidates else 6.9) for agent_id in _ids(10)
+    ]
+    speaker_a = next(a for a in population_a if a.agent_id == "agent_0000")
+    speaker_b = next(a for a in population_b if a.agent_id == "agent_0000")
+
+    order_a = [
+        a.agent_id for a in
+        strategy.select_neighbors(speaker_a, population_a, turn=3, rng=random.Random(1))
+    ]
+    order_b = [
+        a.agent_id for a in
+        strategy.select_neighbors(speaker_b, population_b, turn=3, rng=random.Random(99))
+    ]
+    assert order_a == order_b
 
 
 def test_short_feed_delivers_fewer_than_k_without_backfilling():
@@ -632,7 +671,12 @@ def test_a_reader_with_no_valid_probe_falls_back_to_random_neighbours():
 def test_feed_order_is_shuffled_after_ranking():
     """Delivery order is not itself a clue to similarity: the two chosen
     candidates (one clearly closest, one clearly second) are reshuffled
-    before delivery, so the closest is not always first in the feed."""
+    before delivery, so the closest is not always first in the feed.
+
+    Fix 11: the shuffle comes off the private per-(graph_seed, turn,
+    reader) stream, not the shared `rng` parameter -- varying `rng` alone
+    (a fixed turn=1 below) must not move the order at all; varying turn
+    does, empirically, give more than one order across enough turns."""
     strategy = _similarity(n=10, degree=4, k=2, threshold=2.0, graph_seed=7)
     candidates = strategy.neighbors_of("agent_0000")
     raws = {candidates[0]: 4.1, candidates[1]: 4.5, candidates[2]: 6.0, candidates[3]: 7.0}
@@ -640,9 +684,20 @@ def test_feed_order_is_shuffled_after_ranking():
     by_id = {a.agent_id: a for a in population}
     speaker = by_id["agent_0000"]
 
+    fixed_turn = {
+        tuple(
+            a.agent_id for a in
+            strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(seed))
+        )
+        for seed in range(30)
+    }
+    assert fixed_turn == {(candidates[0], candidates[1])} or fixed_turn == {
+        (candidates[1], candidates[0])
+    }
+
     orders = set()
-    for seed in range(30):
-        chosen = strategy.select_neighbors(speaker, population, turn=1, rng=random.Random(seed))
+    for turn in range(1, 30):
+        chosen = strategy.select_neighbors(speaker, population, turn=turn, rng=random.Random(1))
         assert {a.agent_id for a in chosen} == {candidates[0], candidates[1]}
         orders.add(tuple(a.agent_id for a in chosen))
     assert len(orders) > 1

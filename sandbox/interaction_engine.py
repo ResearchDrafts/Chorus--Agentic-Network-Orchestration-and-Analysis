@@ -191,6 +191,11 @@ class GraphSampling:
             raise ValueError("agent_ids must be unique")
 
         self.k = k
+        # Fix 11: GraphSimilaritySampling.select_neighbors keys its own
+        # per-reader RNG off this, so it never consumes the shared
+        # per-round stream it is handed. Stored on the base class since
+        # GraphSampling itself has no need of it after construction.
+        self.graph_seed = graph_seed
         # Fix 1: at N=5/degree=6 (e8/e9), Watts-Strogatz rewiring during
         # construction strands enough nodes below k that most seeds cannot
         # build at all (48 of the originally committed e8/e9 configs failed
@@ -550,13 +555,31 @@ class GraphSimilaritySampling(GraphSampling):
         """Up to k adjacent neighbours, closest belief first, within
         self.threshold -- see the class docstring for the full rule.
 
-        Candidate order: shuffled with `rng`, then stably sorted by
-        |x_i - x_j| -- so ties at the same distance land in a seeded-random
-        relative order rather than always breaking toward whichever agent_id
-        sorts first. The chosen set is then shuffled again with the SAME
-        stream before being returned, so a post's position in the feed is
-        not itself a clue to how similar it was.
+        Fix 11: does NOT consume `rng`, the shared per-round stream every
+        other strategy draws from. That stream is one sequence per round,
+        shared across every agent processed in it, so how many draws THIS
+        reader's own selection makes depends on how many of its candidates
+        have a probe reading and how many are eligible -- both a function
+        of opinions, which differ by language after round 1. Consuming the
+        shared stream therefore left every later agent's tie-break and feed
+        order drawing from a different position in four different language
+        arms of the same seed, even though the arms are meant to share
+        every non-opinion random draw. Instead, every draw here -- the
+        fallback sample, the tie-break shuffle, and the final feed-order
+        shuffle -- comes from a private stream keyed by this graph's own
+        seed, the round, and this reader's own id, so it is unaffected by
+        what any other agent in the round did or how many draws its own
+        selection took.
+
+        Candidate order: shuffled with the private stream, then stably
+        sorted by |x_i - x_j| -- so ties at the same distance land in a
+        seeded-random relative order rather than always breaking toward
+        whichever agent_id sorts first. The chosen set is then shuffled
+        again with the SAME private stream before being returned, so a
+        post's position in the feed is not itself a clue to how similar it
+        was.
         """
+        reader_rng = random.Random(f"{self.graph_seed}|recsys|{turn}|{speaker.agent_id}")
         by_id = {a.agent_id: a for a in all_agents}
         candidate_ids = self.neighbors_of(speaker.agent_id)
 
@@ -565,7 +588,7 @@ class GraphSimilaritySampling(GraphSampling):
             # k random graph neighbours -- the same thing GraphSampling
             # itself would deliver under allow_short_feed (Fix 1: a reader
             # with fewer than k graph neighbours cannot sample k of them).
-            chosen_ids = rng.sample(candidate_ids, min(self.k, len(candidate_ids)))
+            chosen_ids = reader_rng.sample(candidate_ids, min(self.k, len(candidate_ids)))
             self._feed_info[speaker.agent_id] = RecsysFeedInfo(
                 feed_size=len(chosen_ids),
                 n_neighbors_over_threshold=None,
@@ -584,10 +607,10 @@ class GraphSimilaritySampling(GraphSampling):
         n_over_threshold = sum(1 for d in gap.values() if d > self.threshold)
         eligible = [agent_id for agent_id in with_probe if gap[agent_id] <= self.threshold]
 
-        rng.shuffle(eligible)
+        reader_rng.shuffle(eligible)
         eligible.sort(key=lambda agent_id: gap[agent_id])
         chosen_ids = eligible[: self.k]
-        rng.shuffle(chosen_ids)
+        reader_rng.shuffle(chosen_ids)
 
         self._feed_info[speaker.agent_id] = RecsysFeedInfo(
             feed_size=len(chosen_ids),
