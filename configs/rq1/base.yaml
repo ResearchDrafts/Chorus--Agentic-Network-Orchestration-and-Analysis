@@ -1,33 +1,7 @@
-# RQ1 campaign base config -- the template scripts/make_rq1_configs.py
-# expands into one file per (experiment, language, seed index).
-#
-#   python scripts/make_rq1_configs.py --seeds 5 --out configs/rq1/campaign
-#
-# This is a complete, valid bank-regime ExperimentRun on its own, so it can
-# be checked before it is expanded:
-#
-#   python run_simulation.py configs/rq1/base.yaml --dry-run
-#
-# **Every value marked PLACEHOLDER is a smoke-test value, not a campaign
-# value.** They are deliberately the smoke config's, so that a mistake while
-# wiring the pipeline costs eight agents and three rounds rather than a GPU
-# afternoon. Set them before the real campaign.
-#
-# Five fields are overwritten by the generator and whatever is here is
-# ignored: run_id, language_condition, probe_question, delivery, seed and
-# trial_number. The rest is copied through byte for byte, which is what makes
-# a matched set matched -- four arms differing in exactly the rendering of
-# the text and in nothing else.
-
 run_id: rq1_base           # overwritten: the generator uses the file stem
 rq_target: RQ1_RQ2
 topic: Is there such a thing as a paradox of free speech?
 
-# --- who reads whom ------------------------------------------------------
-# A fixed Watts-Strogatz graph, not stance-based sampling -- the "ws" in a
-# generated filename. Under alpha sampling who an agent reads depends on
-# where it already stands, so a stance effect and a selection effect cannot
-# be separated afterwards.
 neighbor_strategy: graph
 graph_degree: 4            # PLACEHOLDER (smoke). Even, and < M.
 graph_rewire_p: 0.1        # Watts-Strogatz: 0 is a ring, 1 is random

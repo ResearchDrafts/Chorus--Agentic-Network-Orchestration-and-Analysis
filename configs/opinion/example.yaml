@@ -1,0 +1,41 @@
+# Opinion-CSV echo-chamber experiment config (plan.md). A complete, valid
+# OpinionExperimentConfig on its own -- values below marked PLACEHOLDER are
+# smoke-test values, not campaign values.
+
+run_id: opinion_smoke
+topic: Should city bus fares stay subsidised?
+
+# null = use every persona in the pool. Set to a small number for a cheap
+# smoke run.
+M: 8                        # PLACEHOLDER (smoke)
+K: 3                        # PLACEHOLDER (smoke): number of update rounds
+
+# Exactly one of these four True -> every agent forced to that language.
+# All four True -> each agent speaks its own pool "language preference".
+# Any other combination (2 or 3 True) raises NotImplementedError -- not yet
+# supported.
+languages:
+  english: true
+  hindi: false
+  hinglish: false
+  romanized_hindi: false
+
+# Belief-similarity threshold for the recommender, on the belief scale
+# itself ([-2, 2], Jo et al.'s own v scale -- no to_x conversion anywhere in
+# this pipeline).
+similarity_threshold: 2.0
+
+N: 3                         # neighbours sampled per round (<= graph_degree)
+graph_degree: 4              # PLACEHOLDER (smoke). Even, and < M.
+graph_rewire_p: 0.1          # Watts-Strogatz: 0 is a ring, 1 is random
+
+seed: 1000
+
+model_backend_id: hosted_vllm/Qwen/Qwen2.5-7B-Instruct   # PLACEHOLDER
+api_base: http://localhost:8000/v1                       # PLACEHOLDER
+
+persona_pool_path: data/personas/pool_100.jsonl
+max_reply_tokens: 512
+max_concurrency: 32          # PLACEHOLDER: match --max-num-seqs
+
+output_dir: runs/opinion_smoke

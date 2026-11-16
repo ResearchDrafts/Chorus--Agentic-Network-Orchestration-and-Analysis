@@ -1,35 +1,3 @@
-# UNVERIFIED machine translations. Needs a native-speaker check before use.
-#
-# Fix 9: with persona_attributes != "none", the four language arms differ
-# in a FOURTH thing beyond the bank text, the probe question and the one
-# directive line -- this sentence, appended to every persona's description.
-# The persona description itself (the free-text or demographic-row content
-# `_persona_section` substitutes INTO this template) stays in English in
-# every arm; only the template wording translated here varies by language,
-# and it has not been reviewed by a native speaker of hinglish,
-# romanized_hindi or hindi.
-#
-# Fix 7: structured persona attributes (off by default via
-# ExperimentRun.persona_attributes="none").
-#
-# Rendered by sandbox/prompt_builder.py's _persona_section, appended to
-# "You are: <persona>" when persona_attributes is "demographic" or
-# "demographic_big5". Templates, not code, for the same reason the bank CSVs
-# and probe_questions.yaml hold translated text rather than f-strings: a
-# translation is content, and content lives in a file a translator can edit
-# without touching Python.
-#
-# `demographic` is used whenever persona_attributes != "none"; `big5` is
-# appended only under "demographic_big5". `level_words` supplies the
-# high/low wording `big5`'s template substitutes, per language, so the
-# sentence stays in one language throughout rather than mixing in bare
-# English "high"/"low" inside a Hindi sentence.
-#
-# format() placeholders: demographic takes {age}, {gender}, {education};
-# big5 takes {openness}, {conscientiousness}, {extraversion},
-# {agreeableness}, {neuroticism} -- already substituted with this
-# language's high/low word before big5's own template is filled.
-
 demographic:
   english: >-
     You are {age} years old, identify as {gender}, and your highest level
