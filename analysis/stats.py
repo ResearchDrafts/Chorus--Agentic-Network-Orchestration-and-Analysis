@@ -586,6 +586,37 @@ def censored_count(
     return len(set(seeds) & censored_seeds)
 
 
+def min_rounds_defined(
+    frame: pd.DataFrame,
+    experiment: str,
+    language: str,
+    seeds,
+    rewire_rate: float | None = None,
+    recsys_threshold: float | None = None,
+) -> int | None:
+    """The smallest run_metrics.csv `n_rounds_nci_defined` among the runs
+    behind an auc_nci_excess contrast row (Fix 8): both the `language`
+    arm's own run and the English reference's, for each of `seeds` -- a
+    paired difference uses both, so a run that reached consensus early on
+    either side of the pair lowers what the contrast was actually averaged
+    over. None when `seeds` is empty, the column is absent (a pre-Fix-8
+    run_metrics.csv), or no row matches.
+    """
+    if not seeds or "n_rounds_nci_defined" not in frame.columns:
+        return None
+    arm = frame[
+        (frame.experiment == experiment)
+        & frame.seed.isin(seeds)
+        & frame.language.isin([language, REFERENCE_LANGUAGE])
+    ]
+    if rewire_rate is not None:
+        arm = arm[arm.rewire_rate == rewire_rate]
+    if recsys_threshold is not None:
+        arm = arm[arm.recsys_threshold == recsys_threshold]
+    values = arm["n_rounds_nci_defined"].dropna()
+    return int(values.min()) if not values.empty else None
+
+
 def bootstrap_ci(values: list[float], seed: int = BOOTSTRAP_SEED) -> tuple[float, float]:
     """A percentile bootstrap interval over the seeds, resampling seeds.
 
@@ -637,6 +668,7 @@ NETWORK_COLUMNS = (
     "mean_diff", "ci_low", "ci_high", "p_raw", "p_holm", "reject_at_05",
     "family_size", "underpowered", "seeds", "primary",
     "n_censored_treatment", "n_censored_control", "censored_warning",
+    "min_rounds_defined",
 )
 
 
@@ -674,6 +706,7 @@ def network_contrasts(
     never pools two rates into one contrast: main() calls this once per rate
     present among the echo-chamber runs. `recsys_threshold` does the same
     for a --recsys-threshold sweep of e8/e9.
+
     """
     treatment, control = experiment_pair
     languages = [
@@ -706,6 +739,10 @@ def network_contrasts(
             # run length rather than a measured formation time. Every other
             # metric's rows carry None in both censored columns.
             censored = metric == "t_echo"
+            # Fix 8: min_rounds_defined only bears on auc_nci_excess, the
+            # one metric whose own AUC drops rounds where nci_excess was
+            # undefined (everyone agreed).
+            rounds_defined = metric == "auc_nci_excess"
             for scope, values, label, treatment_seeds, control_seeds in (
                 (f"within_{treatment}", treated,
                  f"{language} - {REFERENCE_LANGUAGE} ({treatment.upper()})",
@@ -732,12 +769,31 @@ def network_contrasts(
                     )
                     if censored else None
                 )
+                # The runs behind this scope's seeds: treatment_seeds/
+                # control_seeds are already empty on whichever side a scope
+                # does not draw from (see the tuple above), so calling both
+                # unconditionally and dropping the Nones is equivalent to
+                # branching on scope, without repeating that branch here.
+                rounds_present = [
+                    value for value in (
+                        min_rounds_defined(
+                            frame, treatment, language, treatment_seeds,
+                            rewire_rate, recsys_threshold,
+                        ) if rounds_defined else None,
+                        min_rounds_defined(
+                            frame, control, language, control_seeds,
+                            rewire_rate, None,
+                        ) if rounds_defined else None,
+                    )
+                    if value is not None
+                ]
                 rows.append(
                     _network_row(
                         metric, scope, language, label, values, rewire_rate,
                         recsys_threshold,
                         n_censored_treatment=n_censored_treatment,
                         n_censored_control=n_censored_control,
+                        min_rounds_defined=min(rounds_present) if rounds_present else None,
                     )
                 )
     return holm_within_families(rows, key="_family")
@@ -754,6 +810,7 @@ def _network_row(
     *,
     n_censored_treatment: int | None = None,
     n_censored_control: int | None = None,
+    min_rounds_defined: int | None = None,
 ) -> dict:
     ordered = [values[seed] for seed in sorted(values)]
     low, high = bootstrap_ci(ordered)
@@ -798,6 +855,7 @@ def _network_row(
         "n_censored_treatment": n_censored_treatment,
         "n_censored_control": n_censored_control,
         "censored_warning": censored_warning,
+        "min_rounds_defined": min_rounds_defined,
     }
 
 
@@ -820,6 +878,36 @@ def warn_if_underpowered(rows: list[dict]) -> None:
         "which is above 0.05, so NO row here could have been significant "
         f"however large the effect. Run at least "
         f"{MIN_SEEDS_FOR_SIGNIFICANCE} seeds before reading the p values."
+    )
+
+
+def warn_if_rounds_undefined(rows: list[dict], runs: pd.DataFrame) -> None:
+    """Fix 8: a warning when an auc_nci_excess contrast row's
+    min_rounds_defined falls below the campaign's own K.
+
+    auc_nci_excess drops rounds where nci_excess was undefined (everyone
+    agreed) rather than zeroing them, so a run reaching consensus early is
+    averaged over fewer rounds than K -- and that can differ by language,
+    which is exactly what this contrast is trying to measure, not an
+    artifact to ignore.
+    """
+    nci_rows = [
+        row for row in rows
+        if row["metric"] == "auc_nci_excess" and row.get("min_rounds_defined") is not None
+    ]
+    if not nci_rows or "K" not in runs.columns or runs["K"].dropna().empty:
+        return
+    campaign_k = int(runs["K"].min())
+    under = [row for row in nci_rows if row["min_rounds_defined"] < campaign_k]
+    if not under:
+        return
+    worst = min(row["min_rounds_defined"] for row in under)
+    print(
+        f"\n  WARNING: {len(under)} auc_nci_excess contrast row(s) averaged "
+        f"over fewer than K={campaign_k} rounds (as few as {worst}). Some "
+        "runs behind them reached consensus early -- nci_excess is undefined "
+        "once everyone agrees -- and that can differ by language. See each "
+        "row's own min_rounds_defined."
     )
 
 
@@ -1022,6 +1110,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     write_table(args.out / "network_contrasts.csv", network, NETWORK_COLUMNS)
     warn_if_underpowered(network)
+    warn_if_rounds_undefined(network, runs)
     return 0
 
 

@@ -474,6 +474,7 @@ roughly the "no neighbour alignment" baseline this index sits around.
 | `n_rewires` / `n_side_switches` | rewires applied this round / agents whose side differs from last round | read together: the sorting-versus-conversion race |
 | `t_echo` | the earlier round of the first 2 **consecutive** rounds where assortativity clears its own null **and** `minority_share >= 0.2` | `K + 1` with `echo_censored = True` if no such window exists within `K` rounds |
 | `auc_assort_excess` / `auc_nci_excess` / `auc_neighbor_corr_excess` | mean `assort_excess` / `nci_excess` / `neighbor_corr_excess` over rounds 1..K | need no threshold, unlike `t_echo`; **`auc_nci_excess` is the primary echo-chamber outcome**, since it is defined for every run, censored or not |
+| `n_rounds_nci_defined` / `first_round_nci_undefined` | how many of rounds 1..K had a non-`None` `nci_excess`, and the first round that did not | **Fix 8:** `auc_nci_excess` drops `None` rounds (everyone agreed, so Pz was 0) rather than zeroing them, so a run reaching consensus early is averaged over fewer rounds than K -- which can differ by language. `first_round_nci_undefined` is `None` if every round had a reading |
 | `delta_polarization_index` / `delta_global_disagreement` / `delta_nci` / `delta_neighbor_corr` | final minus round 0 | |
 | `total_side_switches` / `total_rewires` | summed over the run | |
 
@@ -483,7 +484,10 @@ and, when a campaign swept `--rewire-rate`, once per rate so two rates are
 never pooled. Every `t_echo` contrast row carries
 `n_censored_treatment`/`n_censored_control`/`censored_warning`, since a
 difference built from censored runs (`echo_censored`, `t_echo = K + 1`)
-depends on `K`; `formation_summary.csv` reports, per experiment/language/rate,
+depends on `K`; every `auc_nci_excess` contrast row carries
+`min_rounds_defined` (**Fix 8**, the smallest `n_rounds_nci_defined` among
+the runs behind that row), and `analysis.stats` prints a warning when it
+falls below `K`. `formation_summary.csv` reports, per experiment/language/rate,
 how many runs formed an echo chamber at all and the median `t_echo` among the
 ones that did. `analysis.figures` adds `assort_excess`, `cross_side_edge_share`,
 `nci_excess`, `disagreement_ratio`, `minority_share` and `n_side_switches`

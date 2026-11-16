@@ -341,6 +341,88 @@ def test_main_warns_when_a_t_echo_contrast_is_censored(tmp_path, capsys):
     assert "censored run" in capsys.readouterr().out
 
 
+# --- Fix 8: min_rounds_defined on auc_nci_excess contrast rows -------------
+
+
+def test_min_rounds_defined_is_the_smallest_among_the_runs_behind_a_contrast():
+    frame = _run_metrics([
+        _echo_run("e5", "english", 1001, n_rounds_nci_defined=20),
+        _echo_run("e5", "hindi", 1001, n_rounds_nci_defined=12),
+        _echo_run("e6", "english", 1001, n_rounds_nci_defined=20),
+        _echo_run("e6", "hindi", 1001, n_rounds_nci_defined=18),
+    ])
+    assert st.min_rounds_defined(frame, "e5", "hindi", {1001}) == 12
+    assert st.min_rounds_defined(frame, "e6", "hindi", {1001}) == 18
+    assert st.min_rounds_defined(frame, "e5", "hindi", set()) is None
+
+
+def test_min_rounds_defined_is_none_without_the_column():
+    frame = _run_metrics([
+        _echo_run("e5", "english", 1001), _echo_run("e5", "hindi", 1001),
+    ])
+    assert "n_rounds_nci_defined" not in frame.columns
+    assert st.min_rounds_defined(frame, "e5", "hindi", {1001}) is None
+
+
+def test_auc_nci_excess_contrast_rows_carry_min_rounds_defined():
+    """Fix 8's own acceptance test: the did row's min_rounds_defined is the
+    smallest n_rounds_nci_defined among all four runs behind it (both
+    languages, both experiments); other metrics' rows carry None."""
+    frame = _run_metrics([
+        _echo_run("e5", "english", 1001, n_rounds_nci_defined=20),
+        _echo_run("e5", "hindi", 1001, n_rounds_nci_defined=15),
+        _echo_run("e6", "english", 1001, n_rounds_nci_defined=20),
+        _echo_run("e6", "hindi", 1001, n_rounds_nci_defined=20),
+    ])
+    rows = st.network_contrasts(frame, metrics=st.ECHO_METRICS, experiment_pair=("e5", "e6"))
+    nci_did = next(r for r in rows if r["metric"] == "auc_nci_excess" and r["scope"] == "did")
+    assert nci_did["min_rounds_defined"] == 15
+    nci_within_e5 = next(
+        r for r in rows if r["metric"] == "auc_nci_excess" and r["scope"] == "within_e5"
+    )
+    assert nci_within_e5["min_rounds_defined"] == 15
+    other_did = next(r for r in rows if r["metric"] == "t_echo" and r["scope"] == "did")
+    assert other_did["min_rounds_defined"] is None
+
+
+def test_main_warns_when_min_rounds_defined_is_below_k(tmp_path, capsys):
+    results = tmp_path / "results"
+    results.mkdir()
+    rows = [
+        {**_echo_run("e5", "english", 1001, n_rounds_nci_defined=5), "K": 5},
+        {**_echo_run("e5", "hindi", 1001, n_rounds_nci_defined=3), "K": 5},
+        {**_echo_run("e6", "english", 1001, n_rounds_nci_defined=5), "K": 5},
+        {**_echo_run("e6", "hindi", 1001, n_rounds_nci_defined=5), "K": 5},
+    ]
+    _run_metrics(rows).to_csv(results / "run_metrics.csv", index=False)
+
+    assert st.main([
+        "--e1", str(tmp_path / "absent.jsonl"),
+        "--results", str(results), "--out", str(results), "--skip-e1",
+    ]) == 0
+    out = capsys.readouterr().out
+    assert "fewer than K=5 rounds" in out
+
+
+def test_main_is_silent_when_every_run_reached_k_rounds_of_nci(tmp_path, capsys):
+    results = tmp_path / "results"
+    results.mkdir()
+    rows = [
+        {**_echo_run("e5", "english", 1001, n_rounds_nci_defined=5), "K": 5},
+        {**_echo_run("e5", "hindi", 1001, n_rounds_nci_defined=5), "K": 5},
+        {**_echo_run("e6", "english", 1001, n_rounds_nci_defined=5), "K": 5},
+        {**_echo_run("e6", "hindi", 1001, n_rounds_nci_defined=5), "K": 5},
+    ]
+    _run_metrics(rows).to_csv(results / "run_metrics.csv", index=False)
+
+    assert st.main([
+        "--e1", str(tmp_path / "absent.jsonl"),
+        "--results", str(results), "--out", str(results), "--skip-e1",
+    ]) == 0
+    out = capsys.readouterr().out
+    assert "fewer than K" not in out
+
+
 # --- formation_summary.csv --------------------------------------------------
 
 

@@ -1290,6 +1290,7 @@ RUN_COLUMNS = (
     "delta_polarization_index", "delta_global_disagreement", "delta_nci",
     "delta_neighbor_corr",
     "auc_nci_excess", "auc_neighbor_corr_excess",
+    "n_rounds_nci_defined", "first_round_nci_undefined",
     "total_side_switches", "total_rewires",
     *(f"rate_{name}" for name in OUTCOMES),
     "rate_reply_truncated",
@@ -1382,6 +1383,8 @@ def run_row(
         "delta_neighbor_corr": _delta(final["neighbor_corr"], first["neighbor_corr"]),
         "auc_nci_excess": auc_nci_excess(ordered),
         "auc_neighbor_corr_excess": auc_neighbor_corr_excess(ordered),
+        "n_rounds_nci_defined": n_rounds_nci_defined(ordered),
+        "first_round_nci_undefined": first_round_nci_undefined(ordered),
         "total_side_switches": _sum_or_none(
             [r["n_side_switches"] for r in ordered]
         ),
@@ -1442,6 +1445,29 @@ def auc_nci_excess(rounds: list[dict]) -> float | None:
         if r["turn"] >= 1 and r["nci_excess"] is not None
     ]
     return sum(values) / len(values) if values else None
+
+
+def n_rounds_nci_defined(rounds: list[dict]) -> int:
+    """How many of rounds 1..K had a non-None nci_excess -- the same set
+    auc_nci_excess averages over (Fix 8).
+
+    auc_nci_excess drops None rounds (everyone agreeing leaves Pz at 0, so
+    nci itself is undefined) rather than zeroing them, which is correct for
+    "we cannot tell" but means a run reaching consensus early is averaged
+    over fewer rounds than one that never does -- and that count can differ
+    by language, so it belongs next to the primary outcome rather than only
+    in a warning at contrast time.
+    """
+    return sum(1 for r in rounds if r["turn"] >= 1 and r["nci_excess"] is not None)
+
+
+def first_round_nci_undefined(rounds: list[dict]) -> int | None:
+    """The first round in 1..K whose nci_excess is None, or None if every
+    round had one (Fix 8) -- the companion to n_rounds_nci_defined."""
+    undefined_turns = [
+        r["turn"] for r in rounds if r["turn"] >= 1 and r["nci_excess"] is None
+    ]
+    return min(undefined_turns) if undefined_turns else None
 
 
 def auc_neighbor_corr_excess(rounds: list[dict]) -> float | None:

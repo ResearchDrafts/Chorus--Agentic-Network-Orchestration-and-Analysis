@@ -651,6 +651,58 @@ def test_run_row_aggregates_the_new_echo_metrics():
     assert row["final_mean_abs_individual_shift"] is not None
 
 
+def test_run_row_tracks_how_many_rounds_nci_was_defined():
+    """Fix 8: auc_nci_excess drops rounds where nci_excess is None (the
+    population reached consensus: Pz == 0) rather than zeroing them, so a
+    run that converges early is averaged over fewer rounds than K.
+    n_rounds_nci_defined/first_round_nci_undefined record that directly.
+
+    Round 1 here is exact consensus (everyone at 0.5, Pz == 0 -> nci and
+    nci_excess both None); round 2 returns to a split population."""
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 0, "x": 1.0},
+        {"speaker_agent_id": "b", "turn": 0, "x": 1.0},
+        {"speaker_agent_id": "c", "turn": 0, "x": -1.0},
+        {"speaker_agent_id": "d", "turn": 0, "x": -1.0},
+        {"speaker_agent_id": "a", "turn": 1, "x": 0.5},
+        {"speaker_agent_id": "b", "turn": 1, "x": 0.5},
+        {"speaker_agent_id": "c", "turn": 1, "x": 0.5},
+        {"speaker_agent_id": "d", "turn": 1, "x": 0.5},
+        {"speaker_agent_id": "a", "turn": 2, "x": 1.0},
+        {"speaker_agent_id": "b", "turn": 2, "x": 1.0},
+        {"speaker_agent_id": "c", "turn": 2, "x": -1.0},
+        {"speaker_agent_id": "d", "turn": 2, "x": -1.0},
+    ])
+    config = {**CONFIG, "M": 4, "K": 2}
+    probes = m.probe_rows(frame, config, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, config, FOUR_NODES)
+    by_turn = {r["turn"]: r for r in rounds}
+    assert by_turn[1]["nci_excess"] is None
+    assert by_turn[2]["nci_excess"] is not None
+    row = m.run_row(rounds, probes, config, EPSILON)
+    assert row["n_rounds_nci_defined"] == 1
+    assert row["first_round_nci_undefined"] == 1
+
+
+def test_n_rounds_nci_defined_and_first_undefined_when_nci_holds_every_round():
+    frame = _frame([
+        {"speaker_agent_id": "a", "turn": 0, "x": 1.0},
+        {"speaker_agent_id": "b", "turn": 0, "x": 1.0},
+        {"speaker_agent_id": "c", "turn": 0, "x": -1.0},
+        {"speaker_agent_id": "d", "turn": 0, "x": -1.0},
+        {"speaker_agent_id": "a", "turn": 1, "x": 1.0},
+        {"speaker_agent_id": "b", "turn": 1, "x": 1.0},
+        {"speaker_agent_id": "c", "turn": 1, "x": -1.0},
+        {"speaker_agent_id": "d", "turn": 1, "x": -1.0},
+    ])
+    config = {**CONFIG, "M": 4, "K": 1}
+    probes = m.probe_rows(frame, config, TAU, TAU_CONF)
+    rounds = m.round_rows(frame, probes, config, FOUR_NODES)
+    row = m.run_row(rounds, probes, config, EPSILON)
+    assert row["n_rounds_nci_defined"] == 1
+    assert row["first_round_nci_undefined"] is None
+
+
 def test_run_row_carries_the_reply_truncated_rate_through():
     frame = _frame([
         {"speaker_agent_id": "a", "turn": 0, "x": 0.0},
