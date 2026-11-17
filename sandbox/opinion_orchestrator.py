@@ -22,8 +22,66 @@ from sandbox.opinion_llm import build_initial_prompt, build_update_prompt, parse
 from sandbox.opinion_metrics import build_graph, compute_round_metrics, write_round_metrics_row
 from sandbox.opinion_models import LANGUAGES, OpinionAgentState, OpinionExperimentConfig
 from sandbox.opinion_pool import PersonaRecord, load_opinion_persona_pool
+from sandbox.opinion_script import enforce, script_violation
 from sandbox.rate_limiter import RateLimiter
 from sandbox.seed_manager import SeedManager
+
+
+# How many extra samples a reply in the wrong script is given before it is
+# repaired mechanically. Each retry is a fresh sample (a different seed), not
+# a re-send of the same request: re-sending the same seed to the same server
+# returns the same reply, which is the whole point of seeding it, and would
+# make the retry a no-op. 2 is enough to clear an unlucky draw without
+# turning a systematically non-compliant arm into a 3x bill.
+SCRIPT_RETRIES = 2
+
+
+async def _generate_in_script(
+    gateway: ModelGateway,
+    seed_mgr: SeedManager,
+    prompt: str,
+    turn: int,
+    agent_id: str,
+    language: str,
+    max_tokens: int,
+) -> tuple[str, float, int, str]:
+    """(opinion_text, belief, confidence, status).
+
+    Guarantees the returned text is in `language`'s script wherever that can
+    be guaranteed -- see opinion_script.enforce. This is the part that makes
+    a script slip non-absorbing: the stored text is what the agent is shown
+    next round and what its neighbours read, so a reply that is never stored
+    in the wrong script can never seed anyone else's.
+
+    status is one of:
+      success            complied on the first sample
+      script_retried     complied on a later sample
+      script_repaired    never complied; text was transliterated
+      script_unrepaired  never complied and cannot be transliterated
+                         (a hindi-arm reply that came back in Latin)
+    """
+    for attempt in range(SCRIPT_RETRIES + 1):
+        # Attempt 0 keeps the historical purpose string, so a run whose
+        # replies all comply sends byte-identical seeds to what it sent
+        # before this function existed.
+        purpose = "reply" if attempt == 0 else f"reply_script{attempt}"
+        response = await gateway.generate(
+            prompt,
+            seed=seed_mgr.call_seed(purpose, turn, agent_id),
+            max_tokens=max_tokens,
+        )
+        opinion_text, belief, confidence = parse_opinion_response(response.text)
+        if script_violation(opinion_text, language) is None:
+            return (
+                opinion_text, belief, confidence,
+                "success" if attempt == 0 else "script_retried",
+            )
+
+    repaired_text, was_repaired = enforce(opinion_text, language)
+    return (
+        repaired_text, belief, confidence,
+        "script_repaired" if was_repaired else "script_unrepaired",
+    )
 
 
 def resolve_languages(
@@ -121,22 +179,22 @@ async def run(config: OpinionExperimentConfig) -> Path:
 
     states: dict[str, OpinionAgentState] = {}
 
-    async def _initial_call(agent_id: str) -> tuple[str, str, float, int]:
+    async def _initial_call(agent_id: str) -> tuple[str, str, float, int, str]:
         prompt = build_initial_prompt(
             config.topic, persona_by_agent[agent_id], initial_belief[agent_id],
             language_by_agent[agent_id],
         )
-        response = await gateway.generate(
-            prompt,
-            seed=seed_mgr.call_seed("reply", 0, agent_id),
-            max_tokens=config.max_reply_tokens,
+        opinion_text, belief, confidence, status = await _generate_in_script(
+            gateway, seed_mgr, prompt, 0, agent_id,
+            language_by_agent[agent_id], config.max_reply_tokens,
         )
-        opinion_text, belief, confidence = parse_opinion_response(response.text)
-        return agent_id, opinion_text, belief, confidence
+        return agent_id, opinion_text, belief, confidence, status
 
-    for agent_id, opinion_text, belief, confidence in await asyncio.gather(
+    initial_status: dict[str, str] = {}
+    for agent_id, opinion_text, belief, confidence, status in await asyncio.gather(
         *(_initial_call(aid) for aid in agent_ids)
     ):
+        initial_status[agent_id] = status
         states[agent_id] = OpinionAgentState(
             agent_id=agent_id,
             persona_text=persona_by_agent[agent_id],
@@ -156,6 +214,7 @@ async def run(config: OpinionExperimentConfig) -> Path:
                 "initial_belief": states[aid].belief,
                 "initial_opinion": states[aid].opinion_text,
                 "initial_confidence": states[aid].confidence,
+                "initial_status": initial_status[aid],
             }
             for aid in agent_ids
         ],
@@ -179,13 +238,11 @@ async def run(config: OpinionExperimentConfig) -> Path:
                 config.topic, persona_by_agent[agent_id], states[agent_id],
                 [states[c] for c in chosen], language_by_agent[agent_id],
             )
-            response = await gateway.generate(
-                prompt,
-                seed=seed_mgr.call_seed("reply", turn, agent_id),
-                max_tokens=config.max_reply_tokens,
+            opinion_text, belief, confidence, status = await _generate_in_script(
+                gateway, seed_mgr, prompt, turn, agent_id,
+                language_by_agent[agent_id], config.max_reply_tokens,
             )
-            opinion_text, belief, confidence = parse_opinion_response(response.text)
-            return agent_id, opinion_text, belief, confidence, "success"
+            return agent_id, opinion_text, belief, confidence, status
 
         results = await asyncio.gather(*(_round_call(aid) for aid in agent_ids))
 

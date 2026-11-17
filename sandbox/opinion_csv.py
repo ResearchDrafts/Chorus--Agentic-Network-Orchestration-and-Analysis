@@ -24,6 +24,10 @@ INITIAL_COLUMNS = [
     "initial_belief",
     "initial_opinion",
     "initial_confidence",
+    # Round 0's counterpart to round_N_status. Without it, script repairs in
+    # the opening opinions are invisible while every later round's are
+    # recorded, and compliance could not be read off the file.
+    "initial_status",
 ]
 
 

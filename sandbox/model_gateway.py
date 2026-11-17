@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass
 
 import litellm
+import openai
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from sandbox.cost_tracker import CostTracker
@@ -58,6 +59,13 @@ TEXT_ONLY = {
     # the bare id is "qwen2.5:7b", not "qwen2.5".
     "qwen2.5:3b", "qwen2.5:7b", "llama3.2:3b", "llama3.1:8b",
 }
+
+
+# Client-side cap per request. litellm's own default is 600s, long enough
+# that one wedged request holds a concurrency slot for ten minutes while
+# the rest of the round waits on it. Raise it if a single reply
+# legitimately takes longer on a slower GPU.
+_REQUEST_TIMEOUT_S = 300
 
 
 class TransientGatewayError(Exception):
@@ -244,8 +252,8 @@ class ModelGateway:
 
     @retry(
         retry=retry_if_exception_type(TransientGatewayError),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=30),
+        stop=stop_after_attempt(6),
+        wait=wait_exponential(multiplier=1, min=2, max=60),
         reraise=True,
     )
     async def _score_with_retry(self, prompt_text: str) -> BackendResponse:
@@ -259,10 +267,21 @@ class ModelGateway:
                 logprobs=True,
                 top_logprobs=self._top_logprobs,
                 api_base=self._api_base,
+                timeout=_REQUEST_TIMEOUT_S,
             )
-        except litellm.exceptions.RateLimitError as e:
-            raise TransientGatewayError(str(e)) from e
-        except litellm.exceptions.APIConnectionError as e:
+        except (
+            litellm.exceptions.RateLimitError,
+            litellm.exceptions.APIConnectionError,
+            # A local vLLM dropping the socket arrives as
+            # InternalServerError, and a wedged request as Timeout.
+            # Neither is a litellm APIConnectionError -- every litellm
+            # exception subclasses the openai bases, not each other --
+            # so unlisted, both escaped this handler entirely and aborted
+            # the run instead of retrying.
+            litellm.exceptions.InternalServerError,
+            litellm.exceptions.ServiceUnavailableError,
+            litellm.exceptions.Timeout,
+        ) as e:
             raise TransientGatewayError(str(e)) from e
         except litellm.exceptions.AuthenticationError as e:
             raise FatalGatewayError(str(e)) from e
@@ -276,6 +295,16 @@ class ModelGateway:
             # grow the feature, and the run should stop rather than burn its
             # retry budget three times per agent per round discovering that.
             raise FatalGatewayError(str(e)) from e
+        except openai.APIError as e:
+            # Last, deliberately: every clause above subclasses this, so
+            # reaching here means litellm raised something this gateway
+            # has not been taught to name. A 5xx is a server-side fault
+            # and worth the bounded retry budget; a 4xx is this run's own
+            # bad request and must fail now rather than six times.
+            status = getattr(e, "status_code", None)
+            if status is not None and status < 500:
+                raise FatalGatewayError(str(e)) from e
+            raise TransientGatewayError(str(e)) from e
 
         latency_ms = int((time.monotonic() - started) * 1000)
         top_logprobs = _extract_top_logprobs(raw, self.model_backend_id)
@@ -291,8 +320,8 @@ class ModelGateway:
 
     @retry(
         retry=retry_if_exception_type(TransientGatewayError),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=30),
+        stop=stop_after_attempt(6),
+        wait=wait_exponential(multiplier=1, min=2, max=60),
         reraise=True,
     )
     async def _call_with_retry(
@@ -318,11 +347,22 @@ class ModelGateway:
                 messages=_build_messages(prompt_text, image),
                 temperature=temperature,
                 api_base=self._api_base,
+                timeout=_REQUEST_TIMEOUT_S,
                 **extra,
             )
-        except litellm.exceptions.RateLimitError as e:
-            raise TransientGatewayError(str(e)) from e
-        except litellm.exceptions.APIConnectionError as e:
+        except (
+            litellm.exceptions.RateLimitError,
+            litellm.exceptions.APIConnectionError,
+            # A local vLLM dropping the socket arrives as
+            # InternalServerError, and a wedged request as Timeout.
+            # Neither is a litellm APIConnectionError -- every litellm
+            # exception subclasses the openai bases, not each other --
+            # so unlisted, both escaped this handler entirely and aborted
+            # the run instead of retrying.
+            litellm.exceptions.InternalServerError,
+            litellm.exceptions.ServiceUnavailableError,
+            litellm.exceptions.Timeout,
+        ) as e:
             raise TransientGatewayError(str(e)) from e
         except litellm.exceptions.AuthenticationError as e:
             raise FatalGatewayError(str(e)) from e
@@ -332,6 +372,16 @@ class ModelGateway:
             raise ContextLengthExceeded(str(e)) from e
         except litellm.exceptions.BadRequestError as e:
             raise FatalGatewayError(str(e)) from e
+        except openai.APIError as e:
+            # Last, deliberately: every clause above subclasses this, so
+            # reaching here means litellm raised something this gateway
+            # has not been taught to name. A 5xx is a server-side fault
+            # and worth the bounded retry budget; a 4xx is this run's own
+            # bad request and must fail now rather than six times.
+            status = getattr(e, "status_code", None)
+            if status is not None and status < 500:
+                raise FatalGatewayError(str(e)) from e
+            raise TransientGatewayError(str(e)) from e
 
         # Measured here rather than read off the provider response.
         # full_design_doc.md Sec 3.5's sample reads raw.response_ms, which does

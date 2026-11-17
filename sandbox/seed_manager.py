@@ -112,6 +112,16 @@ class SeedManager:
         # -- so the stream's position is a function of how many posts were
         # read, never of any agent's stance.
         "rewire": 6_000_003,
+        # The opinion pipeline's script retries. A reply that came back in
+        # the wrong script is re-sampled, and a re-sample needs a DIFFERENT
+        # seed: handing the server the same seed and the same prompt returns
+        # the same reply, which is exactly what "reply" exists to guarantee,
+        # so a retry on it would be a guaranteed no-op that still costs a
+        # call. Two offsets, one per retry, rather than arithmetic on
+        # "reply": a derived-from-"reply" seed could land on another
+        # purpose's number, and this table exists so that cannot happen.
+        "reply_script1": 7_000_003,
+        "reply_script2": 8_000_003,
     }
 
     def turn_rng(self, purpose: str, turn: int) -> random.Random:

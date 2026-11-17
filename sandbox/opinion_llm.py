@@ -18,24 +18,85 @@ from __future__ import annotations
 import re
 
 from sandbox.opinion_models import OpinionAgentState
-from sandbox.prompt_builder import LANGUAGE_DIRECTIVES
 
 _BELIEF_PATTERN = re.compile(r"BELIEF:\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE)
 _CONFIDENCE_PATTERN = re.compile(r"CONFIDENCE:\s*(\d+)", re.IGNORECASE)
 
 _RESPONSE_FORMAT_INSTRUCTIONS = (
-    "First, on their own lines, report:\n"
+    "You MUST begin your reply with exactly these two lines, filled in with "
+    "real numbers, before writing anything else -- do not skip them, do not "
+    "write any reasoning first:\n"
     "BELIEF: <a number from -2 to 2, where -2 means strongly against and "
     "2 means strongly in favor>\n"
     "CONFIDENCE: <a whole number from 1 to 5, where 1 means you barely "
     "hold this view and 5 means you are completely certain of it>\n"
-    "Then write your opinion as a short paragraph explaining your reasoning.\n"
+    "After those two lines, write a short paragraph (2-3 sentences) "
+    "explaining your reasoning.\n"
     # Putting BELIEF:/CONFIDENCE: first, not last, is deliberate: a response
     # cut off by max_reply_tokens is always truncated from the end, and a
     # verbose free-text paragraph (worse in languages that tokenize less
-    # efficiently than English, e.g. Hindi) can consume the whole budget
-    # before ever reaching trailing tags. Tags first means truncation only
-    # ever costs the reasoning text, never the measurement.
+    # efficiently than English, e.g. Hindi/Hinglish) can consume the whole
+    # budget before ever reaching trailing tags. Tags first means truncation
+    # only ever costs the reasoning text, never the measurement. A Hinglish
+    # run still skipped the tags entirely even chatting casually with no
+    # tags at all, hence the explicit MUST/do-not-skip wording and the
+    # length cap -- a shorter paragraph is also just less likely to ramble
+    # off-format in a conversational, code-mixed register.
+)
+
+
+# Opinion-pipeline directives, deliberately NOT prompt_builder's
+# LANGUAGE_DIRECTIVES.
+#
+# That dict is shared with the bank/generated regimes, where RQ1 holds the
+# four arms to a 42-character length spread (tests/test_prompt_builder.py's
+# test_language_directive_length_spread_stays_bounded) precisely so no arm's
+# prompt grows against the others. These are longer than that budget allows,
+# so they live here and change nothing RQ1 measures.
+#
+# Two differences from the short form, both from measured failure in
+# opinion_colab_run4's romanized_hindi arm (see opinion_script.py's module
+# docstring for the data):
+#
+# 1. Positive, not negated. "(not Devanagari)" asks a 7B model to suppress
+#    its default rendering of "Hindi" by negation, which is the weakest form
+#    of instruction it has.
+# 2. An explicit clause about the posts just read. The feed is the strongest
+#    script cue in the prompt once anyone has drifted -- at round 2 of that
+#    run, 34% of the prompt's characters were Devanagari against a directive
+#    that was 2.3% of it.
+#
+# All four arms are strengthened in the same shape and to within ~20
+# characters of each other. Strengthening only the arm that broke would
+# trade a script confound for a prompt-length one.
+_OPINION_LANGUAGE_DIRECTIVES = {
+    "english": (
+        "Write your reply in English, using only the English alphabet (a-z), "
+        "even if the posts you just read used a different script."
+    ),
+    "hinglish": (
+        "Write your reply in Hinglish (Hindi-English code-mixed) typed in the "
+        "English alphabet (a-z), even if the posts you just read used a "
+        "different script."
+    ),
+    "romanized_hindi": (
+        "Write your reply in Hindi typed in the English alphabet (a-z), the "
+        "way you would type Hindi on a phone, even if the posts you just "
+        "read used a different script."
+    ),
+    "hindi": (
+        "Write your reply in Hindi, using Devanagari script, "
+        "even if the posts you just read used a different script."
+    ),
+}
+
+# Shown to every arm, byte-identical, immediately before the feed. The feed
+# is where a drifted script enters the prompt, so the reminder belongs there
+# rather than only at the end, 2,000 characters later.
+_FEED_SCRIPT_NOTE = (
+    "(The posts below may be written in any script. That does not change how "
+    "you must write: follow the language instruction at the end of this "
+    "message.)"
 )
 
 
@@ -73,7 +134,7 @@ def build_initial_prompt(
         f"Write your opening opinion on this topic, consistent with that "
         f"belief and with who you are.\n\n"
         f"{_RESPONSE_FORMAT_INSTRUCTIONS}\n\n"
-        f"{LANGUAGE_DIRECTIVES[language]}"
+        f"{_OPINION_LANGUAGE_DIRECTIVES[language]}"
     )
 
 
@@ -95,12 +156,13 @@ def build_update_prompt(
         f"Your current opinion: {own_state.opinion_text}\n"
         f"Your current belief: {own_state.belief:.2f} ({own_label}), "
         f"confidence: {own_state.confidence}/5.\n\n"
+        f"{_FEED_SCRIPT_NOTE}\n\n"
         f"Here is what some people you follow have been saying:\n\n"
         f"{neighbour_lines}\n\n"
         f"Write your updated opinion, after considering what you just read. "
         f"You may keep your belief and confidence the same, or change them.\n\n"
         f"{_RESPONSE_FORMAT_INSTRUCTIONS}\n\n"
-        f"{LANGUAGE_DIRECTIVES[language]}"
+        f"{_OPINION_LANGUAGE_DIRECTIVES[language]}"
     )
 
 
